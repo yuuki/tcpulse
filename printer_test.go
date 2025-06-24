@@ -503,7 +503,7 @@ func TestJSONLinesResult_AllFields(t *testing.T) {
 	var buf bytes.Buffer
 	printer := NewPrinter(&buf)
 	
-	addr := "test.host:8080"
+	addr := "localhost:8080"
 	addrs := []string{addr}
 	
 	// Set up timer with varied data for percentile calculations
@@ -534,9 +534,9 @@ func TestJSONLinesResult_AllFields(t *testing.T) {
 		t.Fatalf("Failed to unmarshal JSON: %v", err)
 	}
 	
-	// Verify all fields are populated
-	if result.Peer == "" {
-		t.Error("Expected peer to be set")
+	// Verify all fields are populated with expected values
+	if result.Peer != addr {
+		t.Errorf("Expected peer %s, got %s", addr, result.Peer)
 	}
 	
 	if result.Count != int64(len(testDurations)) {
@@ -573,6 +573,11 @@ func TestJSONLinesResult_AllFields(t *testing.T) {
 	
 	if result.Timestamp == "" {
 		t.Error("Expected timestamp to be set")
+	}
+	
+	// Validate timestamp format
+	if _, err := time.Parse(time.RFC3339, result.Timestamp); err != nil {
+		t.Errorf("Expected valid RFC3339 timestamp, got %s", result.Timestamp)
 	}
 	
 	// Verify JSON field names
