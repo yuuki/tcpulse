@@ -124,6 +124,7 @@ Options:
       --duration duration          [client mode] measurement period (default 10s)
       --enable-pprof               [client mode] enable pprof profiling
       --flavor string              [client mode] connect behavior type 'persistent' or 'ephemeral' (default "persistent")
+  -h, --help                       show help information
       --interval duration          [client mode] interval for printing stats (default 5s)
       --jsonlines                  [client mode] output results in JSON Lines format
       --listen-addrs-file string   [server mode] enable to pass a file including a pair of addresses and ports
@@ -132,16 +133,22 @@ Options:
       --pprof-addr string          [client mode] pprof listening address:port (default "localhost:6060")
       --proto string               [client mode] protocol (tcp or udp) (default "tcp")
       --protocol string            [server mode] listening protocol ('tcp' or 'udp') (default "all")
-      --rate int32                 [client mode] New connections throughput (/s) (only for 'ephemeral') (default 100)
+      --rate int32                 [client mode] Message throughput per connection (/s) (for 'persistent' and UDP) or new connections throughput (/s) (for 'ephemeral'). Total messages (CNT) = rate * duration * connections (for 'persistent') or rate * duration (for 'ephemeral') (default 100)
   -s, --server                     run in server mode
       --show-only-results          [client mode] print only results of measurement stats
       --version                    show version information
+
+Output Format (Client Mode):
+  CNT: Total number of messages/requests sent (not connections)
+  For persistent mode: CNT = rate × duration × connections
+  For ephemeral mode:  CNT = rate × duration
 
 Examples:
   tcpulse -s                          # Start server on default port 9100
   tcpulse -s 0.0.0.0:8080             # Start server on port 8080
   tcpulse -c localhost:9100           # Connect to server as client
   tcpulse -c --connections 50 host:port # Connect with 50 connections
+  tcpulse -c --connections 1 --rate 1 --duration 1s host:port # Send exactly 1 message
 ```
 
 ## Examples
@@ -181,6 +188,11 @@ $ tcpulse -c --jsonlines --rate 1000 --duration 10s 127.0.0.1:9100
 
 #### Standard Output Format
 
+The standard output format includes the following columns:
+- `CNT`: Total number of messages/requests sent (not connections)
+- For persistent mode: CNT = rate × duration × connections  
+- For ephemeral mode: CNT = rate × duration
+
 ```shell-session
 $ tcpulse -c --proto tcp --flavor ephemeral --rate 1000 --duration 15s 10.0.150.2:9200 10.0.150.2:9300
 PEER                 CNT        LAT_MAX(µs)     LAT_MIN(µs)     LAT_MEAN(µs)    LAT_90p(µs)     LAT_95p(µs)     LAT_99p(µs)     RATE(/s)
@@ -205,7 +217,7 @@ $ tcpulse -c --jsonlines --proto tcp --flavor ephemeral --rate 1000 --duration 1
 
 The JSON Lines format includes the following fields:
 - `peer`: Target server address
-- `count`: Total number of successful connections/requests
+- `count`: Total number of messages/requests sent (CNT in standard output)
 - `latency_max_us`: Maximum latency in microseconds
 - `latency_min_us`: Minimum latency in microseconds
 - `latency_mean_us`: Mean latency in microseconds
