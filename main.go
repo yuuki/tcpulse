@@ -74,7 +74,7 @@ func init() {
 	pflag.Int32Var(&connections, "connections", 10,
 		fmt.Sprintf("[client mode] Number of concurrent connections to keep (only for '%s')", flavorPersistent))
 	pflag.Int32Var(&rate, "rate", 100,
-		fmt.Sprintf("[client mode] New connections throughput (/s) (for '%s') or message roundtrip throughput per connection (/s) (for '%s' and UDP)", flavorEphemeral, flavorPersistent))
+		fmt.Sprintf("[client mode] Message throughput per connection (/s) (for '%s' and UDP) or new connections throughput (/s) (for '%s'). Total messages (CNT) = rate * duration * connections (for '%s') or rate * duration (for '%s')", flavorPersistent, flavorEphemeral, flavorPersistent, flavorEphemeral))
 	pflag.DurationVar(&duration, "duration", 10*time.Second, "[client mode] measurement period")
 	pflag.Int32Var(&messageBytes, "message-bytes", 64, "[client mode] TCP/UDP message size (bytes)")
 	pflag.BoolVar(&showOnlyResults, "show-only-results", false, "[client mode] print only results of measurement stats")
@@ -167,11 +167,16 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  -s, --server    Run in server mode (accept connections)\n\n")
 	fmt.Fprintf(os.Stderr, "Options:\n")
 	pflag.PrintDefaults()
-	fmt.Fprintf(os.Stderr, "\nExamples:\n")
+	fmt.Fprintf(os.Stderr, "\nOutput Format (Client Mode):\n")
+	fmt.Fprintf(os.Stderr, "  CNT: Total number of messages/requests sent (not connections)\n")
+	fmt.Fprintf(os.Stderr, "  For persistent mode: CNT = rate × duration × connections\n")
+	fmt.Fprintf(os.Stderr, "  For ephemeral mode:  CNT = rate × duration\n\n")
+	fmt.Fprintf(os.Stderr, "Examples:\n")
 	fmt.Fprintf(os.Stderr, "  %s -s                          # Start server on default port 9100\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "  %s -s 0.0.0.0:8080             # Start server on port 8080\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "  %s -c localhost:9100           # Connect to server as client\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "  %s -c --connections 50 host:port # Connect with 50 connections\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "  %s -c --connections 1 --rate 1 --duration 1s host:port # Send exactly 1 message\n", os.Args[0])
 }
 
 func runServer() error {
