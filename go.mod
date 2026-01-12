@@ -1,6 +1,6 @@
 module github.com/yuuki/tcpulse
 
-go 1.24
+go 1.25
 
 require (
 	github.com/rcrowley/go-metrics v0.0.0-20250401214520-65e299d6c5c9
