@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.8.3](https://github.com/yuuki/tcpulse/compare/v0.8.2...v0.8.3) - 2026-01-12
+- docs: clarify CNT field meaning in help output by @yuuki in https://github.com/yuuki/tcpulse/pull/44
+- Upgrade Go version to 1.25 by @yuuki in https://github.com/yuuki/tcpulse/pull/45
+
 ## [v0.8.2](https://github.com/yuuki/tcpulse/compare/v0.8.1...v0.8.2) - 2025-06-13
 - refactor: separate printer functionality into dedicated module by @yuuki in https://github.com/yuuki/tcpulse/pull/40
 - Fix SIGINT handling in high-load ephemeral TCP/UDP mode by @yuuki in https://github.com/yuuki/tcpulse/pull/41
