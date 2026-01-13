@@ -1,5 +1,7 @@
 # Changelog
 
+## [v0.8.4](https://github.com/yuuki/tcpulse/compare/v0.8.3...v0.8.4) - 2026-01-13
+
 ## [v0.8.3](https://github.com/yuuki/tcpulse/compare/v0.8.2...v0.8.3) - 2026-01-12
 - docs: clarify CNT field meaning in help output by @yuuki in https://github.com/yuuki/tcpulse/pull/44
 - Upgrade Go version to 1.25 by @yuuki in https://github.com/yuuki/tcpulse/pull/45
