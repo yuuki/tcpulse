@@ -7,7 +7,7 @@ import (
 	"github.com/spf13/pflag"
 )
 
-const version = "0.8.3"
+const version = "0.8.4"
 
 var revision = "HEAD"
 var showVersion bool
