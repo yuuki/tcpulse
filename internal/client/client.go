@@ -95,6 +95,10 @@ func Run(ctx context.Context, cfg Config, addr string, rec *stats.Recorder) erro
 	return err
 }
 
+// errTolerated is returned by a request that failed in a way the run
+// tolerates: the failure is logged, and the request is not recorded.
+var errTolerated = errors.New("request failed")
+
 type run struct {
 	cfg     Config
 	addr    string
@@ -111,11 +115,12 @@ func (r *run) messages() int64 {
 
 // measure records how long f takes, if it succeeds. The message must be
 // ready before: generating it is not part of the round trip. A request that
-// the end of the run cuts off is neither recorded nor an error.
+// failed with errTolerated, or that the end of the run cut off, is neither
+// recorded nor an error.
 func (r *run) measure(ctx context.Context, f func() error) error {
 	start := time.Now()
 	if err := f(); err != nil {
-		if cutOff(ctx, err) {
+		if errors.Is(err, errTolerated) || cutOff(ctx, err) {
 			return nil
 		}
 		return err
@@ -243,7 +248,7 @@ func (r *run) ephemeralRequest(ctx context.Context, dialer *net.Dialer, msg []by
 	if err != nil {
 		if errors.Is(err, syscall.ETIMEDOUT) {
 			r.logger.Warn("connection timeout", "addr", r.addr)
-			return nil
+			return errTolerated
 		}
 		return fmt.Errorf("dialing %q: %w", r.addr, err)
 	}
@@ -257,14 +262,14 @@ func (r *run) ephemeralRequest(ctx context.Context, dialer *net.Dialer, msg []by
 	if _, err := conn.Write(msg); err != nil {
 		if errors.Is(err, syscall.EINPROGRESS) {
 			r.logger.Warn("write in progress", "addr", r.addr)
-			return nil
+			return errTolerated
 		}
 		return fmt.Errorf("writing to connection: %w", err)
 	}
 	if _, err := io.ReadFull(conn, msg); err != nil {
 		if errors.Is(err, syscall.ECONNRESET) {
 			r.logger.Warn("connection reset", "addr", r.addr)
-			return nil
+			return errTolerated
 		}
 		return fmt.Errorf("reading from connection: %w", err)
 	}

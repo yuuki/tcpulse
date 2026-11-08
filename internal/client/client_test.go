@@ -303,3 +303,39 @@ func TestRunLargeMessages(t *testing.T) {
 		})
 	}
 }
+
+// resettingServer reads a message of size on every TCP connection, then
+// resets the connection instead of echoing it, until the test ends.
+func resettingServer(t *testing.T, size int) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				_, _ = io.ReadFull(conn, make([]byte, size))
+				_ = conn.(*net.TCPConn).SetLinger(0)
+				_ = conn.Close()
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func TestRunDoesNotRecordFailedRequests(t *testing.T) {
+	cfg := config(ProtocolTCP, FlavorEphemeral)
+	rec := stats.NewRecorder()
+	if err := Run(t.Context(), cfg, resettingServer(t, cfg.MessageBytes), rec); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := rec.Total().Count; got != 0 {
+		t.Fatalf("%d reset requests recorded as round trips", got)
+	}
+}
