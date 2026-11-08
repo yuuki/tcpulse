@@ -91,16 +91,21 @@ func Start(opts Options) (*Tracer, error) {
 		t.dropErr = errors.New("kernel events are not counted")
 	}
 	if opts.RunQueue {
-		sw, err := switchProgram(kernel)
-		if err != nil {
-			return nil, err
-		}
-		progs = append(progs, keventsProgKeventsWakeup, keventsProgKeventsWakeupNew, sw)
+		progs = append(progs, keventsProgKeventsWakeup, keventsProgKeventsWakeupNew, keventsProgKeventsSwitch)
 	}
 	for name := range spec.Programs {
 		if !slices.Contains(progs, name) {
 			delete(spec.Programs, name)
 		}
+	}
+	// The library creates every map of the spec: leave out those of what is
+	// not asked for.
+	if !opts.Events {
+		delete(spec.Maps, keventsMapConns)
+	}
+	if !opts.RunQueue {
+		delete(spec.Maps, keventsMapRunq)
+		delete(spec.Maps, keventsMapRunqStart)
 	}
 
 	coll, err := ebpf.NewCollection(spec)
@@ -253,23 +258,6 @@ func retransmitProgram(kernel *btf.Spec) (string, error) {
 	}
 }
 
-// switchProgram returns the context switch program that matches the
-// kernel's sched_switch tracepoint: Linux 5.18 added prev_state.
-func switchProgram(kernel *btf.Spec) (string, error) {
-	params, err := tracepointParams(kernel, "sched_switch")
-	if err != nil {
-		return "", err
-	}
-	switch len(params) {
-	case 3:
-		return keventsProgKeventsSwitch, nil
-	case 4:
-		return keventsProgKeventsSwitchState, nil
-	default:
-		return "", fmt.Errorf("unexpected prototype of the sched_switch tracepoint: %d parameters", len(params))
-	}
-}
-
 // dropReasonPrefix starts the names of the values of enum skb_drop_reason.
 const dropReasonPrefix = "SKB_DROP_REASON_"
 
@@ -401,6 +389,9 @@ func (t *Tracer) DropReasons() map[uint32]string { return t.dropReasons }
 // works, a duplicate included: it keeps the socket, and its counters, after
 // the connection's own descriptor is closed.
 func (t *Tracer) ReadEvents(fd int) (stats.Events, error) {
+	if t.conns == nil {
+		return stats.Events{}, errors.New("the kernel events are not counted")
+	}
 	// The key of socket storage is the socket's file descriptor, a C int.
 	if fd < 0 || fd > math.MaxInt32 {
 		return stats.Events{}, fmt.Errorf("file descriptor %d out of range", fd)
@@ -461,6 +452,15 @@ func runqBucketMax(b int) uint64 {
 func (t *Tracer) RunQueue() (stats.RunQueueSummary, error) {
 	if t.runq == nil {
 		return stats.RunQueueSummary{}, errors.New("the run queue latency is not measured")
+	}
+	// Until a thread of the process was switched out, nothing was measured:
+	// that is not a process that never waited.
+	var tgid uint32
+	if err := t.coll.Variables[keventsVarRunqTgid].Get(&tgid); err != nil {
+		return stats.RunQueueSummary{}, fmt.Errorf("reading the run queue latency: %w", err)
+	}
+	if tgid == 0 {
+		return stats.RunQueueSummary{}, errors.New("no thread of the process was switched out while the programs ran")
 	}
 	var perCPU []keventsKeventsRunq
 	if err := t.runq.Lookup(uint32(0), &perCPU); err != nil {

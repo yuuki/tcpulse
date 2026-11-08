@@ -326,11 +326,12 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 	}
 	var runq *stats.RunQueueSummary
 	if o.runqueueLatency {
-		q, err := tracer.RunQueue()
-		if err != nil {
-			return fmt.Errorf("--runqueue-latency: %w", err)
+		// The round trips are reported without it.
+		if q, err := tracer.RunQueue(); err != nil {
+			logger.Warn("could not read the run queue latency", "error", err)
+		} else {
+			runq = &q
 		}
-		runq = &q
 	}
 
 	result := func(peer string, rec *stats.Recorder) report.Result {

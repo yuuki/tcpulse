@@ -54,7 +54,6 @@ const (
 	keventsProgKeventsRetransmit    = "kevents_retransmit"
 	keventsProgKeventsRetransmitErr = "kevents_retransmit_err"
 	keventsProgKeventsSwitch        = "kevents_switch"
-	keventsProgKeventsSwitchState   = "kevents_switch_state"
 	keventsProgKeventsWakeup        = "kevents_wakeup"
 	keventsProgKeventsWakeupNew     = "kevents_wakeup_new"
 	keventsVarEventsGeneration      = "events_generation"
@@ -113,7 +112,6 @@ type keventsProgramSpecs struct {
 	KeventsRetransmit    *ebpf.ProgramSpec `ebpf:"kevents_retransmit"`
 	KeventsRetransmitErr *ebpf.ProgramSpec `ebpf:"kevents_retransmit_err"`
 	KeventsSwitch        *ebpf.ProgramSpec `ebpf:"kevents_switch"`
-	KeventsSwitchState   *ebpf.ProgramSpec `ebpf:"kevents_switch_state"`
 	KeventsWakeup        *ebpf.ProgramSpec `ebpf:"kevents_wakeup"`
 	KeventsWakeupNew     *ebpf.ProgramSpec `ebpf:"kevents_wakeup_new"`
 }
@@ -193,7 +191,6 @@ type keventsPrograms struct {
 	KeventsRetransmit    *ebpf.Program `ebpf:"kevents_retransmit"`
 	KeventsRetransmitErr *ebpf.Program `ebpf:"kevents_retransmit_err"`
 	KeventsSwitch        *ebpf.Program `ebpf:"kevents_switch"`
-	KeventsSwitchState   *ebpf.Program `ebpf:"kevents_switch_state"`
 	KeventsWakeup        *ebpf.Program `ebpf:"kevents_wakeup"`
 	KeventsWakeupNew     *ebpf.Program `ebpf:"kevents_wakeup_new"`
 }
@@ -207,7 +204,6 @@ func (p *keventsPrograms) Close() error {
 		p.KeventsRetransmit,
 		p.KeventsRetransmitErr,
 		p.KeventsSwitch,
-		p.KeventsSwitchState,
 		p.KeventsWakeup,
 		p.KeventsWakeupNew,
 	)

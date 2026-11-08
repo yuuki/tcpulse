@@ -334,17 +334,30 @@ than those of §3.5; it loads only its own programs.
 | Tracepoint | What it does |
 | --- | --- |
 | `sched_wakeup`, `sched_wakeup_new` | A thread of the process becomes runnable: remembers when, by thread ID, in a hash map. |
-| `sched_switch` | The switch is involuntary, as the kernel counts it (`nivcsw`), when prev was preempted in the kernel or is still runnable: its time slice ended (preemption in user mode goes through `schedule()`, with `preempt` false), or it yielded. prev then waits again, from now. next stops waiting: its wait is recorded. |
+| `sched_switch` | prev stays runnable when it was preempted in the kernel, or when its state is `TASK_RUNNING`: its time slice ended (preemption in user mode goes through `schedule()`, with `preempt` false), it yielded, or a pending signal kept it from sleeping. The switch is then involuntary, and prev waits again, from now; otherwise prev blocks, and its start is cleared. next stops waiting: its wait is recorded. |
 
 The tasks of these tracepoints carry the IDs of the initial PID namespace,
 while tcpulse may run in a container. The process's ID there is learnt at
 the first context switch of one of its threads, when it is the current task,
-by the namespace check of §3.5; then a switch or wakeup of another process
-costs a load and a comparison. Since Linux 5.18, `sched_switch` passes the
-state prev had when it called the scheduler: reading the state in the
-tracepoint may see a task that a concurrent wakeup already made runnable.
-Before, there is only that, and the loader picks the program that matches
-the prototype.
+by the namespace check of §3.5 (a helper call at every switch of the host
+until then); then a switch or wakeup of another process costs a few loads
+and comparisons.
+
+The state of prev is read in the tracepoint, not taken from its `prev_state`
+argument (Linux 5.18): until Linux 6.16, that is the state of a sleep that a
+pending signal cut short, while the task stays runnable, and a Go thread
+with a pending SIGURG (asynchronous preemption) would lose its wait. Read in
+the tracepoint, the state is `TASK_RUNNING` exactly when prev stays
+runnable: a wakeup racing with the switch sets `TASK_WAKING`, and its own
+tracepoint comes after. The kernel counts the switches the same way
+(`nivcsw`), but since Linux 6.16 it counts such cut-short sleeps as
+voluntary.
+
+`sched_wakeup` also fires for a thread that is still running (a wakeup
+before it slept, `ttwu_runnable`), and sets a start then. A switch that
+blocks the thread clears it, so that a later switch to it cannot count the
+time it ran as a wait. A start older on its CPU's clock than the one that
+ends it, which would be a wait of 2^64 nanoseconds, is not counted.
 
 The waits go to a per-CPU array (the CPU where they end, with preemption
 disabled, so plain increments): their count, total, longest, and a
@@ -352,7 +365,14 @@ histogram whose buckets are at most 1/8 of their values wide (each power of
 two of nanoseconds in eight). After the run, the client adds the CPUs up;
 the percentiles are nearest-rank, as the largest value of their bucket, and
 the longest wait is exact. The report prints one section for the process,
-and every JSON object carries the same `runqueue_latency`.
+and every JSON object carries the same `runqueue_latency`. Until a thread of
+the process was switched out, the programs did not know it, and measured
+nothing: reading the waits is then an error, logged, and the report leaves
+the section out rather than show a process that never waited.
+
+A Tracer creates the maps of what it is asked for only: the library would
+otherwise create those of the run queue (a hash map of 4096 threads, and a
+histogram per CPU) for `--kernel-events` alone.
 
 The waits are those of the process: a Go thread runs the goroutines of
 many connections, so a wait cannot be given to one round trip. The report

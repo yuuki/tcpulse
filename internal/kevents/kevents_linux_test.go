@@ -445,6 +445,13 @@ func TestTracerRunQueue(t *testing.T) {
 	if _, err := tr.ReadEvents(0); err == nil {
 		t.Error("ReadEvents without Events succeeded")
 	}
+	if tr.coll.Maps[keventsMapConns] != nil {
+		t.Error("the map of the kernel events was created without Events")
+	}
+	var before unix.Rusage
+	if err := unix.Getrusage(unix.RUSAGE_SELF, &before); err != nil {
+		t.Fatal(err)
+	}
 	threads := 4 * runtime.NumCPU()
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(threads))
 	// The threads spin: they never block, so they wait only for a CPU.
@@ -460,12 +467,22 @@ func TestTracerRunQueue(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	stop.Store(true)
 	wg.Wait()
+	var after unix.Rusage
+	if err := unix.Getrusage(unix.RUSAGE_SELF, &after); err != nil {
+		t.Fatal(err)
+	}
 
 	s, err := tr.RunQueue()
 	if err != nil {
 		t.Fatal(err)
 	}
-
+	// The involuntary switches are the kernel's (it counts those of the
+	// threads that exited too), but for the few that came between Start and
+	// the first reading, or after the second.
+	nivcsw := after.Nivcsw - before.Nivcsw
+	if diff := s.Preempted - nivcsw; diff < -nivcsw/10-50 || diff > nivcsw/10+50 {
+		t.Errorf("%d involuntary switches, the kernel counted %d", s.Preempted, nivcsw)
+	}
 	if s.Waits == 0 || s.Preempted == 0 || s.Max == 0 {
 		t.Fatalf("run queue = %+v, want waits and preemptions", s)
 	}
@@ -582,4 +599,16 @@ func TestTracerSentDrops(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 		}
 	})
+}
+
+// TestTracerMaps checks that a Tracer creates the maps of what it is asked
+// for only.
+func TestTracerMaps(t *testing.T) {
+	tr := startTracerWith(t, Options{Events: true})
+	if tr.coll.Maps[keventsMapRunq] != nil || tr.coll.Maps[keventsMapRunqStart] != nil {
+		t.Error("the maps of the run queue latency were created without RunQueue")
+	}
+	if _, err := tr.RunQueue(); err == nil {
+		t.Error("RunQueue without RunQueue succeeded")
+	}
 }

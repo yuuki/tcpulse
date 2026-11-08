@@ -380,15 +380,14 @@ func TestClientTCPInfoMergedText(t *testing.T) {
 	}
 }
 
-// canTrace reports whether this process may load the eBPF programs of
-// --kernel-events and --runqueue-latency, which tests normally may not (they
-// run unprivileged).
-func canTrace(t *testing.T) bool {
+// canTrace reports whether this process may load the eBPF programs of opts,
+// which tests normally may not (they run unprivileged).
+func canTrace(t *testing.T, opts kevents.Options) bool {
 	t.Helper()
 	if !kevents.Supported {
 		return false
 	}
-	tr, err := kevents.Start(kevents.Options{Events: true, RunQueue: true})
+	tr, err := kevents.Start(opts)
 	if err != nil {
 		t.Logf("cannot load the eBPF programs: %v", err)
 		return false
@@ -407,7 +406,7 @@ func TestClientKernelEvents(t *testing.T) {
 			t.Fatalf("exit %d, stderr %q; want --kernel-events refused", r.code, r.stderr)
 		}
 		return
-	case !canTrace(t):
+	case !canTrace(t, kevents.Options{Events: true}):
 		// The failure to load is an error, with its reason, not a report
 		// without events.
 		if r.code != exitError || !strings.Contains(r.stderr, "--kernel-events: loading the eBPF programs") || r.stdout != "" {
@@ -721,7 +720,7 @@ func TestClientRunQueueLatency(t *testing.T) {
 			t.Fatalf("exit %d, stderr %q; want --runqueue-latency refused", r.code, r.stderr)
 		}
 		return
-	case !canTrace(t):
+	case !canTrace(t, kevents.Options{RunQueue: true}):
 		if r.code != exitError || !strings.Contains(r.stderr, "--runqueue-latency: loading the eBPF programs") || r.stdout != "" {
 			t.Fatalf("exit %d, stdout %q, stderr %q; want the load error", r.code, r.stdout, r.stderr)
 		}

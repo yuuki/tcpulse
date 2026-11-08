@@ -402,14 +402,14 @@ WAITS      PREEMPTED  WAIT_TOTAL(µs)  WAIT_50p(µs)    WAIT_99p(µs)    WAIT_MA
 In this run, two busy loops per CPU shared the CPUs of the client. Its 99th percentile, 4.88ms, is that of its waits for a CPU, 4.19ms, and its slowest round trip, 11.09ms, its longest wait, 11.29ms: the latency was the client's own. On an idle host, the same run had a 99th percentile of 348µs, and its waits one of 73µs.
 
 - `WAITS`: The waits for a CPU that ended, of all the threads of tcpulse, from the start of the programs (before the first connection) to the end of the run
-- `PREEMPTED`: The involuntary context switches of the threads, as the kernel counts them (`nonvoluntary_ctxt_switches` in `/proc/<pid>/status`): the CPU was taken from a thread that could still run, because its time slice ended, a more urgent task woke up, or it yielded
+- `PREEMPTED`: The involuntary context switches of the threads: the CPU was taken from a thread that could still run, because its time slice ended, a more urgent task woke up, or it yielded. The kernel counts them for the process too (`ru_nivcsw` of `getrusage(2)`), but since Linux 6.16 counts as voluntary a sleep that a pending signal cut short, which this counts as involuntary.
 - `WAIT_TOTAL(µs)`: The sum of the waits. With several threads, it can exceed the duration of the run.
-- `WAIT_50p(µs)`, `WAIT_99p(µs)`: Percentiles of the waits, rounded up by at most 1/8
+- `WAIT_50p(µs)`, `WAIT_99p(µs)`: Percentiles of the waits, rounded up by at most 1/8 (the programs keep the waits in buckets of their own, coarser than those of the round trips)
 - `WAIT_MAX(µs)`: The longest wait
 
 The waits are those of the process, not of the round trips: a thread runs the goroutines of many connections, and its wait delays every round trip it was about to resume. Waits close to the slow round trips point to the client; waits far shorter rule it out.
 
-**Cost:** the programs run at every context switch and wakeup of the host, whatever the process: for the others, they cost a load and a comparison. Inside the clock, tcpulse adds nothing. Against the same server, 50 persistent connections at 1,000 messages per second each had a mean latency 5 to 24µs higher than without the option (about 190µs), which is the size of the differences between runs; 2,000 ephemeral connections per second, 1 to 3µs higher.
+**Cost:** the programs run at every context switch and wakeup of the host, whatever the process: once they know the process's ID, at the first switch of one of its threads, those of the others cost a few loads and comparisons. They run inside the clock for tcpulse's own threads: the wakeup that ends most round trips updates a hash map, and the switch to the woken thread looks it up and updates the histogram. Against the same server, 50 persistent connections at 1,000 messages per second each had a mean latency 5 to 24µs higher than without the option (about 190µs), which is the size of the differences between runs; 2,000 ephemeral connections per second, 1 to 3µs higher.
 
 With `--jsonlines`, each object ends with a `runqueue_latency` object (after `kernel_events`, if present), the same in every object of a run: `waits`, `preempted`, `wait_total_us`, `wait_50p_us`, `wait_99p_us`, `wait_max_us`.
 
