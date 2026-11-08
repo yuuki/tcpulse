@@ -66,6 +66,10 @@ func Main(ctx context.Context, env Env) int {
 		usage(env.Stdout, env.Program, fs)
 		return exitOK
 	}
+	if err := o.envError(o.server && !o.client); err != nil {
+		fmt.Fprintf(env.Stderr, "Error: %v\n", err)
+		return exitUsage
+	}
 
 	switch {
 	case o.client && o.server:
@@ -155,7 +159,14 @@ func validateClient(o *options) error {
 	if o.duration <= 0 {
 		return fmt.Errorf("--duration must be positive, got %v", o.duration)
 	}
-	if o.interval <= 0 {
+	switch n, ok := client.Messages(int(o.rate), o.duration); {
+	case !ok:
+		return fmt.Errorf("--rate %d for --duration %v makes too many messages to count", o.rate, o.duration)
+	case n < 1:
+		return fmt.Errorf("--rate %d for --duration %v sends no message", o.rate, o.duration)
+	}
+	// The interval only paces the interval lines.
+	if printsIntervals(o) && o.interval <= 0 {
 		return fmt.Errorf("--interval must be positive, got %v", o.interval)
 	}
 	if o.messageBytes < 1 {
@@ -165,6 +176,11 @@ func validateClient(o *options) error {
 		return fmt.Errorf("--message-bytes must be at most %d with --proto udp, got %d", maxUDPMessageBytes, o.messageBytes)
 	}
 	return nil
+}
+
+// printsIntervals reports whether a client run prints interval lines.
+func printsIntervals(o *options) bool {
+	return !o.showOnlyResults && !o.jsonlines
 }
 
 // maxUDPMessageBytes is the largest UDP payload over IPv4: 65535 bytes less
@@ -208,16 +224,16 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 		MessageBytes: int(o.messageBytes),
 		Logger:       logger,
 	}
-	recorders := stats.NewSet(addrs, o.mergeResultsEachHost)
-	printIntervalLines := !o.showOnlyResults && !o.jsonlines
+	recorders := stats.NewSet(len(addrs), o.mergeResultsEachHost)
 
 	intervalCtx, stopIntervals := context.WithCancel(ctx)
 	defer stopIntervals()
 	var intervals sync.WaitGroup
 	eg, runCtx := errgroup.WithContext(ctx)
-	for _, addr := range addrs {
-		rec := recorders.For(addr)
-		if printIntervalLines {
+	start := time.Now()
+	for i, addr := range addrs {
+		rec := recorders.For(i)
+		if printsIntervals(o) {
 			intervals.Go(func() {
 				printIntervals(intervalCtx, printer, addr, rec, o.interval, logger)
 			})
@@ -234,18 +250,48 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 		return fmt.Errorf("connection error: %w", err)
 	}
 
+	// The rate of the run is over its duration: the run stops when its last
+	// echo is back, up to 1/rate before the end of the duration, which
+	// would inflate the rate (to thousands per second for a single
+	// message). A run that was interrupted is measured until it stopped.
+	run := time.Since(start)
+	if ctx.Err() == nil {
+		run = max(run, o.duration)
+	}
+
 	var results []report.Result
 	if o.mergeResultsEachHost {
-		results = []report.Result{{Peer: report.MergedPeer(len(addrs)), Summary: recorders.For("").Total()}}
+		results = []report.Result{{Peer: report.MergedPeer(len(addrs)), Summary: recorders.For(0).Total(run)}}
 	} else {
-		for _, addr := range addrs {
-			results = append(results, report.Result{Peer: addr, Summary: recorders.For(addr).Total()})
+		for i, addr := range addrs {
+			results = append(results, report.Result{Peer: addr, Summary: recorders.For(i).Total(run)})
 		}
 	}
 	if o.jsonlines {
-		return printer.JSONLines(results)
+		err = printer.JSONLines(results)
+	} else {
+		err = printer.Report(results)
 	}
-	return printer.Report(results)
+	if err != nil {
+		return err
+	}
+	return noRoundTrip(results)
+}
+
+// noRoundTrip returns an error naming the targets with which no round trip
+// completed (the report shows them too): a target that never answers must
+// not pass for a successful run.
+func noRoundTrip(results []report.Result) error {
+	var silent []string
+	for _, r := range results {
+		if r.Summary.Count == 0 {
+			silent = append(silent, r.Peer)
+		}
+	}
+	if len(silent) == 0 {
+		return nil
+	}
+	return fmt.Errorf("no round trip completed with %s", strings.Join(silent, ", "))
 }
 
 // printIntervals prints the round trips to peer of every interval until ctx

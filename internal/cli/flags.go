@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"time"
 
@@ -19,6 +20,13 @@ const EnvPrefix = "TCPULSE_"
 
 // noEnv lists the options that have no environment variable.
 var noEnv = map[string]bool{"help": true, "version": true}
+
+// serverOptions are the options of server mode only, and commonOptions those
+// of both modes; every other option belongs to client mode only.
+var (
+	serverOptions = map[string]bool{"protocol": true, "listen-addrs-file": true}
+	commonOptions = map[string]bool{"client": true, "server": true, "help": true, "version": true}
+)
 
 const defaultListenAddr = "0.0.0.0:9100"
 
@@ -53,6 +61,28 @@ type options struct {
 	// args are the positional arguments: addresses to connect to (or the
 	// addresses file), or to listen on.
 	args []string
+
+	// envErrors holds, by option name, the environment variables whose
+	// value could not be parsed. Only those of the mode that runs are
+	// errors (envError), as tcpulse 0.8 ignored the others.
+	envErrors map[string]error
+}
+
+// envError returns the error of the first environment variable (by option
+// name) that could not be parsed among those of server mode, or else of
+// client mode.
+func (o *options) envError(serverMode bool) error {
+	names := make([]string, 0, len(o.envErrors))
+	for name := range o.envErrors {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		if commonOptions[name] || serverOptions[name] == serverMode {
+			return o.envErrors[name]
+		}
+	}
+	return nil
 }
 
 func newFlagSet(o *options) *pflag.FlagSet {
@@ -99,24 +129,26 @@ func EnvName(option string) string {
 }
 
 // parse parses the command line args, then sets every option that args do
-// not give and whose environment variable is set and not empty.
+// not give and whose environment variable is set and not empty. It returns
+// an error for the command line only: see options.envErrors.
 func parse(args []string, lookupEnv func(string) (string, bool)) (*options, *pflag.FlagSet, error) {
 	o := &options{}
 	fs := newFlagSet(o)
 	if err := fs.Parse(args); err != nil {
 		return nil, fs, err
 	}
-	if err := applyEnv(fs, lookupEnv); err != nil {
-		return nil, fs, err
-	}
+	o.envErrors = applyEnv(fs, lookupEnv)
 	o.args = fs.Args()
 	return o, fs, nil
 }
 
-func applyEnv(fs *pflag.FlagSet, lookupEnv func(string) (string, bool)) error {
-	var err error
+// applyEnv sets the options that the command line does not give from their
+// environment variables, and returns the errors of the values it could not
+// parse, by option name.
+func applyEnv(fs *pflag.FlagSet, lookupEnv func(string) (string, bool)) map[string]error {
+	var errs map[string]error
 	fs.VisitAll(func(f *pflag.Flag) {
-		if err != nil || f.Changed || noEnv[f.Name] {
+		if f.Changed || noEnv[f.Name] {
 			return
 		}
 		name := EnvName(f.Name)
@@ -124,11 +156,14 @@ func applyEnv(fs *pflag.FlagSet, lookupEnv func(string) (string, bool)) error {
 		if !ok || value == "" {
 			return
 		}
-		if setErr := fs.Set(f.Name, value); setErr != nil {
-			err = fmt.Errorf("invalid %s %q: %w", name, value, setErr)
+		if err := fs.Set(f.Name, value); err != nil {
+			if errs == nil {
+				errs = make(map[string]error)
+			}
+			errs[f.Name] = fmt.Errorf("invalid %s %q: %w", name, value, err)
 		}
 	})
-	return err
+	return errs
 }
 
 func usage(w io.Writer, program string, fs *pflag.FlagSet) {

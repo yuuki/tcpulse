@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -97,9 +99,47 @@ func TestParseEnvironment(t *testing.T) {
 }
 
 func TestParseInvalidEnvironment(t *testing.T) {
-	_, _, err := parse(nil, environment(map[string]string{"TCPULSE_CONNECTIONS": "many"}))
-	if err == nil || !strings.Contains(err.Error(), "TCPULSE_CONNECTIONS") {
-		t.Fatalf("parse returned %v, want an error naming TCPULSE_CONNECTIONS", err)
+	o, _, err := parse(nil, environment(map[string]string{
+		"TCPULSE_CONNECTIONS": "many",
+		"TCPULSE_PROTOCOL":    "", // empty: ignored
+	}))
+	if err != nil {
+		t.Fatalf("parse returned %v for an environment variable", err)
+	}
+	if err := o.envError(false); err == nil || !strings.Contains(err.Error(), "TCPULSE_CONNECTIONS") {
+		t.Fatalf("envError(client) = %v, want an error naming TCPULSE_CONNECTIONS", err)
+	}
+	// --connections is a client option.
+	if err := o.envError(true); err != nil {
+		t.Fatalf("envError(server) = %v, want nil", err)
+	}
+}
+
+func TestMainInvalidEnvironment(t *testing.T) {
+	invalidRate := environment(map[string]string{"TCPULSE_RATE": "abc"})
+	for _, tc := range []struct {
+		name     string
+		env      func(string) (string, bool)
+		args     []string
+		wantCode int
+		want     string
+	}{
+		// --help and --version work whatever the environment.
+		{"version", invalidRate, []string{"--version"}, exitOK, ""},
+		{"help", invalidRate, []string{"--help"}, exitOK, ""},
+		{"client option in client mode", invalidRate, []string{"-c", "host:1"}, exitUsage, "invalid TCPULSE_RATE"},
+		// A variable of the other mode is ignored, as in tcpulse 0.8: the
+		// server fails on its address, not on TCPULSE_INTERVAL.
+		{"client option in server mode", environment(map[string]string{"TCPULSE_INTERVAL": "5"}), []string{"-s", "256.0.0.1:9100"}, exitError, "256.0.0.1:9100"},
+		{"server option in client mode", environment(map[string]string{"TCPULSE_PROTOCOL": "x", "TCPULSE_RATE": "1.5"}), []string{"-c", "host:1"}, exitUsage, "invalid TCPULSE_RATE"},
+		{"mode", environment(map[string]string{"TCPULSE_CLIENT": "maybe"}), []string{"host:1"}, exitUsage, "invalid TCPULSE_CLIENT"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := runMain(t.Context(), tc.env, tc.args...)
+			if r.code != tc.wantCode || !strings.Contains(r.stderr, tc.want) {
+				t.Fatalf("exit %d, stderr %q; want exit %d and %q", r.code, r.stderr, tc.wantCode, tc.want)
+			}
+		})
 	}
 }
 
@@ -163,6 +203,8 @@ func TestMainUsageErrors(t *testing.T) {
 		{"no rate", []string{"-c", "--rate", "0", "host:1"}, exitError, "--rate must be at least 1"},
 		{"negative rate", []string{"-c", "--flavor", "ephemeral", "--rate", "-5", "host:1"}, exitError, "--rate must be at least 1"},
 		{"no duration", []string{"-c", "--duration", "0s", "host:1"}, exitError, "--duration must be positive"},
+		{"no message", []string{"-c", "--rate", "1", "--duration", "900ms", "host:1"}, exitError, "sends no message"},
+		{"too many messages", []string{"-c", "--rate", "2000000000", "--duration", "2000000h", "host:1"}, exitError, "too many messages"},
 		{"no interval", []string{"-c", "--interval", "0s", "host:1"}, exitError, "--interval must be positive"},
 		{"empty messages", []string{"-c", "--message-bytes", "0", "host:1"}, exitError, "--message-bytes must be at least 1"},
 		{"oversized datagrams", []string{"-c", "--proto", "udp", "--message-bytes", "65508", "host:1"}, exitError, "at most 65507"},
@@ -298,7 +340,8 @@ func TestClientMergedResults(t *testing.T) {
 
 func TestClientIntervalLines(t *testing.T) {
 	addrs := echoServers(t, server.ProtocolTCP, 1)
-	r := runMain(t.Context(), noEnvironment, "-c", "--connections", "1", "--rate", "20", "--duration", "2s", "--interval", "600ms", addrs[0])
+	// Messages at 0, 100, ... 1900ms.
+	r := runMain(t.Context(), noEnvironment, "-c", "--connections", "1", "--rate", "10", "--duration", "2s", "--interval", "600ms", addrs[0])
 	if r.code != 0 {
 		t.Fatalf("exit %d: %s", r.code, r.stderr)
 	}
@@ -315,8 +358,8 @@ func TestClientIntervalLines(t *testing.T) {
 			t.Errorf("interval line %q, want round trips to %s", line, addrs[0])
 		}
 	}
-	if total := strings.Fields(after); total[0] != addrs[0] || total[1] != "40" {
-		t.Fatalf("report %q, want 40 round trips to %s", after, addrs[0])
+	if total := strings.Fields(after); total[0] != addrs[0] || total[1] != "20" {
+		t.Fatalf("report %q, want 20 round trips to %s", after, addrs[0])
 	}
 }
 
@@ -420,7 +463,11 @@ func TestValidClientEdges(t *testing.T) {
 		// --connections only matters to persistent TCP connections.
 		{"-c", "--flavor", "ephemeral", "--connections", "0", "host:1"},
 		{"-c", "--proto", "udp", "--connections", "0", "--message-bytes", "65507", "host:1"},
-		{"-c", "--rate", "1", "--duration", "1ns", "--message-bytes", "1", "host:1"},
+		{"-c", "--rate", "1", "--duration", "1s", "--message-bytes", "1", "host:1"},
+		{"-c", "--rate", "1000000000", "--duration", "1ns", "host:1"},
+		// --interval only matters when interval lines are printed.
+		{"-c", "--jsonlines", "--interval", "0s", "host:1"},
+		{"-c", "--show-only-results", "--interval", "-1s", "host:1"},
 	} {
 		o, _, err := parse(args, noEnvironment)
 		if err != nil {
@@ -441,6 +488,7 @@ func FuzzParse(f *testing.F) {
 	f.Add("-c --proto udp host:1", "TCPULSE_MESSAGE_BYTES=65508")
 	f.Add("-s --protocol udp 127.0.0.1:0", "TCPULSE_LISTEN_ADDRS_FILE=")
 	f.Add("--connections=-1 --interval=0s -c a", "TCPULSE_FLAVOR=ephemeral\nTCPULSE_DURATION=1ns")
+	f.Add("-c --rate 1 --duration 999ms a", "TCPULSE_RATE=x")
 	f.Fuzz(func(t *testing.T, cmdline, env string) {
 		vars := map[string]string{}
 		for _, kv := range strings.Split(env, "\n") {
@@ -452,14 +500,23 @@ func FuzzParse(f *testing.F) {
 		if err != nil {
 			return
 		}
-		if validateServer(o) == nil && o.serveProtocol != "tcp" && o.serveProtocol != "udp" && o.serveProtocol != "all" {
+		if o.envError(true) == nil && validateServer(o) == nil &&
+			o.serveProtocol != "tcp" && o.serveProtocol != "udp" && o.serveProtocol != "all" {
 			t.Fatalf("server protocol %q accepted", o.serveProtocol)
 		}
-		if validateClient(o) != nil {
+		if o.envError(false) != nil || validateClient(o) != nil {
 			return
 		}
-		if o.rate < 1 || o.duration <= 0 || o.interval <= 0 || o.messageBytes < 1 || len(o.args) == 0 {
+		if o.rate < 1 || o.duration <= 0 || o.messageBytes < 1 || len(o.args) == 0 {
 			t.Fatalf("accepted options cannot generate load: %+v", *o)
+		}
+		if !o.jsonlines && !o.showOnlyResults && o.interval <= 0 {
+			t.Fatalf("accepted interval lines every %v", o.interval)
+		}
+		// At least one message, computed exactly: rate × duration / 1s.
+		messages := new(big.Int).Mul(big.NewInt(int64(o.rate)), big.NewInt(int64(o.duration)))
+		if messages.Quo(messages, big.NewInt(int64(time.Second))).Sign() <= 0 {
+			t.Fatalf("accepted a run without a message: %d/s for %v", o.rate, o.duration)
 		}
 		if o.proto == "tcp" && o.flavor == "persistent" && o.connections < 1 {
 			t.Fatalf("accepted persistent run without connections: %+v", *o)
@@ -468,4 +525,66 @@ func FuzzParse(f *testing.F) {
 			t.Fatalf("accepted %d-byte datagrams", o.messageBytes)
 		}
 	})
+}
+
+// silentServer accepts TCP connections and never answers, until the test
+// ends.
+func silentServer(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = io.Copy(io.Discard, conn)
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func TestClientNoRoundTrip(t *testing.T) {
+	answering := echoServers(t, server.ProtocolTCP, 1)[0]
+	silent := silentServer(t)
+	r := runMain(t.Context(), noEnvironment, "-c", "--jsonlines", "--connections", "1", "--rate", "5", "--duration", "1s", answering, silent)
+	if r.code != exitError || !strings.Contains(r.stderr, "no round trip completed with "+silent) || strings.Contains(r.stderr, answering) {
+		t.Fatalf("exit %d, stderr %q; want exit 1 naming %s only", r.code, r.stderr, silent)
+	}
+	// The report is printed all the same.
+	results := decodeJSONLines(t, r.stdout)
+	if len(results) != 2 || results[0].Count != 5 || results[1].Count != 0 {
+		t.Fatalf("results:\n%s", r.stdout)
+	}
+}
+
+func TestClientRateOverTheDuration(t *testing.T) {
+	addr := echoServers(t, server.ProtocolTCP, 1)[0]
+	// The single message is back long before the end of the second.
+	r := runMain(t.Context(), noEnvironment, "-c", "--jsonlines", "--connections", "1", "--rate", "1", "--duration", "1s", addr)
+	if r.code != 0 {
+		t.Fatalf("exit %d: %s", r.code, r.stderr)
+	}
+	if results := decodeJSONLines(t, r.stdout); len(results) != 1 || results[0].Count != 1 || results[0].Rate > 1 || results[0].Rate < 0.9 {
+		t.Fatalf("results:\n%s\nwant 1 round trip at 1/s", r.stdout)
+	}
+}
+
+func TestClientSameAddressTwice(t *testing.T) {
+	addr := echoServers(t, server.ProtocolTCP, 1)[0]
+	r := runMain(t.Context(), noEnvironment, "-c", "--jsonlines", "--connections", "1", "--rate", "10", "--duration", "1s", addr, addr)
+	if r.code != 0 {
+		t.Fatalf("exit %d: %s", r.code, r.stderr)
+	}
+	// Each occurrence puts its own load and counts its own round trips.
+	if results := decodeJSONLines(t, r.stdout); len(results) != 2 || results[0].Count != 10 || results[1].Count != 10 {
+		t.Fatalf("results:\n%s\nwant 10 round trips for each occurrence", r.stdout)
+	}
 }

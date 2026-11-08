@@ -36,12 +36,12 @@ func TestRecorderIntervalsAndTotal(t *testing.T) {
 		t.Fatalf("second interval = %+v, want 30 round trips of 3ms at 30/s", second)
 	}
 
-	total := r.Total()
+	total := r.Total(4 * time.Second)
 	if total.Count != 40 || total.Min != time.Millisecond || total.Max != 3*time.Millisecond {
 		t.Fatalf("total = %+v, want 40 round trips between 1ms and 3ms", total)
 	}
-	if total.Rate != 40.0/3 {
-		t.Fatalf("total rate = %v, want 40/3", total.Rate)
+	if total.Rate != 10 {
+		t.Fatalf("total rate = %v, want 40 over the 4s of the run", total.Rate)
 	}
 	if want := (10*time.Millisecond + 90*time.Millisecond) / 40; total.Mean != want {
 		t.Fatalf("total mean = %v, want %v", total.Mean, want)
@@ -54,8 +54,7 @@ func TestRecorderEmpty(t *testing.T) {
 	if s := r.TakeInterval(); s != (Summary{}) {
 		t.Fatalf("empty interval without elapsed time = %+v, want zero", s)
 	}
-	clock.advance(time.Second)
-	if s := r.Total(); s != (Summary{}) {
+	if s := r.Total(time.Second); s != (Summary{}) {
 		t.Fatalf("empty total = %+v, want zero", s)
 	}
 }
@@ -72,22 +71,20 @@ func TestRecorderConcurrent(t *testing.T) {
 		}
 	})
 	wg.Wait()
-	if got := r.Total().Count; got != 8000 {
+	if got := r.Total(time.Second).Count; got != 8000 {
 		t.Fatalf("total count = %d, want 8000", got)
 	}
 }
 
 func TestSet(t *testing.T) {
-	separate := NewSet([]string{"a:1", "b:2", "a:1"}, false)
-	if separate.For("a:1") == nil || separate.For("a:1") == separate.For("b:2") {
-		t.Fatal("peers do not have a Recorder each")
-	}
-	if separate.For("c:3") != nil {
-		t.Fatal("unknown peer has a Recorder")
+	// The same address given twice is two targets.
+	separate := NewSet(3, false)
+	if separate.For(0) == nil || separate.For(0) == separate.For(1) || separate.For(0) == separate.For(2) {
+		t.Fatal("targets do not have a Recorder each")
 	}
 
-	merged := NewSet([]string{"a:1", "b:2"}, true)
-	if merged.For("a:1") == nil || merged.For("a:1") != merged.For("b:2") || merged.For("") != merged.For("a:1") {
-		t.Fatal("merged peers do not share a Recorder")
+	merged := NewSet(2, true)
+	if merged.For(0) == nil || merged.For(0) != merged.For(1) {
+		t.Fatal("merged targets do not share a Recorder")
 	}
 }

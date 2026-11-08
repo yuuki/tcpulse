@@ -35,27 +35,25 @@ func summarize(h *Histogram, elapsed time.Duration) Summary {
 	return s
 }
 
-// Recorder accumulates round trips over two periods: the whole run, since
-// the Recorder was created, and the current reporting interval, since the
-// last TakeInterval. It is safe for concurrent use.
+// Recorder accumulates round trips over two periods: the whole run, and the
+// current reporting interval, since the last TakeInterval (or since the
+// Recorder was created). It is safe for concurrent use.
 type Recorder struct {
 	now func() time.Time
 
 	mu            sync.Mutex
 	total         Histogram
 	interval      Histogram
-	start         time.Time
 	intervalStart time.Time
 }
 
-// NewRecorder returns a Recorder whose run and first interval start now.
+// NewRecorder returns a Recorder whose first interval starts now.
 func NewRecorder() *Recorder {
 	return newRecorder(time.Now)
 }
 
 func newRecorder(now func() time.Time) *Recorder {
-	t := now()
-	return &Recorder{now: now, start: t, intervalStart: t}
+	return &Recorder{now: now, intervalStart: now()}
 }
 
 // Record adds a round trip that took d.
@@ -66,11 +64,13 @@ func (r *Recorder) Record(d time.Duration) {
 	r.mu.Unlock()
 }
 
-// Total summarizes every round trip since the Recorder was created.
-func (r *Recorder) Total() Summary {
+// Total summarizes every round trip of the run, whose length (for the rate)
+// the caller knows: the run stops when its last echo is back, which can be
+// well before its configured duration.
+func (r *Recorder) Total(run time.Duration) Summary {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return summarize(&r.total, r.now().Sub(r.start))
+	return summarize(&r.total, run)
 }
 
 // TakeInterval summarizes the round trips since the previous call (or since
@@ -85,33 +85,31 @@ func (r *Recorder) TakeInterval() Summary {
 	return s
 }
 
-// Set holds the Recorders of a run: one per peer, or a single one that every
-// peer shares when the results of the peers are merged.
+// Set holds the Recorders of a run: one per target, or a single one that
+// every target shares when their results are merged. Targets are numbered in
+// the order they were given; an address given twice is two targets, each
+// loaded and counted on its own.
 type Set struct {
-	merged *Recorder
-	peers  map[string]*Recorder
+	merged  *Recorder
+	targets []*Recorder
 }
 
-// NewSet returns the Recorders of peers. A peer listed twice gets a single
-// Recorder.
-func NewSet(peers []string, merge bool) *Set {
+// NewSet returns the Recorders of n targets.
+func NewSet(n int, merge bool) *Set {
 	if merge {
 		return &Set{merged: NewRecorder()}
 	}
-	s := &Set{peers: make(map[string]*Recorder, len(peers))}
-	for _, p := range peers {
-		if _, ok := s.peers[p]; !ok {
-			s.peers[p] = NewRecorder()
-		}
+	s := &Set{targets: make([]*Recorder, n)}
+	for i := range s.targets {
+		s.targets[i] = NewRecorder()
 	}
 	return s
 }
 
-// For returns the Recorder of peer: the shared one when merged, nil for a
-// peer NewSet was not given otherwise.
-func (s *Set) For(peer string) *Recorder {
+// For returns the Recorder of target i, or the shared one when merged.
+func (s *Set) For(i int) *Recorder {
 	if s.merged != nil {
 		return s.merged
 	}
-	return s.peers[peer]
+	return s.targets[i]
 }

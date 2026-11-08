@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"math/big"
 	"net"
 	"testing"
 	"time"
@@ -83,7 +84,7 @@ func TestRun(t *testing.T) {
 			if err := Run(t.Context(), config(tc.protocol, tc.flavor), addr, rec); err != nil {
 				t.Fatalf("Run: %v", err)
 			}
-			total := rec.Total()
+			total := rec.Total(time.Second)
 			if total.Count != tc.wantCount {
 				t.Fatalf("%d round trips, want %d", total.Count, tc.wantCount)
 			}
@@ -192,7 +193,7 @@ func TestRunEndsDuringARequest(t *testing.T) {
 			if err := Run(t.Context(), cfg, addr, rec); err != nil {
 				t.Fatalf("Run: %v", err)
 			}
-			if got := rec.Total().Count; got != 3 {
+			if got := rec.Total(time.Second).Count; got != 3 {
 				t.Fatalf("%d round trips, want 3: the last request was cut off", got)
 			}
 		})
@@ -212,7 +213,7 @@ func TestRunLostDatagrams(t *testing.T) {
 	if err := Run(t.Context(), cfg, pc.LocalAddr().String(), rec); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if got := rec.Total().Count; got != 0 {
+	if got := rec.Total(time.Second).Count; got != 0 {
 		t.Fatalf("%d round trips without an answer", got)
 	}
 }
@@ -268,7 +269,7 @@ func TestRunWaitsForTheWholeEcho(t *testing.T) {
 			if err := Run(t.Context(), cfg, addr, rec); err != nil {
 				t.Fatalf("Run: %v", err)
 			}
-			total := rec.Total()
+			total := rec.Total(time.Second)
 			if total.Count != 8 {
 				t.Fatalf("%d round trips, want 8", total.Count)
 			}
@@ -298,7 +299,7 @@ func TestRunLargeMessages(t *testing.T) {
 			if err := Run(t.Context(), cfg, echoServer(t, tc.protocol), rec); err != nil {
 				t.Fatalf("Run: %v", err)
 			}
-			if got := rec.Total().Count; got != tc.wantCount {
+			if got := rec.Total(time.Second).Count; got != tc.wantCount {
 				t.Fatalf("%d round trips, want %d", got, tc.wantCount)
 			}
 		})
@@ -336,7 +337,7 @@ func TestRunDoesNotRecordFailedRequests(t *testing.T) {
 	if err := Run(t.Context(), cfg, resettingServer(t, cfg.MessageBytes), rec); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if got := rec.Total().Count; got != 0 {
+	if got := rec.Total(time.Second).Count; got != 0 {
 		t.Fatalf("%d reset requests recorded as round trips", got)
 	}
 }
@@ -346,32 +347,69 @@ func TestMessages(t *testing.T) {
 		rate     int
 		duration time.Duration
 		want     int64
+		ok       bool
 	}{
-		{100, 10 * time.Second, 1000},
-		{1, time.Second, 1},
-		{1, 999 * time.Millisecond, 0},
-		{100, 500 * time.Millisecond, 50},
-		{3, 1500 * time.Millisecond, 4},
-		{40000, 2 * time.Minute, 4800000},
-		{math.MaxInt32, 24 * time.Hour, math.MaxInt32 * 86400},
+		{100, 10 * time.Second, 1000, true},
+		{1, time.Second, 1, true},
+		{1, 999 * time.Millisecond, 0, true},
+		{100, 500 * time.Millisecond, 50, true},
+		{3, 1500 * time.Millisecond, 4, true},
+		{40000, 2 * time.Minute, 4800000, true},
+		{math.MaxInt32, 24 * time.Hour, math.MaxInt32 * 86400, true},
+		{0, time.Hour, 0, true},
+		// 2^31 × about 7.2e9 s overflows int64.
+		{2000000000, 2000000 * time.Hour, 0, false},
+		{math.MaxInt32, math.MaxInt64, 0, false},
+		{-1, time.Second, 0, false},
+		{1, -time.Second, 0, false},
 	} {
-		r := &run{cfg: Config{Rate: tc.rate, Duration: tc.duration}}
-		if got := r.messages(); got != tc.want {
-			t.Errorf("messages() at %d/s for %v = %d, want %d", tc.rate, tc.duration, got, tc.want)
+		got, ok := Messages(tc.rate, tc.duration)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("Messages(%d, %v) = %d, %v; want %d, %v", tc.rate, tc.duration, got, ok, tc.want, tc.ok)
 		}
 	}
 }
 
+func FuzzMessages(f *testing.F) {
+	f.Add(int64(100), int64(10*time.Second))
+	f.Add(int64(math.MaxInt32), int64(math.MaxInt64))
+	f.Add(int64(3), int64(1500*time.Millisecond))
+	f.Fuzz(func(t *testing.T, rate, d int64) {
+		if rate < 0 || rate > math.MaxInt32 {
+			return
+		}
+		got, ok := Messages(int(rate), time.Duration(d))
+		// Exact: rate × d / 1e9, rounded down.
+		want := new(big.Int).Mul(big.NewInt(rate), big.NewInt(d))
+		want.Quo(want, big.NewInt(int64(time.Second)))
+		switch {
+		case d < 0:
+			if ok {
+				t.Fatalf("Messages(%d, %d) accepted a negative duration", rate, d)
+			}
+		case want.IsInt64():
+			if !ok || got != want.Int64() {
+				t.Fatalf("Messages(%d, %d) = %d, %v; want %v", rate, d, got, ok, want)
+			}
+		default:
+			if ok {
+				t.Fatalf("Messages(%d, %d) = %d, want an overflow (%v)", rate, d, got, want)
+			}
+		}
+	})
+}
+
 func TestRunSubsecondDuration(t *testing.T) {
 	cfg := config(ProtocolTCP, FlavorPersistent)
-	cfg.Rate = 20
-	cfg.Duration = 500 * time.Millisecond
+	cfg.Rate = 4
+	cfg.Duration = 1500 * time.Millisecond
 	rec := stats.NewRecorder()
 	if err := Run(t.Context(), cfg, echoServer(t, ProtocolTCP), rec); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if got := rec.Total().Count; got != 20 {
-		t.Fatalf("%d round trips, want 20 (2 connections × 20/s × 500ms)", got)
+	// Messages at 0, 250, ... 1250ms on each connection.
+	if got := rec.Total(cfg.Duration).Count; got != 12 {
+		t.Fatalf("%d round trips, want 12 (2 connections × 4/s × 1.5s)", got)
 	}
 }
 
@@ -479,7 +517,7 @@ func TestRunStopsWhenCanceledDuringARequest(t *testing.T) {
 			if elapsed := time.Since(start); elapsed > 5*time.Second {
 				t.Fatalf("Run returned %v after its context was canceled at 300ms", elapsed)
 			}
-			if got := rec.Total().Count; got != 0 {
+			if got := rec.Total(time.Second).Count; got != 0 {
 				t.Fatalf("%d round trips without an echo", got)
 			}
 		})
@@ -502,7 +540,7 @@ func TestRunMessagesLargerThanSocketBuffers(t *testing.T) {
 			if err := Run(t.Context(), cfg, echoServer(t, ProtocolTCP), rec); err != nil {
 				t.Fatalf("Run: %v", err)
 			}
-			if got := rec.Total().Count; got != 4 {
+			if got := rec.Total(time.Second).Count; got != 4 {
 				t.Fatalf("%d round trips, want 4", got)
 			}
 		})

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"sync"
@@ -107,11 +108,35 @@ type run struct {
 	bufPool sync.Pool
 }
 
-// messages returns how many messages a sender at cfg.Rate per second sends
-// during cfg.Duration: rate × duration, rounded down.
+// Messages returns how many messages a sender at rate per second sends
+// during d: rate × d, rounded down. ok is false when the count does not fit
+// in an int64 (or rate or d is negative).
+func Messages(rate int, d time.Duration) (n int64, ok bool) {
+	if rate < 0 || d < 0 {
+		return 0, false
+	}
+	r := int64(rate)
+	secs, frac := int64(d/time.Second), int64(d%time.Second)
+	if r != 0 && secs > math.MaxInt64/r {
+		return 0, false
+	}
+	// frac < 1e9, so r×frac fits whenever r < 2^33; a larger rate overflows
+	// the whole count anyway once d is a second or more.
+	if r != 0 && frac > math.MaxInt64/r {
+		return 0, false
+	}
+	whole, part := r*secs, r*frac/int64(time.Second)
+	if whole > math.MaxInt64-part {
+		return 0, false
+	}
+	return whole + part, true
+}
+
+// messages returns how many messages each sender of the run sends; the
+// command line validates that the count fits.
 func (r *run) messages() int64 {
-	rate, d := int64(r.cfg.Rate), r.cfg.Duration
-	return rate*int64(d/time.Second) + rate*int64(d%time.Second)/int64(time.Second)
+	n, _ := Messages(r.cfg.Rate, r.cfg.Duration)
+	return n
 }
 
 // finish records a round trip that took elapsed, or returns the error of a
