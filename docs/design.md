@@ -385,7 +385,12 @@ the code), then GoReleaser:
 
 - archives `tcpulse_<version>_<os>_<arch>.tar.gz` for Linux and macOS on
   amd64 and arm64, built with `-trimpath` and commit timestamps, and
-  `tcpulse_<version>_checksums.txt`;
+  `tcpulse_<version>_checksums.txt`. Next to the binary, they hold
+  `LICENSE`, `NOTICE`, `LICENSES/` (the eBPF object's licenses) and
+  `THIRD_PARTY_NOTICES`, the license texts of the Go standard library and
+  of the modules linked into the binary on any release platform, which a
+  hook writes with `scripts/third-party-notices` (it fails on a module
+  without a license file);
 - a linux/amd64 and linux/arm64 image `ghcr.io/yuuki/tcpulse` tagged
   `X.Y.Z`, `X.Y`, `X` and `latest`, assembled from the same binaries
   (Alpine, running as `nobody`);

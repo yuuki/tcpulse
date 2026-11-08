@@ -16,3 +16,8 @@ in the tcpulse binary, and --kernel-events loads it into the Linux kernel.
   and include/bpf_tracing.h are copied from libbpf v1.6.3
   (https://github.com/libbpf/libbpf) and are licensed under
   LGPL-2.1 OR BSD-2-Clause; tcpulse uses them under BSD-2-Clause.
+
+The tcpulse binary also links the Go standard library and third-party Go
+modules. Their license texts are in THIRD_PARTY_NOTICES, which the release
+archives and the container image ship next to the binary
+(scripts/third-party-notices writes it: `make notices`).
