@@ -77,6 +77,7 @@ Creates new connections for each request, immediately closing them afterward. Th
 - **Platform optimizations**: Leverages Linux-specific optimizations (TCP_FASTOPEN, SO_REUSEPORT) when available
 - **JSON Lines output**: Machine-readable output format for integration with monitoring and analysis tools
 - **Kernel TCP statistics**: Retransmissions, the kernel's smoothed RTT and TCP Fast Open use of the connections, with `--tcp-info` on Linux
+- **Latency breakdown**: Which part of the round trips moved, the client's sending, the network and the server, or the client's receiving, by the kernel's timestamps of the last byte of each message, with `--latency-breakdown` (Linux, no privileges needed)
 - **Kernel events per round trip**: Which round trips met a SYN retransmission, a retransmission timeout, another retransmission or a reset, and how slow they were compared with the others, with `--kernel-events` (eBPF, Linux)
 
 ## Installation
@@ -149,6 +150,7 @@ Options:
       --interval duration          [client mode] interval for printing stats (default 5s)
       --jsonlines                  [client mode] output results in JSON Lines format
       --kernel-events              [client mode] attribute kernel TCP events (retransmissions, resets) to the round trips with eBPF (Linux only, needs root or CAP_BPF and CAP_PERFMON)
+      --latency-breakdown          [client mode] split every round trip into send, network and receive time with the kernel's timestamps (SO_TIMESTAMPING; persistent TCP, Linux only)
       --listen-addrs-file string   [server mode] enable to pass a file including a pair of addresses and ports
       --merge-results-each-host    [client mode] merge results of each host (with --show-only-results)
       --message-bytes int32        [client mode] TCP/UDP message size (bytes) (default 64)
@@ -351,6 +353,40 @@ With `--jsonlines`, each object ends with a `kernel_events` object (after `tcp_i
 - `untracked_round_trips`.
 
 The round trips with and without events, plus the untracked ones, add up to `count`.
+
+#### Latency Breakdown (`--latency-breakdown`)
+
+On Linux, `--latency-breakdown` splits every round trip of persistent TCP connections into three parts, by the kernel's software timestamps of the last byte of the message (`SO_TIMESTAMPING`, which needs no privileges). When a percentile moves, the part that moved tells where: in the client, or in the network and the server.
+
+```shell-session
+$ tcpulse -c --show-only-results --latency-breakdown --connections 10 --rate 1000 --duration 4s 192.0.2.10:9100
+PEER                 CNT        LAT_MAX(µs)     LAT_MIN(µs)     LAT_MEAN(µs)    LAT_90p(µs)     LAT_95p(µs)     LAT_99p(µs)     RATE(/s)
+--- A result during total execution time ---
+192.0.2.10:9100      38808      23553           8               423             278             3948            5767            9692.27
+--- Breakdown of the round trips (SO_TIMESTAMPING) ---
+PEER                 SPLIT_RTS  MISSING    NEGATIVE   SEND_50p(µs)    SEND_99p(µs)    NET_50p(µs)     NET_99p(µs)     RECV_50p(µs)    RECV_99p(µs)
+192.0.2.10:9100      38808      0          0          1               11              35              250             39              5537
+```
+
+In this run, two busy loops per CPU shared the CPUs of the client. The 99th percentile, 5.77ms, is in the receive part (5.54ms): the echoes had arrived, and the client was late to read them. The network part kept the 99th percentile it had on an idle host (250µs against 253µs), where the round trips had one of 378µs.
+
+- `SPLIT_RTS`: The completed round trips with a breakdown
+- `MISSING`: The completed round trips without one, for lack of a timestamp: the first round trip of a connection that TCP Fast Open opened with it (the offsets of the stream are not known before), a network driver that does not timestamp what it sends, a timestamp lost
+- `NEGATIVE`: The completed round trips with a negative part, whose breakdown is not used: a step of the system clock, or packets reordered
+- `SEND_50p(µs)`, `SEND_99p(µs)`: From the start of the round trip to the last byte of the message leaving the host (the driver's timestamp, or the loopback device's). For a message larger than the socket buffers or the congestion window, this includes the wait for them.
+- `NET_50p(µs)`, `NET_99p(µs)`: From there to the reception of the last byte of the echo by the client's host: the network both ways and the server, retransmissions included
+- `RECV_50p(µs)`, `RECV_99p(µs)`: From there to the end of the round trip: the client reading the echo, its waits for a CPU included
+
+`SPLIT_RTS`, `MISSING` and `NEGATIVE` add up to `CNT`; the percentiles of the parts are over the round trips with a breakdown.
+
+How the parts are taken:
+- **The last byte only:** the transmit timestamp is that of the send request that ends with the message's last byte, found by its offset in the stream (`SOF_TIMESTAMPING_OPT_ID`); the receive timestamp is that of the `recvmsg(2)` that returns the last byte of the echo. The partial writes of a large message, and the first bytes of its echo, which can arrive before its last byte has left, are not used.
+- **No substitute:** a round trip that lacks a timestamp has no breakdown. Nothing stands in for it, and a negative part is counted, not set to 0.
+- **Clock:** the parts are in the system's time (`CLOCK_REALTIME`), the clock of the kernel's timestamps. The start is read with the clock of the round trip, the end right after it stops, so the parts add up to `LAT_*` within a few microseconds, not exactly.
+- **Requirements:** persistent TCP on Linux; the option is refused with `--flavor ephemeral`, with `--proto udp` and on other platforms. While the run lasts, the kernel timestamps every packet the host receives (it does so as long as one socket asks).
+- **Cost:** the echo is read with `recvmsg(2)` rather than `read(2)`; after the clock stops, the transmit timestamps are read from the socket's error queue, with one `recvmsg(2)` each, plus one.
+
+With `--jsonlines`, each object ends with a `latency_breakdown` object (after `kernel_events`, if present): `round_trips`, `missing_timestamps`, `negative_parts`, `send_50p_us`, `send_99p_us`, `network_50p_us`, `network_99p_us`, `receive_50p_us`, `receive_99p_us`.
 
 ## Use Cases
 

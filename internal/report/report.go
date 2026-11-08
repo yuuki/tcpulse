@@ -23,6 +23,10 @@ type Result struct {
 	// Events describes the kernel events of the round trips when the run
 	// counted them (--kernel-events), and is nil otherwise.
 	Events *stats.EventSummary
+	// Breakdown describes how the round trips split into send, network and
+	// receive time when the run timestamped them (--latency-breakdown), and
+	// is nil otherwise.
+	Breakdown *stats.BreakdownSummary
 }
 
 // MergedPeer is the peer name of the merged result of n peers.
@@ -60,6 +64,12 @@ const (
 	// EventSeparator precedes the kernel events of the round trips in text
 	// output.
 	EventSeparator = "--- Kernel events of the round trips (eBPF) ---"
+
+	breakdownHeaderFormat = "%-20s %-10s %-10s %-10s %-15s %-15s %-15s %-15s %-15s %-15s\n"
+	breakdownLineFormat   = "%-20s %-10d %-10d %-10d %-15d %-15d %-15d %-15d %-15d %-15d\n"
+	// BreakdownSeparator precedes the breakdown of the round trips in text
+	// output.
+	BreakdownSeparator = "--- Breakdown of the round trips (SO_TIMESTAMPING) ---"
 )
 
 // Header writes the column header of the text output.
@@ -101,7 +111,35 @@ func (p *Printer) Report(results []Result) error {
 	if err := p.connReport(results); err != nil {
 		return err
 	}
-	return p.eventReport(results)
+	if err := p.eventReport(results); err != nil {
+		return err
+	}
+	return p.breakdownReport(results)
+}
+
+func (p *Printer) breakdownReport(results []Result) error {
+	header := false
+	for _, r := range results {
+		b := r.Breakdown
+		if b == nil {
+			continue
+		}
+		if !header {
+			if err := p.printf("%s\n"+breakdownHeaderFormat, BreakdownSeparator,
+				"PEER", "SPLIT_RTS", "MISSING", "NEGATIVE", "SEND_50p(µs)", "SEND_99p(µs)",
+				"NET_50p(µs)", "NET_99p(µs)", "RECV_50p(µs)", "RECV_99p(µs)"); err != nil {
+				return err
+			}
+			header = true
+		}
+		if err := p.printf(breakdownLineFormat, r.Peer, b.RoundTrips, b.Missing, b.Negative,
+			b.Send.P50.Microseconds(), b.Send.P99.Microseconds(),
+			b.Network.P50.Microseconds(), b.Network.P99.Microseconds(),
+			b.Receive.P50.Microseconds(), b.Receive.P99.Microseconds()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (p *Printer) eventReport(results []Result) error {
@@ -188,6 +226,40 @@ type JSONLinesResult struct {
 	// KernelEvents is only there when the run counted the kernel events of
 	// its round trips (--kernel-events).
 	KernelEvents *JSONLinesKernelEvents `json:"kernel_events,omitempty"`
+	// LatencyBreakdown is only there when the run timestamped its round
+	// trips (--latency-breakdown).
+	LatencyBreakdown *JSONLinesBreakdown `json:"latency_breakdown,omitempty"`
+}
+
+// JSONLinesBreakdown is the JSON object of the breakdown of the round trips
+// of a result.
+type JSONLinesBreakdown struct {
+	RoundTrips int64 `json:"round_trips"`
+	Missing    int64 `json:"missing_timestamps"`
+	Negative   int64 `json:"negative_parts"`
+	Send50p    int64 `json:"send_50p_us"`
+	Send99p    int64 `json:"send_99p_us"`
+	Network50p int64 `json:"network_50p_us"`
+	Network99p int64 `json:"network_99p_us"`
+	Receive50p int64 `json:"receive_50p_us"`
+	Receive99p int64 `json:"receive_99p_us"`
+}
+
+func jsonLinesBreakdown(b *stats.BreakdownSummary) *JSONLinesBreakdown {
+	if b == nil {
+		return nil
+	}
+	return &JSONLinesBreakdown{
+		RoundTrips: b.RoundTrips,
+		Missing:    b.Missing,
+		Negative:   b.Negative,
+		Send50p:    b.Send.P50.Microseconds(),
+		Send99p:    b.Send.P99.Microseconds(),
+		Network50p: b.Network.P50.Microseconds(),
+		Network99p: b.Network.P99.Microseconds(),
+		Receive50p: b.Receive.P50.Microseconds(),
+		Receive99p: b.Receive.P99.Microseconds(),
+	}
 }
 
 // JSONLinesKernelEvents is the JSON object of the kernel events of the round
@@ -274,18 +346,19 @@ func (p *Printer) JSONLines(results []Result) error {
 	for _, r := range results {
 		s := r.Summary
 		if err := enc.Encode(JSONLinesResult{
-			Peer:         r.Peer,
-			Count:        s.Count,
-			LatencyMax:   s.Max.Microseconds(),
-			LatencyMin:   s.Min.Microseconds(),
-			LatencyMean:  s.Mean.Microseconds(),
-			Latency90p:   s.P90.Microseconds(),
-			Latency95p:   s.P95.Microseconds(),
-			Latency99p:   s.P99.Microseconds(),
-			Rate:         s.Rate,
-			Timestamp:    timestamp,
-			TCPInfo:      jsonLinesTCPInfo(r.Conns),
-			KernelEvents: jsonLinesKernelEvents(r.Events),
+			Peer:             r.Peer,
+			Count:            s.Count,
+			LatencyMax:       s.Max.Microseconds(),
+			LatencyMin:       s.Min.Microseconds(),
+			LatencyMean:      s.Mean.Microseconds(),
+			Latency90p:       s.P90.Microseconds(),
+			Latency95p:       s.P95.Microseconds(),
+			Latency99p:       s.P99.Microseconds(),
+			Rate:             s.Rate,
+			Timestamp:        timestamp,
+			TCPInfo:          jsonLinesTCPInfo(r.Conns),
+			KernelEvents:     jsonLinesKernelEvents(r.Events),
+			LatencyBreakdown: jsonLinesBreakdown(r.Breakdown),
 		}); err != nil {
 			return fmt.Errorf("writing JSON Lines: %w", err)
 		}

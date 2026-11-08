@@ -2,7 +2,8 @@
 
 ## Rules
 - Only completed round trips are samples: a request cut off by the end of the run (`cutOff`) or failing with `errTolerated` is neither recorded nor an error; a target without any round trip fails the run (exit 1).
-- The clock covers only the round trip: generate the payload before starting it, and read the whole echo (`io.ReadFull`) before stopping it.
+- The clock covers only the round trip: generate the payload before starting it, and read the whole echo (`io.ReadFull`, or `tstamp.ReadFull` with `--latency-breakdown`) before stopping it.
+- `--latency-breakdown` changes nothing of what is counted or timed: transmit timestamps are read after the clock stops, only the last byte of a message is matched, and a round trip that lacks a timestamp or has a negative part has no breakdown, never a substitute.
 - CNT promises rate × duration (× connections for persistent), rounded down (`client.Messages`); pacing stays with `go.uber.org/ratelimit` and its slack.
 - Latencies go through `internal/stats.Histogram`: count, min, max and mean exact, percentiles nearest-rank within 1/128; no global registry or package state.
 - Validation in `internal/cli` rejects every option set `client.Run` cannot handle (it would panic or send nothing); `FuzzParse` checks it against an exact message count.

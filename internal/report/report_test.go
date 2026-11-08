@@ -199,6 +199,47 @@ func TestJSONLinesKernelEvents(t *testing.T) {
 	}
 }
 
+var sampleBreakdown = stats.BreakdownSummary{
+	RoundTrips: 14790, Missing: 7, Negative: 2,
+	Send:    stats.PartSummary{P50: 21 * time.Microsecond, P99: 81 * time.Microsecond},
+	Network: stats.PartSummary{P50: 455 * time.Microsecond, P99: 5480 * time.Microsecond},
+	Receive: stats.PartSummary{P50: 18 * time.Microsecond, P99: 4520 * time.Microsecond},
+}
+
+func TestReportBreakdown(t *testing.T) {
+	var buf bytes.Buffer
+	err := NewPrinter(&buf).Report([]Result{
+		{Peer: "10.0.150.2:9200", Summary: sample, Events: &sampleEvents, Breakdown: &sampleBreakdown},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The breakdown follows the kernel events, with its own header.
+	_, breakdown, ok := strings.Cut(buf.String(), BreakdownSeparator+"\n")
+	if !ok || !strings.Contains(buf.String(), EventSeparator) {
+		t.Fatalf("report:\n%s", buf.String())
+	}
+	want := "PEER                 SPLIT_RTS  MISSING    NEGATIVE   SEND_50p(µs)    SEND_99p(µs)    NET_50p(µs)     NET_99p(µs)     RECV_50p(µs)    RECV_99p(µs)   \n" +
+		"10.0.150.2:9200      14790      7          2          21              81              455             5480            18              4520           \n"
+	if breakdown != want {
+		t.Fatalf("breakdown:\n got %q\nwant %q", breakdown, want)
+	}
+}
+
+func TestJSONLinesBreakdown(t *testing.T) {
+	var buf bytes.Buffer
+	p := NewPrinter(&buf)
+	if err := p.JSONLines([]Result{{Peer: "10.0.150.2:9200", Summary: sample, Events: &sampleEvents, Breakdown: &sampleBreakdown}}); err != nil {
+		t.Fatal(err)
+	}
+	// latency_breakdown ends the object, after kernel_events.
+	want := `"untracked_round_trips":5},"latency_breakdown":{"round_trips":14790,"missing_timestamps":7,"negative_parts":2,` +
+		`"send_50p_us":21,"send_99p_us":81,"network_50p_us":455,"network_99p_us":5480,"receive_50p_us":18,"receive_99p_us":4520}}` + "\n"
+	if !strings.HasSuffix(buf.String(), want) {
+		t.Fatalf("JSON Lines: %s\nwant it to end with %s", buf.String(), want)
+	}
+}
+
 type failingWriter struct{}
 
 func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
@@ -206,12 +247,13 @@ func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("broken p
 func TestWriteErrors(t *testing.T) {
 	p := NewPrinter(failingWriter{})
 	for name, err := range map[string]error{
-		"Header":      p.Header(),
-		"Line":        p.Line(Result{Peer: "a:1"}),
-		"Report":      p.Report([]Result{{Peer: "a:1"}}),
-		"connReport":  NewPrinter(failingWriter{}).connReport([]Result{{Peer: "a:1", Conns: &stats.ConnSummary{}}}),
-		"eventReport": NewPrinter(failingWriter{}).eventReport([]Result{{Peer: "a:1", Events: &stats.EventSummary{}}}),
-		"JSONLines":   p.JSONLines([]Result{{Peer: "a:1"}}),
+		"Header":          p.Header(),
+		"Line":            p.Line(Result{Peer: "a:1"}),
+		"Report":          p.Report([]Result{{Peer: "a:1"}}),
+		"connReport":      NewPrinter(failingWriter{}).connReport([]Result{{Peer: "a:1", Conns: &stats.ConnSummary{}}}),
+		"eventReport":     NewPrinter(failingWriter{}).eventReport([]Result{{Peer: "a:1", Events: &stats.EventSummary{}}}),
+		"breakdownReport": NewPrinter(failingWriter{}).breakdownReport([]Result{{Peer: "a:1", Breakdown: &stats.BreakdownSummary{}}}),
+		"JSONLines":       p.JSONLines([]Result{{Peer: "a:1"}}),
 	} {
 		if err == nil {
 			t.Errorf("%s returned no error on a failing writer", name)

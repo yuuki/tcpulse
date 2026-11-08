@@ -78,20 +78,21 @@ func TestParseDefaults(t *testing.T) {
 
 func TestParseEnvironment(t *testing.T) {
 	o, _, err := parse([]string{"--rate", "7", "host:1"}, environment(map[string]string{
-		"TCPULSE_CLIENT":        "true",
-		"TCPULSE_RATE":          "1000", // the command line takes precedence
-		"TCPULSE_MESSAGE_BYTES": "1024",
-		"TCPULSE_DURATION":      "3s",
-		"TCPULSE_TCP_INFO":      "true",
-		"TCPULSE_KERNEL_EVENTS": "1",
-		"TCPULSE_FLAVOR":        "", // empty: ignored
-		"TCPULSE_VERSION":       "true",
-		"TCPULSE_HELP":          "true",
+		"TCPULSE_CLIENT":            "true",
+		"TCPULSE_RATE":              "1000", // the command line takes precedence
+		"TCPULSE_MESSAGE_BYTES":     "1024",
+		"TCPULSE_DURATION":          "3s",
+		"TCPULSE_TCP_INFO":          "true",
+		"TCPULSE_KERNEL_EVENTS":     "1",
+		"TCPULSE_LATENCY_BREAKDOWN": "true",
+		"TCPULSE_FLAVOR":            "", // empty: ignored
+		"TCPULSE_VERSION":           "true",
+		"TCPULSE_HELP":              "true",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !o.client || o.rate != 7 || o.messageBytes != 1024 || o.duration != 3*time.Second || o.flavor != "persistent" || !o.tcpInfo || !o.kernelEvents {
+	if !o.client || o.rate != 7 || o.messageBytes != 1024 || o.duration != 3*time.Second || o.flavor != "persistent" || !o.tcpInfo || !o.kernelEvents || !o.latencyBreakdown {
 		t.Fatalf("options = %+v", *o)
 	}
 	if o.showVersion || o.showHelp {
@@ -179,6 +180,7 @@ func TestMainHelp(t *testing.T) {
 			"\n      --message-bytes int32        [client mode] TCP/UDP message size (bytes) (default 64)\n",
 			"\n      --tcp-info                   [client mode] report TCP statistics of the connections read from the kernel (TCP_INFO, Linux only)\n",
 			"\n      --kernel-events              [client mode] attribute kernel TCP events (retransmissions, resets) to the round trips with eBPF (Linux only, needs root or CAP_BPF and CAP_PERFMON)\n",
+			"\n      --latency-breakdown          [client mode] split every round trip into send, network and receive time with the kernel's timestamps (SO_TIMESTAMPING; persistent TCP, Linux only)\n",
 			"TCPULSE_MESSAGE_BYTES=1024",
 			"Examples:",
 		} {
@@ -216,6 +218,8 @@ func TestMainUsageErrors(t *testing.T) {
 		{"oversized datagrams", []string{"-c", "--proto", "udp", "--message-bytes", "65508", "host:1"}, exitError, "at most 65507"},
 		{"TCP_INFO of UDP", []string{"-c", "--proto", "udp", "--tcp-info", "host:1"}, exitError, "--tcp-info requires --proto tcp"},
 		{"kernel events of UDP", []string{"-c", "--proto", "udp", "--kernel-events", "host:1"}, exitError, "--kernel-events requires --proto tcp"},
+		{"breakdown of UDP", []string{"-c", "--proto", "udp", "--latency-breakdown", "host:1"}, exitError, "--latency-breakdown requires --proto tcp"},
+		{"breakdown of ephemeral connections", []string{"-c", "--flavor", "ephemeral", "--latency-breakdown", "host:1"}, exitError, breakdownRefusal},
 		{"unknown server protocol", []string{"-s", "--protocol", "sctp"}, exitError, `unexpected protocol "sctp"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -597,6 +601,7 @@ func FuzzParse(f *testing.F) {
 	f.Add("-c --rate 1 --duration 999ms a", "TCPULSE_RATE=x")
 	f.Add("-c --tcp-info a", "TCPULSE_PROTO=udp")
 	f.Add("-c --kernel-events a", "TCPULSE_PROTO=udp")
+	f.Add("-c --latency-breakdown a", "TCPULSE_FLAVOR=ephemeral")
 	f.Fuzz(func(t *testing.T, cmdline, env string) {
 		vars := map[string]string{}
 		for _, kv := range strings.Split(env, "\n") {
@@ -637,6 +642,9 @@ func FuzzParse(f *testing.F) {
 		}
 		if o.kernelEvents && (o.proto != "tcp" || !kevents.Supported) {
 			t.Fatalf("accepted --kernel-events with --proto %s (supported: %v)", o.proto, kevents.Supported)
+		}
+		if o.latencyBreakdown && (o.proto != "tcp" || o.flavor != "persistent" || !client.BreakdownSupported) {
+			t.Fatalf("accepted --latency-breakdown with --proto %s --flavor %s (supported: %v)", o.proto, o.flavor, client.BreakdownSupported)
 		}
 	})
 }
@@ -700,5 +708,39 @@ func TestClientSameAddressTwice(t *testing.T) {
 	// Each occurrence puts its own load and counts its own round trips.
 	if results := decodeJSONLines(t, r.stdout); len(results) != 2 || results[0].Count != 10 || results[1].Count != 10 {
 		t.Fatalf("results:\n%s\nwant 10 round trips for each occurrence", r.stdout)
+	}
+}
+
+// breakdownRefusal is how --latency-breakdown is refused with ephemeral
+// connections: for the flavor on Linux, for the platform elsewhere.
+var breakdownRefusal = map[bool]string{
+	true:  "--latency-breakdown requires --flavor persistent",
+	false: "--latency-breakdown is only supported on Linux",
+}[client.BreakdownSupported]
+
+func TestClientLatencyBreakdown(t *testing.T) {
+	addrs := echoServers(t, server.ProtocolTCP, 2)
+	args := append([]string{"-c", "--jsonlines", "--latency-breakdown", "--connections", "2", "--rate", "10", "--duration", "1s"}, addrs...)
+	r := runMain(t.Context(), noEnvironment, args...)
+	if !client.BreakdownSupported {
+		if r.code != exitError || !strings.Contains(r.stderr, "--latency-breakdown is only supported on Linux") {
+			t.Fatalf("exit %d, stderr %q; want --latency-breakdown refused", r.code, r.stderr)
+		}
+		return
+	}
+	if r.code != 0 {
+		t.Fatalf("exit %d: %s", r.code, r.stderr)
+	}
+	results := decodeJSONLines(t, r.stdout)
+	if len(results) != len(addrs) {
+		t.Fatalf("%d results, want %d:\n%s", len(results), len(addrs), r.stdout)
+	}
+	for i, res := range results {
+		// Every round trip is accounted for once. The first round trip of a
+		// connection opened with TCP Fast Open has no timestamps.
+		b := res.LatencyBreakdown
+		if b == nil || res.Count != 20 || b.RoundTrips+b.Missing+b.Negative != res.Count || b.Missing > 2 || b.Negative != 0 {
+			t.Errorf("result %d = %+v, latency_breakdown %+v; want 20 round trips split", i, res, b)
+		}
 	}
 }
