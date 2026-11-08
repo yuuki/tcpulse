@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -29,9 +30,11 @@ const (
 	// udpBufferSize holds the largest UDP payload over IPv4 (65507 bytes):
 	// a datagram larger than the buffer would be truncated.
 	udpBufferSize = 64 * 1024
-	// acceptRetryDelay is how long the server waits after a timeout from
-	// accept before trying again.
-	acceptRetryDelay = time.Second
+	// After a transient accept error, the server waits minAcceptDelay
+	// before it accepts again, twice as long after each consecutive one, up
+	// to maxAcceptDelay.
+	minAcceptDelay = 5 * time.Millisecond
+	maxAcceptDelay = time.Second
 )
 
 var tcpBufPool = sync.Pool{
@@ -166,24 +169,34 @@ func (s *Server) Serve(ctx context.Context) error {
 func (s *Server) serveTCP(ctx context.Context, ln net.Listener) error {
 	var handlers sync.WaitGroup
 	defer handlers.Wait()
+	var delay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				s.logger.Warn("timeout error accepting TCP connection", "addr", ln.Addr(), "error", err)
-				time.Sleep(acceptRetryDelay)
-				continue
+			if !transientAcceptError(err) {
+				return fmt.Errorf("accepting TCP connection: %w", err)
 			}
-			return fmt.Errorf("accepting TCP connection: %w", err)
+			// Under load (out of file descriptors, a connection reset in
+			// the backlog), keep serving the connections already accepted
+			// and try again later, like net/http.
+			delay = min(max(2*delay, minAcceptDelay), maxAcceptDelay)
+			s.logger.Warn("could not accept a TCP connection; retrying", "addr", ln.Addr(), "error", err, "delay", delay)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(delay):
+			}
+			continue
 		}
+		delay = 0
 
+		// TCP_QUICKACK only speeds up acknowledgments: a connection whose
+		// socket refuses it is served all the same.
 		if err := sockopt.SetQuickAck(conn); err != nil {
-			_ = conn.Close()
-			return fmt.Errorf("setting quick ack: %w", err)
+			s.logger.Debug("could not set TCP_QUICKACK", "remote_addr", conn.RemoteAddr(), "error", err)
 		}
 
 		handlers.Go(func() {
@@ -197,7 +210,22 @@ func (s *Server) serveTCP(ctx context.Context, ln net.Listener) error {
 	}
 }
 
-// echo writes back what it reads from conn until the peer closes it.
+// transientAcceptError reports whether accept may succeed if tried again.
+func transientAcceptError(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	for _, errno := range []syscall.Errno{syscall.EMFILE, syscall.ENFILE, syscall.ENOBUFS, syscall.ENOMEM, syscall.ECONNABORTED} {
+		if errors.Is(err, errno) {
+			return true
+		}
+	}
+	return false
+}
+
+// echo writes back what it reads from conn until the peer closes or resets
+// it.
 func echo(conn net.Conn) error {
 	defer func() { _ = conn.Close() }()
 
@@ -208,15 +236,26 @@ func echo(conn net.Conn) error {
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+			if closedByPeer(err) {
 				return nil
 			}
 			return fmt.Errorf("reading from %q: %w", conn.RemoteAddr(), err)
 		}
 		if _, err := conn.Write(buf[:n]); err != nil {
+			if closedByPeer(err) {
+				return nil
+			}
 			return fmt.Errorf("writing to %q: %w", conn.RemoteAddr(), err)
 		}
 	}
+}
+
+// closedByPeer reports whether err ends a connection normally: the client
+// closed or reset it (a load generator stopping does), or the server
+// stopped.
+func closedByPeer(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
 }
 
 func (s *Server) serveUDP(ctx context.Context, pc net.PacketConn) error {

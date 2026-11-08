@@ -7,6 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -192,5 +195,86 @@ func TestServeClosesConnectionsOnCancel(t *testing.T) {
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if _, err := conn.Read(make([]byte, 1)); err == nil {
 		t.Fatal("connection still open after the server stopped")
+	}
+}
+
+type acceptResult struct {
+	conn net.Conn
+	err  error
+}
+
+// fakeListener returns the connections and errors sent to it.
+type fakeListener struct {
+	results chan acceptResult
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func newFakeListener() *fakeListener {
+	return &fakeListener{results: make(chan acceptResult), closed: make(chan struct{})}
+}
+
+func (l *fakeListener) Accept() (net.Conn, error) {
+	select {
+	case r := <-l.results:
+		return r.conn, r.err
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *fakeListener) Close() error {
+	l.once.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *fakeListener) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+
+func TestServeTCPSurvivesFailures(t *testing.T) {
+	ln := newFakeListener()
+	s := &Server{logger: discard}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- s.serveTCP(ctx, ln) }()
+
+	for _, err := range []error{
+		&net.OpError{Op: "accept", Net: "tcp", Err: os.NewSyscallError("accept4", syscall.EMFILE)},
+		&net.OpError{Op: "accept", Net: "tcp", Err: os.NewSyscallError("accept4", syscall.ECONNABORTED)},
+	} {
+		select {
+		case ln.results <- acceptResult{err: err}:
+		case err := <-done:
+			t.Fatalf("serveTCP returned %v", err)
+		}
+	}
+
+	// A connection whose socket options cannot be set (net.Pipe is not
+	// TCP) is still served on Linux, and so are the following ones.
+	for range 2 {
+		local, remote := net.Pipe()
+		select {
+		case ln.results <- acceptResult{conn: remote}:
+		case err := <-done:
+			t.Fatalf("serveTCP returned %v", err)
+		}
+		roundTrip(t, local, []byte("still serving"))
+		_ = local.Close()
+	}
+
+	cancel()
+	_ = ln.Close()
+	if err := <-done; err != nil {
+		t.Fatalf("serveTCP returned %v after the server stopped", err)
+	}
+}
+
+func TestServeTCPStopsOnPermanentError(t *testing.T) {
+	ln := newFakeListener()
+	s := &Server{logger: discard}
+	done := make(chan error, 1)
+	go func() { done <- s.serveTCP(t.Context(), ln) }()
+	ln.results <- acceptResult{err: &net.OpError{Op: "accept", Net: "tcp", Err: os.NewSyscallError("accept4", syscall.EINVAL)}}
+	if err := <-done; err == nil {
+		t.Fatal("serveTCP ignored a permanent accept error")
 	}
 }
