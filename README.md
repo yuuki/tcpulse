@@ -36,6 +36,7 @@ tcpulse is a concurrent TCP/UDP load generator written in Go that provides fine-
   - [Bandwidth Measurement Tools](#bandwidth-measurement-tools)
   - [tcpulse's Unique Positioning](#tcpulses-unique-positioning)
   - [tcpulse's Limitations](#tcpulses-limitations)
+- [Upgrading from 0.8](#upgrading-from-08)
 - [Development](#development)
 - [License](#license)
 
@@ -224,9 +225,9 @@ The standard output format includes the following columns:
 - For persistent mode: CNT = rate × duration × connections
 - For ephemeral mode: CNT = rate × duration
 - `LAT_*`: Round-trip latencies in microseconds: from the write of a message to the read of its whole echo, including connection establishment in ephemeral mode. Minimum, maximum and mean are exact; percentiles are within 0.8% of the exact value.
-- `RATE(/s)`: Round trips per second over the interval, or over the whole run
+- `RATE(/s)`: Round trips per second over the interval, or over the whole run (its `--duration`, or until it was interrupted)
 
-Only completed round trips are counted: a request that failed in a way tcpulse tolerates (a connection reset or timeout in ephemeral mode) or that was still in flight when the duration elapsed is not, so CNT can be slightly below rate × duration under load. See [docs/design.md](docs/design.md) for what is measured and why.
+Only completed round trips are counted: a request that failed in a way tcpulse tolerates (in ephemeral mode, a connection timeout, or a connection reset while the message is written or the echo read) or that was still in flight when the duration elapsed is not, so CNT can be slightly below rate × duration under load. A target with which no round trip completed makes tcpulse exit with status 1 after printing the report. Ctrl-C interrupts the requests in flight and prints the report. See [docs/design.md](docs/design.md) for what is measured and why.
 
 ```shell-session
 $ tcpulse -c --proto tcp --flavor ephemeral --rate 1000 --duration 15s 10.0.150.2:9200 10.0.150.2:9300
@@ -363,6 +364,16 @@ However, tcpulse has certain limitations:
 **No High-Layer Protocol Support**: Doesn't directly support L7 protocols like HTTP, HTTP/2, or QUIC. Verifying protocol-specific performance characteristics requires dedicated tools or libraries (e.g. [wrk](https://github.com/wg/wrk), [vegeta](https://github.com/tsenart/vegeta), [hey](https://github.com/rakyll/hey), etc.).
 
 **Limited Network Diagnostic Features**: Detailed packet content analysis or network path problem identification requires separate packet capture tools like [Wireshark](https://www.wireshark.org/) or [tcpdump](https://www.tcpdump.org/).
+
+## Upgrading from 0.8
+
+tcpulse 0.9 keeps the options, the environment variables and the output formats of 0.8, but:
+
+- **Container image**: it runs as the unprivileged user `nobody` (not root), and the binary is `/usr/local/bin/tcpulse` (the entrypoint was `./tcpulse` in `/`). A command or entrypoint that names `./tcpulse`, a server binding a port below 1024 with `--network host`, or an address file only root can read needs changes, or `--user 0`. The image is published for linux/arm64 too.
+- **Measurements**: minimum, maximum and mean are exact and percentiles within 0.8% (0.8 sampled them from a reservoir of 1028 round trips), round trips include the whole echo of large messages, failed and cut-off requests are not counted, and the rate of the run is over its duration, so the numbers differ from those of 0.8 for the same load.
+- **Exit status**: a request still in flight when the duration elapses no longer fails the run (0.8 exited 1 with an I/O timeout and printed no report, after a single lost UDP datagram for instance); a target with which no round trip completed exits 1 after the report is printed. Options that cannot generate load (`--rate 0`, which panicked, a run of less than one message, `--protocol` other than `tcp`, `udp` or `all`, which exited 0 at once) exit 1. A command line that cannot be parsed exits 2 and prints a hint instead of the list of options.
+- **Environment variables**: values are parsed like the flags, more strictly than 0.8: `TCPULSE_RATE=10.0` and a duration without a unit (`TCPULSE_DURATION=10`, which 0.8 read as 10ns) are errors (exit 2), and so is an unparsable value, which 0.8 read as zero. A variable of the other mode (`TCPULSE_INTERVAL` for a server) is ignored.
+- **Help**: `--help` prints to stdout.
 
 ## Development
 

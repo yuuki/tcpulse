@@ -49,5 +49,6 @@ basis.
 Every release publishes `tcpulse_<version>_checksums.txt`, and every archive
 and the checksums file have a signed
 [build provenance attestation](https://github.com/yuuki/tcpulse/attestations)
-stating that the release workflow built them from the tag. See
+stating that the release workflow of this repository built them from the
+commit of the release. See
 [Pre-built binaries](README.md#pre-built-binaries).

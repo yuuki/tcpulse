@@ -50,11 +50,12 @@ in one process.
 | UDP | a new socket per datagram | `--rate` per second |
 
 Each target address gets its own load: `tcpulse -c a b` puts the full load
-on both `a` and `b`.
+on both `a` and `b`. An address given twice gets the load twice and two
+report lines, each counting its own round trips.
 
 The number of messages is rate × duration, rounded down, per connection in
-persistent mode (`messages()`): `--rate 3 --duration 1500ms` sends 4. The
-run ends when they are all answered or when the duration has elapsed,
+persistent mode (`client.Messages`): `--rate 3 --duration 1500ms` sends 4.
+The run ends when they are all answered or when the duration has elapsed,
 whichever comes first.
 
 Messages are paced with `go.uber.org/ratelimit`: evenly spaced, with a slack
@@ -71,7 +72,7 @@ not depend on latency.
 
 The clock starts after the payload is generated (random bytes, so that no
 middlebox can compress or deduplicate them) and stops when the whole echo
-has been read:
+has been read, before the connection is closed:
 
 - persistent: write the message, read the whole echo (`io.ReadFull`: the
   echo of a message larger than a segment arrives in several reads);
@@ -80,22 +81,37 @@ has been read:
   connection establishment;
 - UDP: create the socket, write the datagram, read the echo.
 
+Ephemeral and UDP requests dial the address as given, so with a host name
+every request resolves it (which DNS-based load balancing relies on) and
+the latency includes the lookup; give an IP address to leave it out.
+
+The echo of a TCP message larger than 64 KiB is read while the message is
+written: the server writes back as it reads, so a message that does not fit
+in the socket buffers of both sides would otherwise block the client and
+the server on each other.
+
 ### 3.3 End of the run and failures
 
-The connections take the deadline of the run, so blocked I/O returns when
-the duration elapses. A request that the end of the run cuts off (the run's
+The I/O of every connection gives up when the run ends (`bindToRun`): at
+its deadline, or at once when it is canceled (Ctrl-C, SIGTERM, another
+target failing). A request that the end of the run cuts off (the run's
 context is done, or the error is a timeout and the deadline has passed:
 `cutOff`) is neither recorded nor an error. This is also what happens to a
 lost UDP datagram: the client waits for its echo until the end of the run.
 CNT can therefore be slightly below rate × duration.
 
 In ephemeral mode a dial that times out (`ETIMEDOUT`), a write still in
-progress (`EINPROGRESS`) and a reset while reading the echo (`ECONNRESET`)
-are logged and tolerated (`errTolerated`): the run goes on, and the request
-is not recorded. These are the failures of overloaded servers, load
-balancers and conntrack tables, which tcpulse is used to provoke. Any other
-error (connection refused, a persistent connection closed by the server)
-stops the run with exit status 1.
+progress (`EINPROGRESS`) and a connection reset or closed by the peer while
+the message is written or the echo read (`ECONNRESET`, `EPIPE`) are logged
+and tolerated (`errTolerated`): the run goes on, and the request is not
+recorded. These are the failures of overloaded servers, load balancers and
+conntrack tables, which tcpulse is used to provoke. Any other error
+(connection refused, a persistent connection closed by the server) stops
+the run with exit status 1.
+
+A target with which no round trip completed (it never answers, or every
+request failed in a tolerated way) fails the run too: tcpulse prints the
+report, then exits 1 naming the target.
 
 ## 4. Statistics
 
@@ -110,17 +126,19 @@ the run, and:
   its bucket and clamped to [min, max]: at most 0.8% above the exact value,
   exact below 128ns. `FuzzQuantile` checks the bound.
 
-A `Recorder` holds two histograms per peer: one for the whole run and one
+A `Recorder` holds two histograms per target: one for the whole run and one
 for the current interval, swapped under a lock when an interval line is
 printed, so no sample is lost between intervals. RATE(/s) is the count
-divided by the length of the period: the interval, or the run from its
-start to the report. With `--merge-results-each-host` all peers share a
-single recorder.
+divided by the length of the period: the interval, or the run. The run
+lasts `--duration` even when its last echo comes back earlier (up to
+1/rate before the end), or until it stopped when it was interrupted. With
+`--merge-results-each-host` all targets share a single recorder.
 
 tcpulse 0.8 used `github.com/rcrowley/go-metrics`, now archived, whose
 timers drew the minimum, maximum, mean and percentiles from a 1028-sample
-exponentially decaying reservoir, and the rate from a meter updated every 5
-seconds (a fresh timer printed 0.00).
+exponentially decaying reservoir, and divided the count of the run by the
+time from its first round trip to the report, which inflated the rate of
+short runs.
 
 ## 5. Server
 
@@ -133,10 +151,12 @@ receives. It listens on each address for TCP, UDP (`udp4`) or both
   is a normal end.
 - UDP: one reader per socket, with a buffer that holds the largest IPv4
   payload (65507 bytes), and one goroutine per echo.
-- Accept errors that can go away (out of file descriptors or memory, a
-  connection aborted in the backlog, timeouts) are retried after 5ms,
-  doubling up to 1s, like `net/http`; other accept errors stop the server.
-  No error of a single connection stops it.
+- Accept errors that can go away (out of file descriptors or memory, the
+  network errors of the connection being accepted that accept(2) says to
+  retry, timeouts) are retried after 5ms, doubling up to 1s, like
+  `net/http`. Another accept error closes the listener's connections and
+  stops the server with exit status 1. No error of a single connection
+  stops it.
 - On SIGINT or SIGTERM it closes its listeners and connections and waits
   for its goroutines.
 
@@ -161,18 +181,26 @@ per option, and the connection goes on. Other platforms set none.
 Options are POSIX-style flags (`spf13/pflag`, kept on 1.0, whose help text
 is that of tcpulse 0.8). Every option but `--help` and `--version` can also
 come from `TCPULSE_<OPTION>` (upper case, `-` replaced by `_`); a flag on the
-command line wins, an empty variable is ignored, an invalid one is an error.
+command line wins, and an empty variable is ignored. Values are parsed like
+the flags, more strictly than tcpulse 0.8 (whose viper read `10.0` as 10,
+`10` as a duration of 10ns, and garbage as 0). A value that cannot be parsed
+is an error when its option belongs to the mode that runs, and is ignored
+otherwise, as is everything for `--help` and `--version`.
 
 Validation rejects any option set the run cannot work with: a rate below 1
-(the rate limiter would divide by zero), an interval or a duration that is
-not positive, an empty message, no connection in persistent mode, a UDP
-message above 65507 bytes, an empty addresses file, an unknown protocol or
-flavor. `FuzzParse` checks that whatever validation accepts can generate
-load.
+(the rate limiter would divide by zero), a duration that is not positive, a
+rate × duration below one message or beyond an int64, an interval that is
+not positive when interval lines are printed, an empty message, no
+connection in persistent mode, a UDP message above 65507 bytes, an empty
+addresses file, an unknown protocol or flavor. `FuzzParse` checks the
+options validation accepts against an independent computation of the
+message count.
 
-Exit statuses: 0 on success (also after Ctrl-C, which prints the report),
-1 for invalid options and run errors, 2 for a command line that cannot be
-parsed. A second SIGINT or SIGTERM terminates tcpulse at once.
+Exit statuses: 0 on success (also after Ctrl-C, which interrupts the
+requests in flight and prints the report), 1 for invalid options, run
+errors and a target without a round trip, 2 for a command line or an
+environment variable that cannot be parsed. A second SIGINT or SIGTERM
+terminates tcpulse at once.
 
 The Go runtime raises the soft limit of open files to the hard limit at
 startup (to `kern.maxfilesperproc` on macOS), which the thousands of
@@ -191,8 +219,11 @@ names and order are a public format, pinned by golden tests in
 ## 9. Release
 
 tagpr keeps a release pull request up to date on `main` (CHANGELOG.md and
-the version in `version.go`). Merging it tags `vX.Y.Z` and calls the
-release workflow, which runs CI on the tagged commit, then GoReleaser:
+the version in `version.go`); it bumps the patch version unless a merged
+pull request has the label `minor` or `major`. Merging it tags `vX.Y.Z` and
+calls the release workflow, which runs CI on the tagged commit (without
+fuzzing and the online workflow audits, which can fail without a change of
+the code), then GoReleaser:
 
 - archives `tcpulse_<version>_<os>_<arch>.tar.gz` for Linux and macOS on
   amd64 and arm64, built with `-trimpath` and commit timestamps, and
@@ -203,5 +234,9 @@ release workflow, which runs CI on the tagged commit, then GoReleaser:
 - a signed build provenance attestation of the archives and the checksums
   file.
 
+A pre-release tag pushed by hand (`vX.Y.Z-rc.N`) is released the same way,
+marked as a pre-release and with only its own image tag. Running the
+release workflow by hand on an existing tag releases it again, replacing
+the assets a failed run already uploaded (the archives are reproducible).
 The CI snapshot job builds the same archives and image on every change
 without publishing them.
