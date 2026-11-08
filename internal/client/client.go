@@ -131,15 +131,15 @@ func (r *run) measure(ctx context.Context, f func() error) error {
 }
 
 // cutOff reports whether err comes from the end of the run, ctx, rather than
-// from the connection: either ctx is done, or err is the I/O timeout of the
-// connection deadline, which is the deadline of ctx (see setDeadline), and
-// that deadline has passed. The I/O can time out a moment before ctx
-// reports it.
+// from the connection: either ctx is done, or err is a timeout (of a dial,
+// or of the connection deadline, which is the deadline of ctx: see
+// setDeadline) and the deadline of ctx has passed. The I/O can time out a
+// moment before ctx reports it.
 func cutOff(ctx context.Context, err error) bool {
 	if ctx.Err() != nil {
 		return true
 	}
-	if errors.Is(err, os.ErrDeadlineExceeded) {
+	if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
 		deadline, ok := ctx.Deadline()
 		return ok && !time.Now().Before(deadline)
 	}

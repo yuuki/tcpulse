@@ -374,3 +374,48 @@ func TestRunSubsecondDuration(t *testing.T) {
 		t.Fatalf("%d round trips, want 20 (2 connections × 20/s × 500ms)", got)
 	}
 }
+
+// lateContext has passed its deadline but does not report it yet, as a
+// context does for a moment after the I/O of its connections timed out.
+type lateContext struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c lateContext) Deadline() (time.Time, bool) { return c.deadline, true }
+func (lateContext) Err() error                    { return nil }
+
+func TestCutOff(t *testing.T) {
+	expired, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+	var d net.Dialer
+	_, dialTimeout := d.DialContext(expired, "tcp", closedPort(t))
+
+	conn, err := net.Dial("tcp", echoServer(t, ProtocolTCP))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now())
+	_, readTimeout := conn.Read(make([]byte, 1))
+
+	late := lateContext{Context: t.Context(), deadline: time.Now().Add(-time.Millisecond)}
+	early := lateContext{Context: t.Context(), deadline: time.Now().Add(time.Hour)}
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		{"read timeout at the deadline", late, readTimeout, true},
+		{"dial timeout at the deadline", late, dialTimeout, true},
+		{"read timeout before the deadline", early, readTimeout, false},
+		{"other error at the deadline", late, io.ErrUnexpectedEOF, false},
+		{"any error after the end", expired, io.ErrUnexpectedEOF, true},
+		{"any error during the run", t.Context(), io.ErrUnexpectedEOF, false},
+	} {
+		if got := cutOff(tc.ctx, tc.err); got != tc.want {
+			t.Errorf("%s: cutOff(%v) = %v, want %v", tc.name, tc.err, got, tc.want)
+		}
+	}
+}
