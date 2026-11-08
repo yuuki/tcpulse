@@ -348,7 +348,7 @@ func TestClientTCPInfo(t *testing.T) {
 	}
 	for i, res := range results {
 		info := res.TCPInfo
-		if res.Count != 20 || info == nil || info.Connections != 2 || info.SegmentsOut < 4 || info.SRTTMax < info.SRTTMean {
+		if res.Count != 20 || info == nil || info.Connections != 2 || info.SegmentsOut < 20 || info.SRTTMax < info.SRTTMean {
 			t.Errorf("result %d = %+v, tcp_info %+v; want 20 round trips over 2 connections", i, res, info)
 		}
 	}
