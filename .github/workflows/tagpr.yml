@@ -1,25 +1,51 @@
 name: tagpr
+
+# tagpr keeps a release pull request up to date with what is merged into main
+# (CHANGELOG.md and the version in version.go). Merging it tags the release,
+# which the release workflow then publishes.
 on:
   push:
-    branches: ["main"]
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: tagpr
+  cancel-in-progress: false
+
 jobs:
   tagpr:
+    name: tagpr
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-      packages: write
+      contents: write # push the release branch and the tag
+      pull-requests: write # open and update the release pull request
+      issues: write # create the labels of the release pull request
+    outputs:
+      tag: ${{ steps.tagpr.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: true
           fetch-depth: 0
+          # tagpr pushes the release branch and the tag with git.
+          persist-credentials: true # zizmor: ignore[artipacked]
       - id: tagpr
-        uses: Songmu/tagpr@v1
+        uses: Songmu/tagpr@49c02dc423566b55a123beb12dc63f371032eaa3 # v1.9.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: ./.github/actions/release
-        with:
-          tag: ${{ steps.tagpr.outputs.tag }}
-        if: "steps.tagpr.outputs.tag != ''"
+
+  release:
+    name: release
+    needs: tagpr
+    if: needs.tagpr.outputs.tag != ''
+    # What the release job of release.yml needs.
+    permissions:
+      contents: write # create the GitHub release and upload its archives
+      packages: write # push the image to ghcr.io
+      id-token: write # sign the build provenance attestation
+      attestations: write # store the attestation
+    # See release.yml for ./ rather than $/.
+    uses: ./.github/workflows/release.yml # zizmor: ignore[self-repository]
+    with:
+      tag: ${{ needs.tagpr.outputs.tag }}

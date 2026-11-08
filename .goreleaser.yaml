@@ -1,0 +1,112 @@
+# Release configuration, run by .github/workflows/release.yml on a tag vX.Y.Z
+# (which tagpr creates when its release pull request is merged).
+#
+# The release workflow runs CI first, so this file has no test or
+# `go mod tidy` hooks: a release builds exactly the tagged tree.
+version: 2
+
+project_name: tcpulse
+
+builds:
+  - id: tcpulse
+    main: .
+    binary: tcpulse
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    # Reproducible: no local paths, and file times taken from the commit.
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{ .Version }} -X main.revision={{ .ShortCommit }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+# The archive names are those of the previous releases
+# (tcpulse_0.8.3_linux_amd64.tar.gz), which download scripts depend on.
+archives:
+  - id: tcpulse
+    ids: [tcpulse]
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    # Fixed owners, modes and times, so that the archives are reproducible
+    # too, whoever builds them.
+    builds_info:
+      owner: root
+      group: root
+      mode: 0755
+      mtime: "{{ .CommitDate }}"
+    files:
+      - src: LICENSE
+        info: &doc
+          owner: root
+          group: root
+          mode: 0644
+          mtime: "{{ .CommitDate }}"
+      - src: README.md
+        info: *doc
+      - src: CHANGELOG.md
+        info: *doc
+
+# The default name, tcpulse_<version>_checksums.txt, as before.
+checksum:
+  algorithm: sha256
+
+# `dockers_v2` builds one multi-platform image from the binaries built above
+# (Dockerfile.goreleaser). The tags are those of the previous releases:
+# 0.8.3, 0.8, 0 and latest; a pre-release gets only its own.
+#
+# Not disabled on snapshots: GoReleaser refuses to push from one, so a
+# snapshot (make snapshot, the CI snapshot job) checks that the image still
+# builds.
+dockers_v2:
+  - id: tcpulse
+    ids: [tcpulse]
+    dockerfile: Dockerfile.goreleaser
+    images:
+      - ghcr.io/yuuki/tcpulse
+    tags:
+      - "{{ .Version }}"
+      - "{{ if not .Prerelease }}{{ .Major }}.{{ .Minor }}{{ end }}"
+      - "{{ if not .Prerelease }}{{ .Major }}{{ end }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    extra_files:
+      - LICENSE
+    # Labels and annotations carry the same data on purpose: ghcr.io links a
+    # package to its repository from the image config label, while the
+    # manifest annotations are what a multi-platform aware client reads.
+    labels:
+      org.opencontainers.image.title: "{{ .ProjectName }}"
+      org.opencontainers.image.description: "Concurrent TCP/UDP load generator with fine-grained, flow-level control"
+      org.opencontainers.image.created: "{{ .CommitDate }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.source: "{{ .GitURL }}"
+      org.opencontainers.image.licenses: "Apache-2.0"
+    annotations:
+      org.opencontainers.image.title: "{{ .ProjectName }}"
+      org.opencontainers.image.description: "Concurrent TCP/UDP load generator with fine-grained, flow-level control"
+      org.opencontainers.image.created: "{{ .CommitDate }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.source: "{{ .GitURL }}"
+      org.opencontainers.image.licenses: "Apache-2.0"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  # v1.2.3-rc.1 and the like are marked as pre-releases.
+  prerelease: auto
