@@ -37,9 +37,17 @@ var (
 	// Client side: send the first message in the SYN.
 	fastOpenConnect = &option{name: "TCP_FASTOPEN_CONNECT", level: unix.IPPROTO_TCP, opt: unix.TCP_FASTOPEN_CONNECT, value: 1}
 	// Server side: accept data in the SYN; the value is the length of the
-	// queue of pending Fast Open requests.
-	fastOpen = &option{name: "TCP_FASTOPEN", level: unix.IPPROTO_TCP, opt: unix.TCP_FASTOPEN, value: 1}
+	// queue of pending Fast Open requests (FastOpenQueue).
+	fastOpen = &option{name: "TCP_FASTOPEN", level: unix.IPPROTO_TCP, opt: unix.TCP_FASTOPEN, value: FastOpenQueue}
 )
+
+// FastOpenQueue is the number of pending Fast Open requests a listening
+// socket accepts. The connections of these requests wait in the accept
+// queue, so the queue is as long as the accept backlog: the kernel caps it
+// at net.core.somaxconn (fastopen_queue_tune), like the backlog that Go
+// gives listen(2). A shorter queue makes concurrent Fast Open handshakes
+// fall back to plain ones, and the client send their data again.
+const FastOpenQueue = 65535
 
 // DialControl is a net.Dialer Control function that enables SO_REUSEPORT and
 // TCP_FASTOPEN_CONNECT.
