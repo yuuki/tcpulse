@@ -1,6 +1,7 @@
 # tcpulse
 
-[![Test](https://github.com/yuuki/tcpulse/actions/workflows/test.yml/badge.svg)](https://github.com/yuuki/tcpulse/actions/workflows/test.yml)
+[![CI](https://github.com/yuuki/tcpulse/actions/workflows/ci.yml/badge.svg)](https://github.com/yuuki/tcpulse/actions/workflows/ci.yml)
+[![Security](https://github.com/yuuki/tcpulse/actions/workflows/security.yml/badge.svg)](https://github.com/yuuki/tcpulse/actions/workflows/security.yml)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/yuuki/tcpulse)
 
 tcpulse is a concurrent TCP/UDP load generator written in Go that provides fine-grained, flow-level control over connection establishment and data transfer.
@@ -15,9 +16,11 @@ tcpulse is a concurrent TCP/UDP load generator written in Go that provides fine-
   - [Key Features](#key-features)
 - [Installation](#installation)
   - [Pre-built Binaries](#pre-built-binaries)
+  - [Container Image](#container-image)
   - [Build from Source](#build-from-source)
   - [Verify Installation](#verify-installation)
 - [Usage](#usage)
+  - [Environment Variables](#environment-variables)
 - [Examples](#examples)
   - [Commands](#commands)
   - [Reports](#reports)
@@ -33,6 +36,7 @@ tcpulse is a concurrent TCP/UDP load generator written in Go that provides fine-
   - [Bandwidth Measurement Tools](#bandwidth-measurement-tools)
   - [tcpulse's Unique Positioning](#tcpulses-unique-positioning)
   - [tcpulse's Limitations](#tcpulses-limitations)
+- [Development](#development)
 - [License](#license)
 
 ## What is tcpulse?
@@ -65,7 +69,7 @@ Creates new connections for each request, immediately closing them afterward. Th
 
 ### Key Features
 
-- **Real-time metrics**: Latency percentiles (90th, 95th, 99th), throughput, and connection counts
+- **Real-time metrics**: Latency percentiles (90th, 95th, 99th), throughput, and connection counts; minimum, maximum and mean are exact and percentiles within 0.8%, however long the run
 - **Rate limiting**: Control connection establishment rate to simulate realistic load patterns
 - **Multi-target support**: Test multiple endpoints simultaneously and aggregate results
 - **Protocol support**: Both TCP and UDP with optimized implementations
@@ -76,27 +80,41 @@ Creates new connections for each request, immediately closing them afterward. Th
 
 ### Pre-built Binaries
 
-Download the latest pre-built binaries from the [GitHub Releases](https://github.com/yuuki/tcpulse/releases) page.
+Download the archive for your platform (Linux or macOS, amd64 or arm64) from the [GitHub Releases](https://github.com/yuuki/tcpulse/releases) page. Every archive and the checksums file have a signed [build provenance attestation](https://github.com/yuuki/tcpulse/attestations); verify a download with the [GitHub CLI](https://cli.github.com):
+
+```bash
+gh attestation verify tcpulse_<version>_linux_amd64.tar.gz --repo yuuki/tcpulse
+```
+
+or check it against `tcpulse_<version>_checksums.txt`:
+
+```bash
+sha256sum --ignore-missing -c tcpulse_<version>_checksums.txt
+```
+
+### Container Image
+
+Multi-platform images (linux/amd64, linux/arm64) are published to the GitHub Container Registry, tagged with the version (`0.8.3`, `0.8`, `0`) and `latest`. They run as an unprivileged user.
+
+```bash
+docker run --rm -p 9100:9100/tcp -p 9100:9100/udp ghcr.io/yuuki/tcpulse:latest -s
+docker run --rm ghcr.io/yuuki/tcpulse:latest -c --rate 1000 --duration 15s 192.0.2.10:9100
+```
 
 ### Build from Source
 
 Requirements:
-- Go 1.22+ (see [go.mod](go.mod) for exact version requirements)
+- Go 1.27+ (see [go.mod](go.mod) for exact version requirements)
 - Git
 
 ```bash
-# Clone the repository
+# Install to $GOPATH/bin
+go install github.com/yuuki/tcpulse@latest
+
+# Or clone the repository and build with make
 git clone https://github.com/yuuki/tcpulse.git
 cd tcpulse
-
-# Build using Make
 make build
-
-# Or build directly with Go
-go build -o tcpulse .
-
-# Install to $GOPATH/bin
-go install .
 ```
 
 ### Verify Installation
@@ -132,11 +150,16 @@ Options:
       --message-bytes int32        [client mode] TCP/UDP message size (bytes) (default 64)
       --pprof-addr string          [client mode] pprof listening address:port (default "localhost:6060")
       --proto string               [client mode] protocol (tcp or udp) (default "tcp")
-      --protocol string            [server mode] listening protocol ('tcp' or 'udp') (default "all")
+      --protocol string            [server mode] listening protocol ('tcp', 'udp' or 'all') (default "all")
       --rate int32                 [client mode] Message throughput per connection (/s) (for 'persistent' and UDP) or new connections throughput (/s) (for 'ephemeral'). Total messages (CNT) = rate * duration * connections (for 'persistent') or rate * duration (for 'ephemeral') (default 100)
   -s, --server                     run in server mode
       --show-only-results          [client mode] print only results of measurement stats
       --version                    show version information
+
+Environment:
+  Every option but --help and --version can also be set with an environment
+  variable: TCPULSE_ and the option name in upper case, with '-' replaced by '_'
+  (TCPULSE_MESSAGE_BYTES=1024). An option on the command line takes precedence.
 
 Output Format (Client Mode):
   CNT: Total number of messages/requests sent (not connections)
@@ -149,6 +172,14 @@ Examples:
   tcpulse -c localhost:9100           # Connect to server as client
   tcpulse -c --connections 50 host:port # Connect with 50 connections
   tcpulse -c --connections 1 --rate 1 --duration 1s host:port # Send exactly 1 message
+```
+
+### Environment Variables
+
+Every option but `--help` and `--version` can also be set with an environment variable named `TCPULSE_` followed by the option name in upper case, with `-` replaced by `_`. An option given on the command line takes precedence, and an empty variable is ignored.
+
+```shell-session
+$ TCPULSE_CLIENT=true TCPULSE_RATE=1000 TCPULSE_MESSAGE_BYTES=1024 tcpulse 127.0.0.1:9100
 ```
 
 ## Examples
@@ -190,8 +221,12 @@ $ tcpulse -c --jsonlines --rate 1000 --duration 10s 127.0.0.1:9100
 
 The standard output format includes the following columns:
 - `CNT`: Total number of messages/requests sent (not connections)
-- For persistent mode: CNT = rate × duration × connections  
+- For persistent mode: CNT = rate × duration × connections
 - For ephemeral mode: CNT = rate × duration
+- `LAT_*`: Round-trip latencies in microseconds: from the write of a message to the read of its whole echo, including connection establishment in ephemeral mode. Minimum, maximum and mean are exact; percentiles are within 0.8% of the exact value.
+- `RATE(/s)`: Round trips per second over the interval, or over the whole run
+
+Only completed round trips are counted: a request that failed in a way tcpulse tolerates (a connection reset or timeout in ephemeral mode) or that was still in flight when the duration elapsed is not, so CNT can be slightly below rate × duration under load. See [docs/design.md](docs/design.md) for what is measured and why.
 
 ```shell-session
 $ tcpulse -c --proto tcp --flavor ephemeral --rate 1000 --duration 15s 10.0.150.2:9200 10.0.150.2:9300
@@ -328,6 +363,10 @@ However, tcpulse has certain limitations:
 **No High-Layer Protocol Support**: Doesn't directly support L7 protocols like HTTP, HTTP/2, or QUIC. Verifying protocol-specific performance characteristics requires dedicated tools or libraries (e.g. [wrk](https://github.com/wg/wrk), [vegeta](https://github.com/tsenart/vegeta), [hey](https://github.com/rakyll/hey), etc.).
 
 **Limited Network Diagnostic Features**: Detailed packet content analysis or network path problem identification requires separate packet capture tools like [Wireshark](https://www.wireshark.org/) or [tcpdump](https://www.tcpdump.org/).
+
+## Development
+
+`make check` runs the linters, the workflow audit, `go vet`, the race-enabled tests and the build; `make help` lists the other targets. See [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md) for the conventions and compatibility contracts, and [SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## License
 
