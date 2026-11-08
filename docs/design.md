@@ -310,8 +310,21 @@ receives. It listens on each address for TCP, UDP (`udp4`) or both
   `net/http`. Another accept error closes the listener's connections and
   stops the server with exit status 1. No error of a single connection
   stops it.
-- On SIGINT or SIGTERM it closes its listeners and connections and waits
-  for its goroutines.
+- On SIGINT or SIGTERM it closes its listeners and connections and waits for
+  its goroutines.
+- TCP listeners are plain TCP. Since Go 1.24, listeners use MPTCP where the
+  kernel supports it; tcpulse measures TCP, its client never uses MPTCP, and
+  an MPTCP listener keeps the drops of its TCP subflow listener from
+  `SO_MEMINFO`. For TCP clients, the connections are the same either way.
+- With `--listener-stats` (Linux), the server counts the connections it
+  accepts and the datagrams it receives, and samples the accept queue of
+  each TCP listener every 10ms (`TCP_INFO` of a listening socket: the
+  connections waiting and the length of the queue). When it stops, it reads
+  the drops the kernel accounted to each socket (`SO_MEMINFO`), before it
+  closes them, and prints a line per socket. The drops of a TCP listener are
+  mostly handshakes it could not take because its SYN or accept queue was
+  full (the host's `ListenDrops`); those of a UDP socket, datagrams over its
+  receive buffer.
 
 UDP is IPv4 only on both sides: unlike TCP, a UDP client cannot fall back
 from `::1` to `127.0.0.1`, so `localhost` would fail against the default
@@ -346,9 +359,10 @@ rate × duration below one message or beyond an int64, an interval that is
 not positive when interval lines are printed, an empty message, no
 connection in persistent mode, a UDP message above 65507 bytes, an empty
 addresses file, an unknown protocol or flavor, `--tcp-info` or
-`--kernel-events` with UDP or on a platform other than Linux. `FuzzParse`
-checks the options validation accepts against an independent computation of
-the message count.
+`--kernel-events` with UDP or on a platform other than Linux, and
+`--listener-stats` on a platform other than Linux. `FuzzParse` checks the
+options validation accepts against an independent computation of the message
+count.
 
 Exit statuses: 0 on success (also after Ctrl-C, which interrupts the
 requests in flight and prints the report), 1 for invalid options, run
@@ -372,7 +386,9 @@ single merged line) of TCP statistics. Each JSON object ends with a
 `tcp_info` object. `--kernel-events` adds a section of the same form after
 it, and a `kernel_events` object. Without these options, the output is
 unchanged. The column layout and the JSON field names and order are a public
-format, pinned by golden tests in `internal/report`.
+format, pinned by golden tests in `internal/report`. The server prints
+`Listening at ...`, and with `--listener-stats`, when it stops, a separator,
+a header and a line per listening socket.
 
 ## 9. Release
 

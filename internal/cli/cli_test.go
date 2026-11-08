@@ -179,6 +179,7 @@ func TestMainHelp(t *testing.T) {
 			"\n      --message-bytes int32        [client mode] TCP/UDP message size (bytes) (default 64)\n",
 			"\n      --tcp-info                   [client mode] report TCP statistics of the connections read from the kernel (TCP_INFO, Linux only)\n",
 			"\n      --kernel-events              [client mode] attribute kernel TCP events (retransmissions, resets) to the round trips with eBPF (Linux only, needs root or CAP_BPF and CAP_PERFMON)\n",
+			"\n      --listener-stats             [server mode] print the statistics of the listening sockets (connections, drops, accept queue) when the server stops (Linux only)\n",
 			"TCPULSE_MESSAGE_BYTES=1024",
 			"Examples:",
 		} {
@@ -557,6 +558,47 @@ func TestServer(t *testing.T) {
 	}
 }
 
+func TestServerListenerStats(t *testing.T) {
+	if !server.StatsSupported {
+		r := runMain(t.Context(), noEnvironment, "-s", "--listener-stats", "127.0.0.1:0")
+		if r.code != exitError || !strings.Contains(r.stderr, "--listener-stats is only supported on Linux") {
+			t.Fatalf("exit %d, stderr %q; want --listener-stats refused", r.code, r.stderr)
+		}
+		return
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	var stdout syncBuffer
+	done := make(chan int, 1)
+	go func() {
+		done <- Main(ctx, Env{
+			Program:   "tcpulse",
+			Args:      []string{"-s", "--listener-stats", "127.0.0.1:0"},
+			Stdout:    &stdout,
+			Stderr:    io.Discard,
+			LookupEnv: noEnvironment,
+		})
+	}()
+	for deadline := time.Now().Add(5 * time.Second); stdout.String() == "" && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if code := <-done; code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	lines := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
+	if len(lines) != 5 || lines[1] != report.ListenerSeparator || !strings.HasPrefix(lines[2], "LISTENER ") {
+		t.Fatalf("stdout:\n%s", stdout.String())
+	}
+	// The bound addresses, TCP then UDP; nothing received.
+	tcp, udp := strings.Fields(lines[3]), strings.Fields(lines[4])
+	if !strings.HasPrefix(tcp[0], "127.0.0.1:") || tcp[0] == "127.0.0.1:0" || tcp[1] != "tcp" || tcp[2] != "0" || tcp[3] != "0" {
+		t.Errorf("TCP line %q", lines[3])
+	}
+	if udp[1] != "udp" || udp[2] != "0" || udp[3] != "0" || udp[4] != "-" || udp[5] != "-" {
+		t.Errorf("UDP line %q", lines[4])
+	}
+}
+
 func TestServerListenError(t *testing.T) {
 	r := runMain(t.Context(), noEnvironment, "-s", "256.0.0.1:9100")
 	if r.code != exitError || !strings.Contains(r.stderr, "256.0.0.1:9100") {
@@ -608,9 +650,13 @@ func FuzzParse(f *testing.F) {
 		if err != nil {
 			return
 		}
-		if o.envError(true) == nil && validateServer(o) == nil &&
-			o.serveProtocol != "tcp" && o.serveProtocol != "udp" && o.serveProtocol != "all" {
-			t.Fatalf("server protocol %q accepted", o.serveProtocol)
+		if o.envError(true) == nil && validateServer(o) == nil {
+			if o.serveProtocol != "tcp" && o.serveProtocol != "udp" && o.serveProtocol != "all" {
+				t.Fatalf("server protocol %q accepted", o.serveProtocol)
+			}
+			if o.listenerStats && !server.StatsSupported {
+				t.Fatal("accepted --listener-stats where it is not supported")
+			}
 		}
 		if o.envError(false) != nil || validateClient(o) != nil {
 			return

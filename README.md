@@ -150,6 +150,7 @@ Options:
       --jsonlines                  [client mode] output results in JSON Lines format
       --kernel-events              [client mode] attribute kernel TCP events (retransmissions, resets) to the round trips with eBPF (Linux only, needs root or CAP_BPF and CAP_PERFMON)
       --listen-addrs-file string   [server mode] enable to pass a file including a pair of addresses and ports
+      --listener-stats             [server mode] print the statistics of the listening sockets (connections, drops, accept queue) when the server stops (Linux only)
       --merge-results-each-host    [client mode] merge results of each host (with --show-only-results)
       --message-bytes int32        [client mode] TCP/UDP message size (bytes) (default 64)
       --pprof-addr string          [client mode] pprof listening address:port (default "localhost:6060")
@@ -351,6 +352,31 @@ With `--jsonlines`, each object ends with a `kernel_events` object (after `tcp_i
 - `untracked_round_trips`.
 
 The round trips with and without events, plus the untracked ones, add up to `count`.
+
+#### Listener Statistics (`--listener-stats`)
+
+On Linux, a server started with `--listener-stats` prints the statistics of its listening sockets when it stops (Ctrl-C, SIGTERM). They are read from what the kernel already counts for each socket, so no privileges are needed.
+
+```shell-session
+$ tcpulse -s --listener-stats 0.0.0.0:9100
+Listening at ["0.0.0.0:9100"] ...
+^C
+--- Statistics of the listening sockets ---
+LISTENER             PROTO      RECEIVED        DROPS           QUEUE_MAX       QUEUE_LEN
+0.0.0.0:9100         tcp        37944           7506            9               8
+0.0.0.0:9100         udp        145590          0               -               -
+```
+
+That run had an accept queue of 8 (`net.core.somaxconn=8`) and 20,000 new connections per second: the listener dropped handshakes while connections waited to be accepted.
+
+- `RECEIVED`: The TCP connections accepted, or the UDP datagrams received
+- `DROPS`: What the kernel dropped for the socket (`SO_MEMINFO`).
+  - For TCP, mostly the SYNs and ACKs of handshakes the listener could not take because its SYN or accept queue was full, which the host counts as `ListenDrops`.
+  - For UDP, the datagrams that did not fit in the receive buffer (the host's `RcvbufErrors`).
+- `QUEUE_MAX`: The most connections seen waiting in the accept queue (`TCP_INFO` of the listener, sampled every 10ms). The kernel lets the queue hold one more connection than its length.
+- `QUEUE_LEN`: The length of the accept queue: the backlog, capped at `net.core.somaxconn`
+
+A value that does not apply, or that the kernel could not report, is `-`.
 
 ## Use Cases
 

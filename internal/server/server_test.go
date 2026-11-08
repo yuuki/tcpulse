@@ -241,7 +241,7 @@ func TestServeTCPSurvivesFailures(t *testing.T) {
 	s := &Server{logger: discard}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- s.serveTCP(ctx, ln) }()
+	go func() { done <- s.serveTCP(ctx, ln, newSocketStats()) }()
 
 	for _, err := range []error{
 		&net.OpError{Op: "accept", Net: "tcp", Err: os.NewSyscallError("accept4", syscall.EMFILE)},
@@ -279,7 +279,7 @@ func TestServeTCPStopsOnPermanentError(t *testing.T) {
 	ln := newFakeListener()
 	s := &Server{logger: discard}
 	done := make(chan error, 1)
-	go func() { done <- s.serveTCP(t.Context(), ln) }()
+	go func() { done <- s.serveTCP(t.Context(), ln, newSocketStats()) }()
 
 	// A connection is open when the listener fails: it must not keep the
 	// listener from returning.
@@ -300,5 +300,80 @@ func TestServeTCPStopsOnPermanentError(t *testing.T) {
 	_ = local.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if _, err := local.Read(make([]byte, 1)); err == nil {
 		t.Fatal("the connection is still open after the listener failed")
+	}
+}
+
+func TestServerStats(t *testing.T) {
+	if !StatsSupported {
+		t.Skip("listener statistics are Linux only")
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	srv, err := Listen(ctx, Config{Addrs: []string{"127.0.0.1:0"}, Protocol: ProtocolAll, Logger: discard, Stats: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+
+	msg := []byte("hello")
+	for range 3 {
+		conn, err := net.Dial("tcp", srv.TCPAddrs()[0].String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Write(msg); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(conn, make([]byte, len(msg))); err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.Close()
+	}
+	udp, err := net.Dial("udp4", srv.UDPAddrs()[0].String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+	for range 5 {
+		if _, err := udp.Write(msg); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := udp.Read(make([]byte, len(msg))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	stats := srv.Stats()
+	if len(stats) != 2 {
+		t.Fatalf("stats = %+v, want a TCP and a UDP socket", stats)
+	}
+	tcp, udpStats := stats[0], stats[1]
+	if tcp.Protocol != ProtocolTCP || tcp.Received != 3 || tcp.Drops != 0 || tcp.QueueLen < 1 || tcp.QueueMax < 0 || tcp.QueueMax > tcp.QueueLen {
+		t.Errorf("TCP stats = %+v, want 3 connections, no drop and a sampled queue", tcp)
+	}
+	if udpStats.Protocol != ProtocolUDP || udpStats.Received != 5 || udpStats.Drops != 0 || udpStats.QueueMax != -1 || udpStats.QueueLen != -1 {
+		t.Errorf("UDP stats = %+v, want 5 datagrams and no drop", udpStats)
+	}
+}
+
+func TestServerWithoutStats(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	srv, err := Listen(ctx, Config{Addrs: []string{"127.0.0.1:0"}, Protocol: ProtocolTCP, Logger: discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if stats := srv.Stats(); stats != nil {
+		t.Fatalf("stats without Config.Stats = %+v", stats)
 	}
 }
