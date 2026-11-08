@@ -291,7 +291,7 @@ The kernel's RTT leaves out the time spent in the client's process (system calls
 
 Retransmissions have two common causes, which these counters alone do not tell apart:
 
-- **Lost segments, SYNs in particular:** a SYN is retransmitted after the initial timeout of 1s, then 2s more, so in ephemeral mode SYN loss shows as steps of 1s or 3s in the latencies (`LAT_MAX`, `LAT_99p`).
+- **Lost segments, SYNs in particular:** a lost SYN is retransmitted after a timeout of at least 1s, so in ephemeral mode SYN loss shows as steps of whole seconds in the latencies (`LAT_MAX`, `LAT_99p`). The steps depend on the kernel: 1s, 2s, 3s, 4s with `net.ipv4.tcp_syn_linear_timeouts` (1s between the first retransmissions, 4 of them by default), 1s, 3s, 7s on kernels that double the timeout from the first one.
 - **TCP Fast Open falling back:** when the server does not accept the data sent in a SYN with a cookie (it no longer enables Fast Open, or its queue of pending Fast Open requests is full), the client sends the data again right after the handshake. That counts as one retransmission per connection, without loss and without the delay of a timeout.
 
 The host's kernel counters `TCPSynRetrans` and `TCPFastOpenActiveFail` (`nstat`, or `/proc/net/netstat`) separate the two.

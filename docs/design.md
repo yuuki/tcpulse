@@ -152,9 +152,10 @@ that data (it no longer enables Fast Open, or its queue of pending Fast Open
 requests is full: the tcpulse server keeps a queue of one, see §6), the
 client sends the data again right after the handshake, and it counts as a
 retransmission. So do lost SYNs, which are retransmitted after a timeout of
-1s: the counters alone do not tell the two apart. The latencies do (steps of
-1s or 3s for SYN loss), and so do the host's counters `TCPSynRetrans` and
-`TCPFastOpenActiveFail`.
+at least 1s: the counters alone do not tell the two apart. The latencies do
+(steps of whole seconds for SYN loss: 1s, 2s, 3s with
+`net.ipv4.tcp_syn_linear_timeouts`, 1s, 3s, 7s where the timeout doubles),
+and so do the host's counters `TCPSynRetrans` and `TCPFastOpenActiveFail`.
 
 `tcpi_fastopen_client_fail`, which says why Fast Open failed, is left out:
 `golang.org/x/sys/unix.TCPInfo` leaves its byte out as padding, and it needs
