@@ -58,6 +58,10 @@ type Config struct {
 	Duration time.Duration
 	// MessageBytes is the size of every message.
 	MessageBytes int
+	// TCPInfo records in the Recorder what the kernel reports of every TCP
+	// connection (TCP_INFO) when it is closed, once the clock of its last
+	// round trip has stopped. It needs TCPInfoSupported; UDP ignores it.
+	TCPInfo bool
 	// Logger receives the errors the run tolerates; nil means
 	// slog.Default().
 	Logger *slog.Logger
@@ -96,6 +100,10 @@ func Run(ctx context.Context, cfg Config, addr string, rec *stats.Recorder) erro
 	return err
 }
 
+// TCPInfoSupported reports whether Config.TCPInfo works on this platform
+// (Linux).
+const TCPInfoSupported = sockopt.TCPInfoSupported
+
 // errTolerated is returned by a request that failed in a way the run
 // tolerates: the failure is logged, and the request is not recorded.
 var errTolerated = errors.New("request failed")
@@ -106,6 +114,9 @@ type run struct {
 	rec     *stats.Recorder
 	logger  *slog.Logger
 	bufPool sync.Pool
+	// tcpInfoWarning logs once a connection whose TCP_INFO could not be
+	// read.
+	tcpInfoWarning sync.Once
 }
 
 // Messages returns how many messages a sender at rate per second sends
@@ -167,6 +178,30 @@ func cutOff(ctx context.Context, err error) bool {
 		return ok && !time.Now().Before(deadline)
 	}
 	return false
+}
+
+// closeTCP closes a TCP connection, after recording what the kernel reports
+// of it when the run asks for it. It runs after the clock of the last round
+// trip of the connection has stopped.
+func (r *run) closeTCP(conn net.Conn) {
+	if r.cfg.TCPInfo {
+		r.recordTCPInfo(conn)
+	}
+	_ = conn.Close()
+}
+
+// recordTCPInfo records the TCP_INFO of conn. A connection whose TCP_INFO
+// cannot be read is not recorded: the report counts the connections it
+// describes.
+func (r *run) recordTCPInfo(conn net.Conn) {
+	info, err := sockopt.ReadTCPInfo(conn)
+	if err != nil {
+		r.tcpInfoWarning.Do(func() {
+			r.logger.Warn("could not read TCP_INFO", "addr", r.addr, "error", err)
+		})
+		return
+	}
+	r.rec.RecordConn(stats.Conn(info))
 }
 
 // fill puts random bytes in a message.
@@ -265,7 +300,7 @@ func (r *run) persistent(ctx context.Context) error {
 				}
 				return fmt.Errorf("dialing %q: %w", r.addr, err)
 			}
-			defer func() { _ = conn.Close() }()
+			defer r.closeTCP(conn)
 			defer bindToRun(ctx, conn)()
 
 			msg := make([]byte, r.cfg.MessageBytes)
@@ -321,7 +356,8 @@ func (r *run) ephemeral(ctx context.Context) error {
 }
 
 // ephemeralRequest connects, sends msg, reads its echo and returns how long
-// that took; the connection is closed after the clock stops.
+// that took; the connection is closed after the clock stops (the deferred
+// calls run after the result is evaluated).
 func (r *run) ephemeralRequest(ctx context.Context, dialer *net.Dialer, msg, echo []byte) (time.Duration, error) {
 	start := time.Now()
 	conn, err := dialer.DialContext(ctx, "tcp", r.addr)
@@ -332,7 +368,7 @@ func (r *run) ephemeralRequest(ctx context.Context, dialer *net.Dialer, msg, ech
 		}
 		return 0, fmt.Errorf("dialing %q: %w", r.addr, err)
 	}
-	defer func() { _ = conn.Close() }()
+	defer r.closeTCP(conn)
 	defer bindToRun(ctx, conn)()
 
 	if err := sockopt.SetQuickAck(conn); err != nil {

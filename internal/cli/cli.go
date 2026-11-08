@@ -175,6 +175,13 @@ func validateClient(o *options) error {
 	if o.proto == client.ProtocolUDP && o.messageBytes > maxUDPMessageBytes {
 		return fmt.Errorf("--message-bytes must be at most %d with --proto udp, got %d", maxUDPMessageBytes, o.messageBytes)
 	}
+	// UDP has no TCP_INFO, and other platforms none that tcpulse reads.
+	if o.tcpInfo && o.proto != client.ProtocolTCP {
+		return errors.New("--tcp-info requires --proto tcp")
+	}
+	if o.tcpInfo && !client.TCPInfoSupported {
+		return errors.New("--tcp-info is only supported on Linux")
+	}
 	return nil
 }
 
@@ -222,6 +229,7 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 		Rate:         int(o.rate),
 		Duration:     o.duration,
 		MessageBytes: int(o.messageBytes),
+		TCPInfo:      o.tcpInfo,
 		Logger:       logger,
 	}
 	recorders := stats.NewSet(len(addrs), o.mergeResultsEachHost)
@@ -259,12 +267,20 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 		run = max(run, o.duration)
 	}
 
+	result := func(peer string, rec *stats.Recorder) report.Result {
+		r := report.Result{Peer: peer, Summary: rec.Total(run)}
+		if o.tcpInfo {
+			conns := rec.Conns()
+			r.Conns = &conns
+		}
+		return r
+	}
 	var results []report.Result
 	if o.mergeResultsEachHost {
-		results = []report.Result{{Peer: report.MergedPeer(len(addrs)), Summary: recorders.For(0).Total(run)}}
+		results = []report.Result{result(report.MergedPeer(len(addrs)), recorders.For(0))}
 	} else {
 		for i, addr := range addrs {
-			results = append(results, report.Result{Peer: addr, Summary: recorders.For(i).Total(run)})
+			results = append(results, result(addr, recorders.For(i)))
 		}
 	}
 	if o.jsonlines {

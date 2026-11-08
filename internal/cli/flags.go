@@ -47,6 +47,7 @@ type options struct {
 	showOnlyResults      bool
 	mergeResultsEachHost bool
 	jsonlines            bool
+	tcpInfo              bool
 	addrsFile            bool
 	enablePprof          bool
 	pprofAddr            string
@@ -110,6 +111,7 @@ func newFlagSet(o *options) *pflag.FlagSet {
 	fs.BoolVar(&o.showOnlyResults, "show-only-results", false, "[client mode] print only results of measurement stats")
 	fs.BoolVar(&o.mergeResultsEachHost, "merge-results-each-host", false, "[client mode] merge results of each host (with --show-only-results)")
 	fs.BoolVar(&o.jsonlines, "jsonlines", false, "[client mode] output results in JSON Lines format")
+	fs.BoolVar(&o.tcpInfo, "tcp-info", false, "[client mode] report TCP statistics of the connections read from the kernel (TCP_INFO, Linux only)")
 	fs.BoolVar(&o.addrsFile, "addrs-file", false, "[client mode] enable to pass a file including a pair of addresses and ports to an argument")
 	fs.BoolVar(&o.enablePprof, "enable-pprof", false, "[client mode] enable pprof profiling")
 	fs.StringVar(&o.pprofAddr, "pprof-addr", "localhost:6060", "[client mode] pprof listening address:port")

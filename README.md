@@ -76,6 +76,7 @@ Creates new connections for each request, immediately closing them afterward. Th
 - **Protocol support**: Both TCP and UDP with optimized implementations
 - **Platform optimizations**: Leverages Linux-specific optimizations (TCP_FASTOPEN, SO_REUSEPORT) when available
 - **JSON Lines output**: Machine-readable output format for integration with monitoring and analysis tools
+- **Kernel TCP statistics**: Retransmissions, the kernel's smoothed RTT and TCP Fast Open use of the connections, with `--tcp-info` on Linux
 
 ## Installation
 
@@ -155,6 +156,7 @@ Options:
       --rate int32                 [client mode] Message throughput per connection (/s) (for 'persistent' and UDP) or new connections throughput (/s) (for 'ephemeral'). Total messages (CNT) = rate * duration * connections (for 'persistent') or rate * duration (for 'ephemeral') (default 100)
   -s, --server                     run in server mode
       --show-only-results          [client mode] print only results of measurement stats
+      --tcp-info                   [client mode] report TCP statistics of the connections read from the kernel (TCP_INFO, Linux only)
       --version                    show version information
 
 Environment:
@@ -262,6 +264,38 @@ The JSON Lines format includes the following fields:
 - `latency_99p_us`: 99th percentile latency in microseconds
 - `rate_per_sec`: Average request rate per second
 - `timestamp`: ISO 8601 timestamp when the measurement was completed
+- `tcp_info`: Only with `--tcp-info`: the TCP statistics of the connections (see below)
+
+#### TCP Statistics (`--tcp-info`)
+
+On Linux, `--tcp-info` reads what the kernel reports of every TCP connection (`getsockopt(TCP_INFO)`) right before tcpulse closes it, once the clock of its last round trip has stopped. The report then includes the TCP statistics of the connections of the whole run. It needs no privileges. It is refused with `--proto udp` and on other platforms. Without it, the output is unchanged.
+
+```shell-session
+$ tcpulse -c --show-only-results --tcp-info --flavor ephemeral --rate 1000 --duration 15s 127.0.0.1:9100
+PEER                 CNT        LAT_MAX(µs)     LAT_MIN(µs)     LAT_MEAN(µs)    LAT_90p(µs)     LAT_95p(µs)     LAT_99p(µs)     RATE(/s)
+--- A result during total execution time ---
+127.0.0.1:9100       14982      20537           63              294             380             425             749             998.79
+--- TCP statistics of the connections (TCP_INFO) ---
+PEER                 CONNS      RETRANS_CONNS   RETRANS_SEGS    SEGS_OUT        SRTT_MEAN(µs)   SRTT_99p(µs)    SRTT_MAX(µs)    TFO_CONNS
+127.0.0.1:9100       14982      0               0               59928           14              40              1862            0
+```
+
+- `CONNS`: The connections whose TCP_INFO was read: every connection that was opened, including those whose request failed or was cut off by the end of the run. A connection that could not be dialed has no socket to read and is not counted.
+- `RETRANS_CONNS`: The connections that retransmitted at least one segment
+- `RETRANS_SEGS`: The segments retransmitted, SYNs included (`tcpi_total_retrans`)
+- `SEGS_OUT`: The segments sent, retransmissions included (`tcpi_segs_out`). `RETRANS_SEGS / SEGS_OUT` is the retransmission rate.
+- `SRTT_*`: The kernel's smoothed round-trip time (`tcpi_rtt`), in microseconds: the mean, the 99th percentile (within 0.8%) and the maximum over the connections that have one. A connection whose SYN was never answered has none. They are 0 when no connection has an RTT.
+- `TFO_CONNS`: The connections whose data in the SYN was acknowledged by TCP Fast Open (`TCPI_OPT_SYN_DATA`). The server side needs `net.ipv4.tcp_fastopen` with its server bit, for instance `3`.
+
+The kernel's RTT leaves out the time spent in the client's process (system calls, the Go runtime), which `LAT_*` includes. In ephemeral mode, a round trip also includes the handshake, about one more RTT.
+
+When data sent in a SYN with a Fast Open cookie is not accepted, for instance because the server no longer enables Fast Open, the client sends it again after the handshake, and that counts as a retransmission. `RETRANS_CONNS` close to `CONNS` with `TFO_CONNS` at 0 means exactly that, not packet loss.
+
+Interval lines do not include these statistics: a persistent connection is read only when it ends. With `--jsonlines`, each object ends with a `tcp_info` object:
+
+```json
+{"peer":"127.0.0.1:9100","count":14982,"latency_max_us":20537,"latency_min_us":63,"latency_mean_us":294,"latency_90p_us":380,"latency_95p_us":425,"latency_99p_us":749,"rate_per_sec":998.79,"timestamp":"2026-11-08T08:40:00Z","tcp_info":{"connections":14982,"retrans_connections":0,"retrans_segments":0,"segments_out":59928,"srtt_mean_us":14,"srtt_99p_us":40,"srtt_max_us":1862,"fastopen_connections":0}}
+```
 
 ## Use Cases
 
