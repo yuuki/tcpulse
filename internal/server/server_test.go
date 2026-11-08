@@ -245,7 +245,8 @@ func TestServeTCPSurvivesFailures(t *testing.T) {
 
 	for _, err := range []error{
 		&net.OpError{Op: "accept", Net: "tcp", Err: os.NewSyscallError("accept4", syscall.EMFILE)},
-		&net.OpError{Op: "accept", Net: "tcp", Err: os.NewSyscallError("accept4", syscall.ECONNABORTED)},
+		// A network error of the connection being accepted (accept(2)).
+		&net.OpError{Op: "accept", Net: "tcp", Err: os.NewSyscallError("accept4", syscall.EPROTO)},
 	} {
 		select {
 		case ln.results <- acceptResult{err: err}:
@@ -279,8 +280,25 @@ func TestServeTCPStopsOnPermanentError(t *testing.T) {
 	s := &Server{logger: discard}
 	done := make(chan error, 1)
 	go func() { done <- s.serveTCP(t.Context(), ln) }()
+
+	// A connection is open when the listener fails: it must not keep the
+	// listener from returning.
+	local, remote := net.Pipe()
+	defer local.Close()
+	ln.results <- acceptResult{conn: remote}
+	roundTrip(t, local, []byte("open"))
+
 	ln.results <- acceptResult{err: &net.OpError{Op: "accept", Net: "tcp", Err: os.NewSyscallError("accept4", syscall.EINVAL)}}
-	if err := <-done; err == nil {
-		t.Fatal("serveTCP ignored a permanent accept error")
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("serveTCP ignored a permanent accept error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveTCP did not return after a permanent accept error while a connection was open")
+	}
+	_ = local.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := local.Read(make([]byte, 1)); err == nil {
+		t.Fatal("the connection is still open after the listener failed")
 	}
 }

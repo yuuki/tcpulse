@@ -167,8 +167,15 @@ func (s *Server) Serve(ctx context.Context) error {
 }
 
 func (s *Server) serveTCP(ctx context.Context, ln net.Listener) error {
+	// The connections end with the listener, whatever ends it: the server
+	// stopping, or an accept error. They are closed before they are waited
+	// for (deferred calls run last in, first out): waiting first would wait
+	// for the clients to disconnect, while the failed listener holds its
+	// port and nothing reports the error.
+	connCtx, closeConns := context.WithCancel(ctx)
 	var handlers sync.WaitGroup
 	defer handlers.Wait()
+	defer closeConns()
 	var delay time.Duration
 	for {
 		conn, err := ln.Accept()
@@ -179,9 +186,9 @@ func (s *Server) serveTCP(ctx context.Context, ln net.Listener) error {
 			if !transientAcceptError(err) {
 				return fmt.Errorf("accepting TCP connection: %w", err)
 			}
-			// Under load (out of file descriptors, a connection reset in
-			// the backlog), keep serving the connections already accepted
-			// and try again later, like net/http.
+			// Under load (out of file descriptors, a network error of the
+			// connection being accepted), keep serving the connections
+			// already accepted and try again later, like net/http.
 			delay = min(max(2*delay, minAcceptDelay), maxAcceptDelay)
 			s.logger.Warn("could not accept a TCP connection; retrying", "addr", ln.Addr(), "error", err, "delay", delay)
 			select {
@@ -201,13 +208,26 @@ func (s *Server) serveTCP(ctx context.Context, ln net.Listener) error {
 
 		handlers.Go(func() {
 			// Closing the connection when the server stops ends the handler.
-			stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+			stop := context.AfterFunc(connCtx, func() { _ = conn.Close() })
 			defer stop()
-			if err := echo(conn); err != nil && ctx.Err() == nil {
+			if err := echo(conn); err != nil && connCtx.Err() == nil {
 				s.logger.Error("connection handler error", "remote_addr", conn.RemoteAddr(), "error", err)
 			}
 		})
 	}
+}
+
+// transientAcceptErrors are the accept errors after which accept may
+// succeed: running out of file descriptors or memory, and the network errors
+// of the connection being accepted, which accept(2) on Linux says to retry
+// like EAGAIN (server_linux.go adds ENONET). Go already retries ECONNABORTED
+// and EAGAIN itself.
+var transientAcceptErrors = []syscall.Errno{
+	syscall.EMFILE, syscall.ENFILE, syscall.ENOBUFS, syscall.ENOMEM,
+	syscall.ENETDOWN, syscall.EPROTO, syscall.ENOPROTOOPT, syscall.EHOSTDOWN,
+	syscall.EHOSTUNREACH, syscall.EOPNOTSUPP, syscall.ENETUNREACH,
+	// Firewall rules forbid the connection (Linux).
+	syscall.EPERM,
 }
 
 // transientAcceptError reports whether accept may succeed if tried again.
@@ -216,7 +236,7 @@ func transientAcceptError(err error) bool {
 	if errors.As(err, &ne) && ne.Timeout() {
 		return true
 	}
-	for _, errno := range []syscall.Errno{syscall.EMFILE, syscall.ENFILE, syscall.ENOBUFS, syscall.ENOMEM, syscall.ECONNABORTED} {
+	for _, errno := range transientAcceptErrors {
 		if errors.Is(err, errno) {
 			return true
 		}
