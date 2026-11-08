@@ -9,10 +9,10 @@ import (
 // packets of a connection apart.
 const DropSlots = 4
 
-// DropCount counts the dropped packets of a connection for one reason.
+// DropCount counts the dropped packets of a connection for one reason. A
+// slot without drops (Count 0) means nothing, whatever its Reason.
 type DropCount struct {
-	// Reason is the kernel's reason (enum skb_drop_reason). 0 marks a slot
-	// without a reason yet: the kernel never drops a packet with it.
+	// Reason is the kernel's reason (enum skb_drop_reason).
 	Reason uint32
 	Count  uint32
 }
@@ -73,7 +73,7 @@ func (e Events) DroppedPackets() uint32 {
 }
 
 // IsZero reports whether no event was counted. A slot that has a reason but
-// no drop yet (the kernel takes the slot, then counts) is not an event.
+// no drop yet (the program takes the slot, then counts) is not an event.
 func (e Events) IsZero() bool {
 	return e.SYNRetrans == 0 && e.FastOpenRetrans == 0 && e.RTORetrans == 0 &&
 		e.OtherRetrans == 0 && e.ResetsReceived == 0 && e.DroppedPackets() == 0

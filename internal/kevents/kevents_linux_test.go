@@ -8,6 +8,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -270,18 +272,35 @@ func TestDropProgram(t *testing.T) {
 	if prog != want {
 		t.Errorf("dropProgram = %q for %d parameters, want %q", prog, len(params), want)
 	}
-	// Linux 5.17 has these two first; there is no reason 0.
-	if names[2] != "NOT_SPECIFIED" || names[3] != "NO_SOCKET" {
-		t.Errorf("reasons 2 and 3 = %q, %q, want NOT_SPECIFIED, NO_SOCKET", names[2], names[3])
-	}
-	if name, ok := names[0]; ok {
-		t.Errorf("reason 0 = %q, want none", name)
-	}
+	// Their values vary (Linux 5.17 has NOT_SPECIFIED at 0, later kernels
+	// put SKB_NOT_DROPPED_YET and SKB_CONSUMED first): look them up by name.
+	values := map[string]uint32{}
 	for v, name := range names {
-		if name == "" || name == "MAX" || strings.HasPrefix(name, dropReasonPrefix) {
+		if name == "" || name == "MAX" || name == "SUBSYS_MASK" || strings.HasPrefix(name, dropReasonPrefix) {
 			t.Errorf("reason %d = %q", v, name)
 		}
+		values[name] = v
 	}
+	for _, want := range []string{"NOT_SPECIFIED", "NO_SOCKET", "NETFILTER_DROP"} {
+		if _, ok := values[want]; !ok {
+			t.Errorf("no reason %s among %d", want, len(names))
+		}
+	}
+}
+
+// startDropTracer starts a Tracer that counts drops, or skips the test on a
+// kernel without the reason of drops. Where the kernel has it, the drop
+// program must load.
+func startDropTracer(t *testing.T) *Tracer {
+	t.Helper()
+	tr := startTracer(t)
+	if err := tr.DropsError(); err != nil {
+		if _, _, perr := dropProgram(kernelSpec(t)); perr != nil {
+			t.Skip(err)
+		}
+		t.Fatalf("drops not counted: %v", err)
+	}
+	return tr
 }
 
 // dropReason returns the value of the drop reason name, or skips the test
@@ -301,10 +320,7 @@ func dropReason(t *testing.T, tr *Tracer, name string) uint32 {
 // of a connection: data that arrives after it was shut down for reading,
 // which TCP drops and answers with a reset.
 func TestTracerDrops(t *testing.T) {
-	tr := startTracer(t)
-	if err := tr.DropsError(); err != nil {
-		t.Skip(err)
-	}
+	tr := startDropTracer(t)
 	if tr.drop != keventsProgKeventsDropRx {
 		t.Skip("the receive path of TCP passes the socket to kfree_skb since Linux 6.11")
 	}
@@ -360,4 +376,96 @@ func TestTracerDrops(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// inNetns runs f on a thread of its own, in a new network namespace whose
+// loopback device is up: the sockets f opens, and the programs f runs, are
+// there. It reports failures with t.Error, as f must.
+func inNetns(t *testing.T, f func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// The thread is never unlocked: it ends with the goroutine, and never
+		// serves another in the host's namespace.
+		runtime.LockOSThread()
+		if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
+			t.Errorf("unshare: %v", err)
+			return
+		}
+		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer unix.Close(fd)
+		ifr, err := unix.NewIfreq("lo")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		ifr.SetUint16(unix.IFF_UP)
+		if err := unix.IoctlIfreq(fd, unix.SIOCSIFFLAGS, ifr); err != nil {
+			t.Errorf("bringing lo up: %v", err)
+			return
+		}
+		f()
+	}()
+	<-done
+}
+
+// TestTracerSentDrops counts a packet of the client that netfilter's OUTPUT
+// hook drops: rx_sk is NULL, and the drop is the socket's by skb->sk.
+func TestTracerSentDrops(t *testing.T) {
+	tr := startDropTracer(t)
+	nft, err := exec.LookPath("nft")
+	if err != nil {
+		t.Skip("no nft")
+	}
+	netfilterDrop := dropReason(t, tr, "NETFILTER_DROP")
+	inNetns(t, func() {
+		ln, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer ln.Close()
+		conn, err := net.Dial("tcp4", ln.Addr().String())
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		// Drop the client's packets that carry data, once connected.
+		rules := fmt.Sprintf("table inet tcpulse_test {\n\tchain out {\n\t\ttype filter hook output priority 0;\n\t\ttcp dport %d meta length > 100 drop\n\t}\n}\n",
+			ln.Addr().(*net.TCPAddr).Port)
+		cmd := exec.Command(nft, "-f", "-")
+		cmd.Stdin = strings.NewReader(rules)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Errorf("nft: %v: %s", err, out)
+			return
+		}
+		if _, err := conn.Write(make([]byte, 200)); err != nil {
+			t.Error(err)
+			return
+		}
+		for deadline := time.Now().Add(3 * time.Second); ; {
+			ev, err := readConn(tr, conn)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if ev.DroppedPackets() > 0 {
+				if ev.Drops[0].Reason != netfilterDrop || ev.Drops[0].Count == 0 {
+					t.Errorf("drops = %+v, other %d; want NETFILTER_DROP (%d)", ev.Drops, ev.OtherDrops, netfilterDrop)
+				}
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("events = %+v, want a drop", ev)
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	})
 }

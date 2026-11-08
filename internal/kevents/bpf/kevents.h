@@ -53,9 +53,15 @@ struct sock {
 	struct sock_common __sk_common;
 } __attribute__((preserve_access_index));
 
-/* sk is in a union: CO-RE finds it by name. */
+/*
+ * Before Linux 6.9, sk shares a union with ip_defrag_offset, which a
+ * fragment queued for reassembly sets: its sk is then not a socket. Such a
+ * fragment has no destructor, while every packet that belongs to a socket
+ * has one (count_drop). CO-RE finds the fields by name, in a union or not.
+ */
 struct sk_buff {
 	struct sock *sk;
+	void (*destructor)(struct sk_buff *skb);
 } __attribute__((preserve_access_index));
 
 /* Bit fields: read with BPF_CORE_READ_BITFIELD_PROBED, which relocates
@@ -74,7 +80,8 @@ struct tcp_sock {
 
 /* The drops of one reason. */
 struct kevents_drop_count {
-	/* enum skb_drop_reason; 0 (SKB_NOT_DROPPED_YET) marks a free slot. */
+	/* The reason (enum skb_drop_reason) plus one: 0 marks a free slot. On
+	 * Linux 5.17, reason 0 is a reason (SKB_DROP_REASON_NOT_SPECIFIED). */
 	__u32 reason;
 	__u32 count;
 };
