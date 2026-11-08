@@ -110,3 +110,7 @@ changelog:
 release:
   # v1.2.3-rc.1 and the like are marked as pre-releases.
   prerelease: auto
+  # Releasing a tag again after a failure (workflow_dispatch of the release
+  # workflow) replaces the assets already uploaded instead of failing on
+  # them. The archives are reproducible, so the replacements are identical.
+  replace_existing_artifacts: true

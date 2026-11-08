@@ -6,15 +6,24 @@ name: release
 # attestation.
 #
 # The tagpr workflow calls this one with the tag it created, because a tag
-# pushed with GITHUB_TOKEN triggers no workflow; a tag pushed by hand runs it
-# directly.
+# pushed with GITHUB_TOKEN triggers no workflow; a tag pushed by hand (a
+# pre-release such as v1.2.3-rc.1 too) runs it directly. Running it by hand
+# (workflow_dispatch) releases an existing tag again: after a failure, the
+# assets already uploaded are replaced (release.replace_existing_artifacts
+# in .goreleaser.yaml; the archives are reproducible).
 on:
   push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+", "v[0-9]+.[0-9]+.[0-9]+-*"]
   workflow_call:
     inputs:
       tag:
         description: The tag to release (vX.Y.Z)
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The existing tag to release (vX.Y.Z or vX.Y.Z-rc.N)
         required: true
         type: string
 
@@ -32,6 +41,9 @@ jobs:
     # A reusable workflow called with ./ comes from the calling commit, as
     # $/ would bring nothing more (and actionlint does not know it yet).
     uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository]
+    with:
+      ref: ${{ inputs.tag || github.ref }}
+      release: true
 
   release:
     name: release
@@ -57,8 +69,8 @@ jobs:
 
       - name: The tag is a semantic version
         run: |
-          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::$TAG is not a tag vX.Y.Z"
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::$TAG is not a tag vX.Y.Z or vX.Y.Z-PRERELEASE"
             exit 1
           fi
 

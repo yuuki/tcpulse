@@ -9,9 +9,11 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: tagpr
-  cancel-in-progress: false
+# No concurrency group: tagpr tags the release only in the run of the merge
+# commit of its pull request, and a group would let a later push replace that
+# run while it is pending, so that the release never happens. Overlapping
+# runs at worst update the release pull request twice. (`queue: max` would
+# keep them in order, but actionlint 1.7.12 does not know it yet.)
 
 jobs:
   tagpr:

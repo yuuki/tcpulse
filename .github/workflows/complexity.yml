@@ -14,6 +14,12 @@ on:
 permissions:
   contents: read
 
+# Pushes to main commit their reports to the octocov branch one at a time; a
+# new push to a pull request replaces the measurement of the previous one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   complexity:
     name: Measure complexity
