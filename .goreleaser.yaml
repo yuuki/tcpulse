@@ -42,6 +42,12 @@ archives:
           group: root
           mode: 0644
           mtime: "{{ .CommitDate }}"
+      # The binary embeds the eBPF object of --kernel-events, distributed
+      # under BSD-2-Clause: see NOTICE.
+      - src: NOTICE
+        info: *doc
+      - src: LICENSES/*
+        info: *doc
       - src: README.md
         info: *doc
       - src: CHANGELOG.md
@@ -74,6 +80,9 @@ dockers_v2:
       - linux/arm64
     extra_files:
       - LICENSE
+      - NOTICE
+      - LICENSES/BSD-2-Clause.txt
+      - LICENSES/GPL-2.0-only.txt
     # Labels and annotations carry the same data on purpose: ghcr.io links a
     # package to its repository from the image config label, while the
     # manifest annotations are what a multi-platform aware client reads.

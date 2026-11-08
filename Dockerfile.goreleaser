@@ -9,7 +9,8 @@ FROM alpine:3.24
 # context root.
 ARG TARGETPLATFORM
 COPY $TARGETPLATFORM/tcpulse /usr/local/bin/tcpulse
-COPY LICENSE /usr/share/licenses/tcpulse/LICENSE
+COPY LICENSE NOTICE /usr/share/licenses/tcpulse/
+COPY LICENSES/ /usr/share/licenses/tcpulse/LICENSES/
 
 # Alpine's unprivileged user: no RUN step, so that the arm64 image builds
 # without emulation.
