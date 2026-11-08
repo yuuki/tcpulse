@@ -152,6 +152,14 @@ func TestMainUsageErrors(t *testing.T) {
 		{"unknown flavor", []string{"-c", "--flavor", "bursty", "host:1"}, exitError, `unexpected connect flavor "bursty"`},
 		{"two addresses files", []string{"-c", "--addrs-file", "a", "b"}, exitError, "must be one"},
 		{"merge without show-only-results", []string{"-c", "--merge-results-each-host", "host:1"}, exitError, "requires --show-only-results"},
+		{"no connection", []string{"-c", "--connections", "0", "host:1"}, exitError, "--connections must be at least 1"},
+		{"no rate", []string{"-c", "--rate", "0", "host:1"}, exitError, "--rate must be at least 1"},
+		{"negative rate", []string{"-c", "--flavor", "ephemeral", "--rate", "-5", "host:1"}, exitError, "--rate must be at least 1"},
+		{"no duration", []string{"-c", "--duration", "0s", "host:1"}, exitError, "--duration must be positive"},
+		{"no interval", []string{"-c", "--interval", "0s", "host:1"}, exitError, "--interval must be positive"},
+		{"empty messages", []string{"-c", "--message-bytes", "0", "host:1"}, exitError, "--message-bytes must be at least 1"},
+		{"oversized datagrams", []string{"-c", "--proto", "udp", "--message-bytes", "65508", "host:1"}, exitError, "at most 65507"},
+		{"unknown server protocol", []string{"-s", "--protocol", "sctp"}, exitError, `unexpected protocol "sctp"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := runMain(t.Context(), noEnvironment, tc.args...)
@@ -176,6 +184,13 @@ func TestReadAddrs(t *testing.T) {
 	}
 	if _, err := readAddrs(filepath.Join(t.TempDir(), "missing")); err == nil {
 		t.Fatal("readAddrs of a missing file succeeded")
+	}
+	empty := filepath.Join(t.TempDir(), "empty")
+	if err := os.WriteFile(empty, []byte(" \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readAddrs(empty); err == nil {
+		t.Fatal("readAddrs of a file without addresses succeeded")
 	}
 }
 
@@ -391,4 +406,59 @@ func TestServerListenError(t *testing.T) {
 	if r.code != exitError || !strings.Contains(r.stderr, "256.0.0.1:9100") {
 		t.Fatalf("exit %d, stderr %q; want a listen error", r.code, r.stderr)
 	}
+}
+
+func TestValidClientEdges(t *testing.T) {
+	for _, args := range [][]string{
+		// --connections only matters to persistent TCP connections.
+		{"-c", "--flavor", "ephemeral", "--connections", "0", "host:1"},
+		{"-c", "--proto", "udp", "--connections", "0", "--message-bytes", "65507", "host:1"},
+		{"-c", "--rate", "1", "--duration", "1ns", "--message-bytes", "1", "host:1"},
+	} {
+		o, _, err := parse(args, noEnvironment)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateClient(o); err != nil {
+			t.Errorf("%q: %v", args, err)
+		}
+	}
+}
+
+// FuzzParse checks that no command line or environment makes parse panic,
+// and that the options validation accepts can generate load: client.Run
+// would panic on a rate below 1, time.NewTicker on an interval that is not
+// positive.
+func FuzzParse(f *testing.F) {
+	f.Add("-c --rate 0 host:1", "")
+	f.Add("-c --proto udp host:1", "TCPULSE_MESSAGE_BYTES=65508")
+	f.Add("-s --protocol udp 127.0.0.1:0", "TCPULSE_LISTEN_ADDRS_FILE=")
+	f.Add("--connections=-1 --interval=0s -c a", "TCPULSE_FLAVOR=ephemeral\nTCPULSE_DURATION=1ns")
+	f.Fuzz(func(t *testing.T, cmdline, env string) {
+		vars := map[string]string{}
+		for _, kv := range strings.Split(env, "\n") {
+			if k, v, ok := strings.Cut(kv, "="); ok {
+				vars[k] = v
+			}
+		}
+		o, _, err := parse(strings.Fields(cmdline), environment(vars))
+		if err != nil {
+			return
+		}
+		if validateServer(o) == nil && o.serveProtocol != "tcp" && o.serveProtocol != "udp" && o.serveProtocol != "all" {
+			t.Fatalf("server protocol %q accepted", o.serveProtocol)
+		}
+		if validateClient(o) != nil {
+			return
+		}
+		if o.rate < 1 || o.duration <= 0 || o.interval <= 0 || o.messageBytes < 1 || len(o.args) == 0 {
+			t.Fatalf("accepted options cannot generate load: %+v", *o)
+		}
+		if o.proto == "tcp" && o.flavor == "persistent" && o.connections < 1 {
+			t.Fatalf("accepted persistent run without connections: %+v", *o)
+		}
+		if o.proto == "udp" && o.messageBytes > maxUDPMessageBytes {
+			t.Fatalf("accepted %d-byte datagrams", o.messageBytes)
+		}
+	})
 }

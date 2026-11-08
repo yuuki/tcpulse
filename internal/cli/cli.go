@@ -90,7 +90,19 @@ func Main(ctx context.Context, env Env) int {
 	return exitOK
 }
 
+func validateServer(o *options) error {
+	switch o.serveProtocol {
+	case server.ProtocolTCP, server.ProtocolUDP, server.ProtocolAll:
+		return nil
+	default:
+		return fmt.Errorf("unexpected protocol %q", o.serveProtocol)
+	}
+}
+
 func runServer(ctx context.Context, o *options, stdout io.Writer, logger *slog.Logger) error {
+	if err := validateServer(o); err != nil {
+		return err
+	}
 	if err := raiseFileLimit(); err != nil {
 		return fmt.Errorf("setting file limit: %w", err)
 	}
@@ -138,8 +150,31 @@ func validateClient(o *options) error {
 	if o.mergeResultsEachHost && !o.showOnlyResults {
 		return errors.New("--merge-results-each-host flag requires --show-only-results flag")
 	}
+	// Each of these would make the run panic or send nothing.
+	if o.proto == client.ProtocolTCP && o.flavor == client.FlavorPersistent && o.connections < 1 {
+		return fmt.Errorf("--connections must be at least 1, got %d", o.connections)
+	}
+	if o.rate < 1 {
+		return fmt.Errorf("--rate must be at least 1, got %d", o.rate)
+	}
+	if o.duration <= 0 {
+		return fmt.Errorf("--duration must be positive, got %v", o.duration)
+	}
+	if o.interval <= 0 {
+		return fmt.Errorf("--interval must be positive, got %v", o.interval)
+	}
+	if o.messageBytes < 1 {
+		return fmt.Errorf("--message-bytes must be at least 1, got %d", o.messageBytes)
+	}
+	if o.proto == client.ProtocolUDP && o.messageBytes > maxUDPMessageBytes {
+		return fmt.Errorf("--message-bytes must be at most %d with --proto udp, got %d", maxUDPMessageBytes, o.messageBytes)
+	}
 	return nil
 }
+
+// maxUDPMessageBytes is the largest UDP payload over IPv4: 65535 bytes less
+// the IPv4 and UDP headers.
+const maxUDPMessageBytes = 65535 - 20 - 8
 
 func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.Logger) error {
 	if err := validateClient(o); err != nil {
@@ -276,11 +311,16 @@ func raiseFileLimit() error {
 	return nil
 }
 
-// readAddrs returns the whitespace-separated addresses of a file.
+// readAddrs returns the whitespace-separated addresses of a file, which
+// must hold at least one.
 func readAddrs(path string) ([]string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading addresses file: %w", err)
 	}
-	return strings.Fields(string(data)), nil
+	addrs := strings.Fields(string(data))
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("no address in %s", path)
+	}
+	return addrs, nil
 }

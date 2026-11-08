@@ -85,7 +85,7 @@ func newFlagSet(o *options) *pflag.FlagSet {
 	fs.StringVar(&o.pprofAddr, "pprof-addr", "localhost:6060", "[client mode] pprof listening address:port")
 
 	// Server mode.
-	fs.StringVar(&o.serveProtocol, "protocol", server.ProtocolAll, "[server mode] listening protocol ('tcp' or 'udp')")
+	fs.StringVar(&o.serveProtocol, "protocol", server.ProtocolAll, "[server mode] listening protocol ('tcp', 'udp' or 'all')")
 	fs.StringVar(&o.listenAddrsFile, "listen-addrs-file", "", "[server mode] enable to pass a file including a pair of addresses and ports")
 
 	fs.BoolVar(&o.showVersion, "version", false, "show version information")
