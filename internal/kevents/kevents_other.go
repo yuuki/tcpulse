@@ -15,7 +15,7 @@ const Supported = false
 type Tracer struct{}
 
 // Start is not supported on this platform.
-func Start() (*Tracer, error) { return nil, errors.ErrUnsupported }
+func Start(Options) (*Tracer, error) { return nil, errors.ErrUnsupported }
 
 // Generation is not supported on this platform.
 func (*Tracer) Generation() (uint64, bool) { return 0, false }
@@ -32,6 +32,11 @@ func (*Tracer) DropReasons() map[uint32]string { return nil }
 // ReadEvents is not supported on this platform.
 func (*Tracer) ReadEvents(int) (stats.Events, error) {
 	return stats.Events{}, errors.ErrUnsupported
+}
+
+// RunQueue is not supported on this platform.
+func (*Tracer) RunQueue() (stats.RunQueueSummary, error) {
+	return stats.RunQueueSummary{}, errors.ErrUnsupported
 }
 
 // Close does nothing.

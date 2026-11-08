@@ -26,6 +26,10 @@ type Result struct {
 	// Events describes the kernel events of the round trips when the run
 	// counted them (--kernel-events), and is nil otherwise.
 	Events *stats.EventSummary
+	// RunQueue describes how long the threads of the process waited for a
+	// CPU when the run measured it (--runqueue-latency), and is nil
+	// otherwise. It is the same for every result of a run.
+	RunQueue *stats.RunQueueSummary
 }
 
 // MergedPeer is the peer name of the merged result of n peers.
@@ -74,7 +78,13 @@ const (
 	dropLineFormat   = "%-20s %-30s %-10d\n"
 	// DropSeparator precedes the dropped packets of the connections, by
 	// reason, in text output.
-	DropSeparator = "--- Packets of the connections dropped by the kernel (eBPF) ---"
+	DropSeparator    = "--- Packets of the connections dropped by the kernel (eBPF) ---"
+	runqHeaderFormat = "%-10s %-10s %-15s %-15s %-15s %-15s\n"
+	runqLineFormat   = "%-10d %-10d %-15d %-15d %-15d %-15d\n"
+	// RunQueueSeparator precedes the run queue latency of the process in
+	// text output.
+	RunQueueSeparator = "--- Run queue latency of the tcpulse threads (eBPF) ---"
+
 	// OtherDropReason names the drops whose reason was not kept
 	// (stats.EventSummary.OtherDrops). The kernel's names are upper case.
 	OtherDropReason = "other"
@@ -122,7 +132,25 @@ func (p *Printer) Report(results []Result) error {
 	if err := p.eventReport(results); err != nil {
 		return err
 	}
-	return p.dropReport(results)
+	if err := p.dropReport(results); err != nil {
+		return err
+	}
+	return p.runQueueReport(results)
+}
+
+// runQueueReport writes the run queue latency of the process, once: every
+// result has the same.
+func (p *Printer) runQueueReport(results []Result) error {
+	for _, r := range results {
+		q := r.RunQueue
+		if q == nil {
+			continue
+		}
+		return p.printf("%s\n"+runqHeaderFormat+runqLineFormat, RunQueueSeparator,
+			"WAITS", "PREEMPTED", "WAIT_TOTAL(µs)", "WAIT_50p(µs)", "WAIT_99p(µs)", "WAIT_MAX(µs)",
+			q.Waits, q.Preempted, q.Total.Microseconds(), q.P50.Microseconds(), q.P99.Microseconds(), q.Max.Microseconds())
+	}
+	return nil
 }
 
 func (p *Printer) eventReport(results []Result) error {
@@ -271,6 +299,35 @@ type JSONLinesResult struct {
 	// KernelEvents is only there when the run counted the kernel events of
 	// its round trips (--kernel-events).
 	KernelEvents *JSONLinesKernelEvents `json:"kernel_events,omitempty"`
+	// RunQueueLatency is only there when the run measured the run queue
+	// latency of the process (--runqueue-latency); it is the same in every
+	// object of a run.
+	RunQueueLatency *JSONLinesRunQueue `json:"runqueue_latency,omitempty"`
+}
+
+// JSONLinesRunQueue is the JSON object of the run queue latency of the
+// process.
+type JSONLinesRunQueue struct {
+	Waits     int64 `json:"waits"`
+	Preempted int64 `json:"preempted"`
+	WaitTotal int64 `json:"wait_total_us"`
+	Wait50p   int64 `json:"wait_50p_us"`
+	Wait99p   int64 `json:"wait_99p_us"`
+	WaitMax   int64 `json:"wait_max_us"`
+}
+
+func jsonLinesRunQueue(q *stats.RunQueueSummary) *JSONLinesRunQueue {
+	if q == nil {
+		return nil
+	}
+	return &JSONLinesRunQueue{
+		Waits:     q.Waits,
+		Preempted: q.Preempted,
+		WaitTotal: q.Total.Microseconds(),
+		Wait50p:   q.P50.Microseconds(),
+		Wait99p:   q.P99.Microseconds(),
+		WaitMax:   q.Max.Microseconds(),
+	}
 }
 
 // JSONLinesKernelEvents is the JSON object of the kernel events of the round
@@ -376,18 +433,19 @@ func (p *Printer) JSONLines(results []Result) error {
 	for _, r := range results {
 		s := r.Summary
 		if err := enc.Encode(JSONLinesResult{
-			Peer:         r.Peer,
-			Count:        s.Count,
-			LatencyMax:   s.Max.Microseconds(),
-			LatencyMin:   s.Min.Microseconds(),
-			LatencyMean:  s.Mean.Microseconds(),
-			Latency90p:   s.P90.Microseconds(),
-			Latency95p:   s.P95.Microseconds(),
-			Latency99p:   s.P99.Microseconds(),
-			Rate:         s.Rate,
-			Timestamp:    timestamp,
-			TCPInfo:      jsonLinesTCPInfo(r.Conns),
-			KernelEvents: p.jsonLinesKernelEvents(r.Events),
+			Peer:            r.Peer,
+			Count:           s.Count,
+			LatencyMax:      s.Max.Microseconds(),
+			LatencyMin:      s.Min.Microseconds(),
+			LatencyMean:     s.Mean.Microseconds(),
+			Latency90p:      s.P90.Microseconds(),
+			Latency95p:      s.P95.Microseconds(),
+			Latency99p:      s.P99.Microseconds(),
+			Rate:            s.Rate,
+			Timestamp:       timestamp,
+			TCPInfo:         jsonLinesTCPInfo(r.Conns),
+			KernelEvents:    p.jsonLinesKernelEvents(r.Events),
+			RunQueueLatency: jsonLinesRunQueue(r.RunQueue),
 		}); err != nil {
 			return fmt.Errorf("writing JSON Lines: %w", err)
 		}

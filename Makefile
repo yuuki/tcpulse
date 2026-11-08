@@ -49,8 +49,8 @@ test-race: ## Run the tests with the race detector
 # Loading eBPF programs needs root, or CAP_BPF and CAP_PERFMON: without them,
 # these tests skip (as they do in `make test`).
 .PHONY: test-bpf
-test-bpf: ## Run the tests that load the eBPF programs of --kernel-events (as root)
-	go test -race -count=1 -run 'Tracer|KernelEvents' ./internal/kevents/ ./internal/cli/
+test-bpf: ## Run the tests that load the eBPF programs of --kernel-events and --runqueue-latency (as root)
+	go test -race -count=1 -run 'Tracer|KernelEvents|RunQueueLatency' ./internal/kevents/ ./internal/cli/
 
 # bpf2go compiles internal/kevents/bpf with clang; its output
 # (internal/kevents/kevents_bpfel.go and .o) is committed, so that building

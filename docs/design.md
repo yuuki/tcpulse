@@ -31,7 +31,7 @@ internal/server  echo server
 internal/stats   latency histogram, per-peer recorders
 internal/report  text and JSON Lines output
 internal/sockopt Linux socket options and TCP_INFO (no-ops or unsupported elsewhere)
-internal/kevents eBPF counters of kernel TCP events per connection (Linux)
+internal/kevents eBPF counters of kernel TCP events per connection, run queue latency (Linux)
 ```
 
 `main.go` stays at the root of the module so that
@@ -301,6 +301,44 @@ The tests that load the programs skip without the privileges, as in CI;
 `make test-bpf` runs them as root. The attribution itself is tested with a
 fake reader.
 
+### 3.6 Run queue latency
+
+A load generator that waits for a CPU delays its own round trips, and its
+report then blames the network. With `--runqueue-latency` (the requirements
+of §3.5, TCP or UDP), the programs of `internal/kevents` measure how long the
+threads of the process wait for a CPU: from when a thread becomes runnable
+to when it runs, as `runqlat` does. It is a separate option because its
+tracepoints run at every context switch and wakeup of the host, more often
+than those of §3.5; it loads only its own programs.
+
+| Tracepoint | What it does |
+| --- | --- |
+| `sched_wakeup`, `sched_wakeup_new` | A thread of the process becomes runnable: remembers when, by thread ID, in a hash map. |
+| `sched_switch` | The switch is involuntary, as the kernel counts it (`nivcsw`), when prev was preempted in the kernel or is still runnable: its time slice ended (preemption in user mode goes through `schedule()`, with `preempt` false), or it yielded. prev then waits again, from now. next stops waiting: its wait is recorded. |
+
+The tasks of these tracepoints carry the IDs of the initial PID namespace,
+while tcpulse may run in a container. The process's ID there is learnt at
+the first context switch of one of its threads, when it is the current task,
+by the namespace check of §3.5; then a switch or wakeup of another process
+costs a load and a comparison. Since Linux 5.18, `sched_switch` passes the
+state prev had when it called the scheduler: reading the state in the
+tracepoint may see a task that a concurrent wakeup already made runnable.
+Before, there is only that, and the loader picks the program that matches
+the prototype.
+
+The waits go to a per-CPU array (the CPU where they end, with preemption
+disabled, so plain increments): their count, total, longest, and a
+histogram whose buckets are at most 1/8 of their values wide (each power of
+two of nanoseconds in eight). After the run, the client adds the CPUs up;
+the percentiles are nearest-rank, as the largest value of their bucket, and
+the longest wait is exact. The report prints one section for the process,
+and every JSON object carries the same `runqueue_latency`.
+
+The waits are those of the process: a Go thread runs the goroutines of
+many connections, so a wait cannot be given to one round trip. The report
+compares percentiles, which is what tells the client's delays from the
+network's.
+
 ## 4. Statistics
 
 `internal/stats.Histogram` counts durations in log-linear buckets: every
@@ -406,7 +444,9 @@ with a section of its own: a separator, a header, and a line per peer (or a
 single merged line) of TCP statistics. Each JSON object ends with a
 `tcp_info` object. `--kernel-events` adds a section of the same form after
 it, and a `kernel_events` object; when the host dropped packets of the
-connections, a last section lists them by peer and reason. Without these
+connections, a section lists them by peer and reason. `--runqueue-latency`
+ends the text report with a section for the process, and each object with a
+`runqueue_latency` object. Without these
 options, the output is
 unchanged. The column layout and the JSON field names and order are a public
 format, pinned by golden tests in `internal/report`.

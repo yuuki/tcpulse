@@ -78,20 +78,21 @@ func TestParseDefaults(t *testing.T) {
 
 func TestParseEnvironment(t *testing.T) {
 	o, _, err := parse([]string{"--rate", "7", "host:1"}, environment(map[string]string{
-		"TCPULSE_CLIENT":        "true",
-		"TCPULSE_RATE":          "1000", // the command line takes precedence
-		"TCPULSE_MESSAGE_BYTES": "1024",
-		"TCPULSE_DURATION":      "3s",
-		"TCPULSE_TCP_INFO":      "true",
-		"TCPULSE_KERNEL_EVENTS": "1",
-		"TCPULSE_FLAVOR":        "", // empty: ignored
-		"TCPULSE_VERSION":       "true",
-		"TCPULSE_HELP":          "true",
+		"TCPULSE_CLIENT":           "true",
+		"TCPULSE_RATE":             "1000", // the command line takes precedence
+		"TCPULSE_MESSAGE_BYTES":    "1024",
+		"TCPULSE_DURATION":         "3s",
+		"TCPULSE_TCP_INFO":         "true",
+		"TCPULSE_KERNEL_EVENTS":    "1",
+		"TCPULSE_RUNQUEUE_LATENCY": "true",
+		"TCPULSE_FLAVOR":           "", // empty: ignored
+		"TCPULSE_VERSION":          "true",
+		"TCPULSE_HELP":             "true",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !o.client || o.rate != 7 || o.messageBytes != 1024 || o.duration != 3*time.Second || o.flavor != "persistent" || !o.tcpInfo || !o.kernelEvents {
+	if !o.client || o.rate != 7 || o.messageBytes != 1024 || o.duration != 3*time.Second || o.flavor != "persistent" || !o.tcpInfo || !o.kernelEvents || !o.runqueueLatency {
 		t.Fatalf("options = %+v", *o)
 	}
 	if o.showVersion || o.showHelp {
@@ -179,6 +180,7 @@ func TestMainHelp(t *testing.T) {
 			"\n      --message-bytes int32        [client mode] TCP/UDP message size (bytes) (default 64)\n",
 			"\n      --tcp-info                   [client mode] report TCP statistics of the connections read from the kernel (TCP_INFO, Linux only)\n",
 			"\n      --kernel-events              [client mode] attribute kernel TCP events (retransmissions, resets, drops) to the round trips with eBPF (Linux only, needs root or CAP_BPF and CAP_PERFMON)\n",
+			"\n      --runqueue-latency           [client mode] measure how long the threads of tcpulse wait for a CPU with eBPF, to tell its own delays from those of the network (Linux only, needs root or CAP_BPF and CAP_PERFMON)\n",
 			"TCPULSE_MESSAGE_BYTES=1024",
 			"Examples:",
 		} {
@@ -379,13 +381,14 @@ func TestClientTCPInfoMergedText(t *testing.T) {
 }
 
 // canTrace reports whether this process may load the eBPF programs of
-// --kernel-events, which tests normally may not (they run unprivileged).
+// --kernel-events and --runqueue-latency, which tests normally may not (they
+// run unprivileged).
 func canTrace(t *testing.T) bool {
 	t.Helper()
 	if !kevents.Supported {
 		return false
 	}
-	tr, err := kevents.Start()
+	tr, err := kevents.Start(kevents.Options{Events: true, RunQueue: true})
 	if err != nil {
 		t.Logf("cannot load the eBPF programs: %v", err)
 		return false
@@ -597,6 +600,7 @@ func FuzzParse(f *testing.F) {
 	f.Add("-c --rate 1 --duration 999ms a", "TCPULSE_RATE=x")
 	f.Add("-c --tcp-info a", "TCPULSE_PROTO=udp")
 	f.Add("-c --kernel-events a", "TCPULSE_PROTO=udp")
+	f.Add("-c --runqueue-latency a", "TCPULSE_PROTO=udp")
 	f.Fuzz(func(t *testing.T, cmdline, env string) {
 		vars := map[string]string{}
 		for _, kv := range strings.Split(env, "\n") {
@@ -637,6 +641,9 @@ func FuzzParse(f *testing.F) {
 		}
 		if o.kernelEvents && (o.proto != "tcp" || !kevents.Supported) {
 			t.Fatalf("accepted --kernel-events with --proto %s (supported: %v)", o.proto, kevents.Supported)
+		}
+		if o.runqueueLatency && !kevents.Supported {
+			t.Fatal("accepted --runqueue-latency where it is not supported")
 		}
 	})
 }
@@ -700,5 +707,39 @@ func TestClientSameAddressTwice(t *testing.T) {
 	// Each occurrence puts its own load and counts its own round trips.
 	if results := decodeJSONLines(t, r.stdout); len(results) != 2 || results[0].Count != 10 || results[1].Count != 10 {
 		t.Fatalf("results:\n%s\nwant 10 round trips for each occurrence", r.stdout)
+	}
+}
+
+func TestClientRunQueueLatency(t *testing.T) {
+	// UDP too: the waits are those of the process.
+	addrs := echoServers(t, server.ProtocolUDP, 2)
+	args := append([]string{"-c", "--jsonlines", "--proto", "udp", "--runqueue-latency", "--rate", "50", "--duration", "1s"}, addrs...)
+	r := runMain(t.Context(), noEnvironment, args...)
+	switch {
+	case !kevents.Supported:
+		if r.code != exitError || !strings.Contains(r.stderr, "--runqueue-latency is only supported on Linux on little-endian architectures") {
+			t.Fatalf("exit %d, stderr %q; want --runqueue-latency refused", r.code, r.stderr)
+		}
+		return
+	case !canTrace(t):
+		if r.code != exitError || !strings.Contains(r.stderr, "--runqueue-latency: loading the eBPF programs") || r.stdout != "" {
+			t.Fatalf("exit %d, stdout %q, stderr %q; want the load error", r.code, r.stdout, r.stderr)
+		}
+		return
+	}
+	if r.code != 0 {
+		t.Fatalf("exit %d: %s", r.code, r.stderr)
+	}
+	results := decodeJSONLines(t, r.stdout)
+	if len(results) != len(addrs) {
+		t.Fatalf("%d results, want %d:\n%s", len(results), len(addrs), r.stdout)
+	}
+	for i, res := range results {
+		// The threads of a run wait at least once: they are woken up for
+		// every message. Every object has the same summary.
+		q := res.RunQueueLatency
+		if q == nil || q.Waits == 0 || *q != *results[0].RunQueueLatency || res.KernelEvents != nil {
+			t.Errorf("result %d: runqueue_latency %+v, kernel_events %+v; want the waits, and no kernel events", i, q, res.KernelEvents)
+		}
 	}
 }

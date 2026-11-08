@@ -10,6 +10,7 @@
 - Tests listen on port 0 (`server.Listen`, `TCPAddrs`) and keep at least 100ms of margin in timing assertions; macOS sends UDP datagrams of 9216 bytes at most.
 - `main.go` stays at the root so that `go install github.com/yuuki/tcpulse@latest` works.
 - `--kernel-events` adds no hook on the path of every packet or message: tracepoints at state changes, retransmissions, resets and drops (`kfree_skb`, which runs for dropped packets only); counters checked after the clock stops (on amd64 and arm64 through shared memory, with a system call for a connection's first reading and after an event was counted), a duplicate of each dialed socket so that failed dials are read too; events that cannot be read make a round trip untracked, never one without events.
+- `--runqueue-latency` is opt-in because its tracepoints (`sched_switch`, `sched_wakeup`, `sched_wakeup_new`) run at every context switch of the host: keep the path of other processes to a load and a comparison, and read the waits only after the run.
 
 ## Compatibility contracts
 - Flags, short options, defaults, exit statuses (2 for a command line or variable that cannot be parsed) and the option lines of the help text (pflag stays on 1.0): `internal/cli/flags.go`.

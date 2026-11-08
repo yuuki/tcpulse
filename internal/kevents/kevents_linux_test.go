@@ -6,9 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/bits"
 	"net"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -23,7 +28,13 @@ import (
 // this process may not load eBPF programs (tests normally run unprivileged).
 func startTracer(t *testing.T) *Tracer {
 	t.Helper()
-	tr, err := Start()
+	return startTracerWith(t, Options{Events: true})
+}
+
+// startTracerWith starts a Tracer of opts, as startTracer.
+func startTracerWith(t *testing.T, opts Options) *Tracer {
+	t.Helper()
+	tr, err := Start(opts)
 	if errors.Is(err, os.ErrPermission) {
 		t.Skipf("loading eBPF programs needs root, or CAP_BPF and CAP_PERFMON: %v", err)
 	}
@@ -359,5 +370,108 @@ func TestTracerDrops(t *testing.T) {
 			t.Fatalf("events = %+v, want a drop", ev)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// runqBucket mirrors runq_bucket of kevents.bpf.c.
+func runqBucket(ns uint64) int {
+	if ns < runqSub {
+		return int(ns)
+	}
+	e := bits.Len64(ns) - 1
+	return (e-runqSubBits+1)<<runqSubBits | int(ns>>(e-runqSubBits))&(runqSub-1)
+}
+
+func TestRunqBuckets(t *testing.T) {
+	buckets := len(keventsKeventsRunq{}.Buckets)
+	if b := runqBucket(math.MaxUint64); b != buckets-1 || runqBucketMax(b) != math.MaxUint64 {
+		t.Fatalf("the largest wait is in bucket %d up to %d, want the last one, %d", b, runqBucketMax(b), buckets-1)
+	}
+	// Every bucket starts right after the previous one, and is at most 1/8
+	// of its values wide.
+	for b := 1; b < buckets; b++ {
+		lo, hi := runqBucketMax(b-1)+1, runqBucketMax(b)
+		if runqBucket(lo) != b || runqBucket(hi) != b {
+			t.Fatalf("bucket %d is [%d, %d], but they fall in %d and %d", b, lo, hi, runqBucket(lo), runqBucket(hi))
+		}
+		if hi-lo > lo/8 {
+			t.Fatalf("bucket %d is [%d, %d]: wider than 1/8", b, lo, hi)
+		}
+	}
+}
+
+func TestSummarizeRunQueue(t *testing.T) {
+	var r keventsKeventsRunq
+	// 98 waits of 1µs, one of 2ms and one of 50ms.
+	r.Buckets[runqBucket(1000)] = 98
+	r.Buckets[runqBucket(2_000_000)] = 1
+	r.Buckets[runqBucket(50_000_000)] = 1
+	r.Waits, r.TotalNs, r.MaxNs, r.Preempted = 100, 98_000+52_000_000, 50_000_000, 7
+	s := summarizeRunQueue(&r)
+	if s.Waits != 100 || s.Preempted != 7 || s.Total != 52098*time.Microsecond || s.Max != 50*time.Millisecond {
+		t.Fatalf("summary = %+v", s)
+	}
+	// Rounded up, within 1/8; the 99th is the 99th of 100 waits.
+	if s.P50 < time.Microsecond || s.P50 > 1125*time.Nanosecond {
+		t.Errorf("P50 = %v, want 1µs within 1/8", s.P50)
+	}
+	if s.P99 < 2*time.Millisecond || s.P99 > 2250*time.Microsecond {
+		t.Errorf("P99 = %v, want 2ms within 1/8", s.P99)
+	}
+	if s := summarizeRunQueue(&keventsKeventsRunq{}); s != (stats.RunQueueSummary{}) {
+		t.Errorf("summary of nothing = %+v, want zero", s)
+	}
+}
+
+// TestTracerRunQueue makes more threads of the process runnable than there
+// are CPUs, so that they wait for one.
+func TestTracerRunQueue(t *testing.T) {
+	tr := startTracerWith(t, Options{RunQueue: true})
+	if _, err := tr.ReadEvents(0); err == nil {
+		t.Error("ReadEvents without Events succeeded")
+	}
+	threads := 4 * runtime.NumCPU()
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(threads))
+	// The threads spin: they never block, so they wait only for a CPU.
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	for range threads {
+		wg.Go(func() {
+			runtime.LockOSThread()
+			for !stop.Load() {
+			}
+		})
+	}
+	time.Sleep(300 * time.Millisecond)
+	stop.Store(true)
+	wg.Wait()
+
+	s, err := tr.RunQueue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Waits == 0 || s.Preempted == 0 || s.Max == 0 {
+		t.Fatalf("run queue = %+v, want waits and preemptions", s)
+	}
+	if s.P50 > s.P99 || s.P99 > s.Max || s.Max > s.Total {
+		t.Fatalf("run queue = %+v, want P50 <= P99 <= Max <= Total", s)
+	}
+	// The programs and the decoding agree on the buckets: the longest wait
+	// is in the last bucket that has waits.
+	var perCPU []keventsKeventsRunq
+	if err := tr.runq.Lookup(uint32(0), &perCPU); err != nil {
+		t.Fatal(err)
+	}
+	last := -1
+	for _, c := range perCPU {
+		for b, n := range c.Buckets {
+			if n > 0 {
+				last = max(last, b)
+			}
+		}
+	}
+	maxNs := uint64(s.Max.Nanoseconds())
+	if last < 1 || maxNs <= runqBucketMax(last-1) || maxNs > runqBucketMax(last) {
+		t.Fatalf("longest wait %dns, last bucket with waits %d", maxNs, last)
 	}
 }

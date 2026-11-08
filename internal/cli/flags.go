@@ -49,6 +49,7 @@ type options struct {
 	jsonlines            bool
 	tcpInfo              bool
 	kernelEvents         bool
+	runqueueLatency      bool
 	addrsFile            bool
 	enablePprof          bool
 	pprofAddr            string
@@ -114,6 +115,7 @@ func newFlagSet(o *options) *pflag.FlagSet {
 	fs.BoolVar(&o.jsonlines, "jsonlines", false, "[client mode] output results in JSON Lines format")
 	fs.BoolVar(&o.tcpInfo, "tcp-info", false, "[client mode] report TCP statistics of the connections read from the kernel (TCP_INFO, Linux only)")
 	fs.BoolVar(&o.kernelEvents, "kernel-events", false, "[client mode] attribute kernel TCP events (retransmissions, resets, drops) to the round trips with eBPF (Linux only, needs root or CAP_BPF and CAP_PERFMON)")
+	fs.BoolVar(&o.runqueueLatency, "runqueue-latency", false, "[client mode] measure how long the threads of tcpulse wait for a CPU with eBPF, to tell its own delays from those of the network (Linux only, needs root or CAP_BPF and CAP_PERFMON)")
 	fs.BoolVar(&o.addrsFile, "addrs-file", false, "[client mode] enable to pass a file including a pair of addresses and ports to an argument")
 	fs.BoolVar(&o.enablePprof, "enable-pprof", false, "[client mode] enable pprof profiling")
 	fs.StringVar(&o.pprofAddr, "pprof-addr", "localhost:6060", "[client mode] pprof listening address:port")
