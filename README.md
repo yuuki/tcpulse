@@ -77,7 +77,7 @@ Creates new connections for each request, immediately closing them afterward. Th
 - **Platform optimizations**: Leverages Linux-specific optimizations (TCP_FASTOPEN, SO_REUSEPORT) when available
 - **JSON Lines output**: Machine-readable output format for integration with monitoring and analysis tools
 - **Kernel TCP statistics**: Retransmissions, the kernel's smoothed RTT and TCP Fast Open use of the connections, with `--tcp-info` on Linux
-- **Kernel events per round trip**: Which round trips met a SYN retransmission, a retransmission timeout, a fast retransmission or a reset, and how slow they were compared with the others, with `--kernel-events` (eBPF, Linux)
+- **Kernel events per round trip**: Which round trips met a SYN retransmission, a retransmission timeout, another retransmission or a reset, and how slow they were compared with the others, with `--kernel-events` (eBPF, Linux)
 
 ## Installation
 
@@ -309,7 +309,7 @@ Interval lines do not include these statistics: a persistent connection is read 
 On Linux, `--kernel-events` loads eBPF programs that count kernel events on every TCP connection tcpulse opens: retransmissions, by kind, and resets received. tcpulse attributes each event to the round trip during which it happened, and the report tells whether the slow round trips are those that met these events.
 
 **Requirements**
-- Linux 5.12 or later, with BTF (`/sys/kernel/btf/vmlinux`).
+- Linux 5.12 or later, with BTF (`/sys/kernel/btf/vmlinux`), on a little-endian architecture.
 - Root, or `CAP_BPF` and `CAP_PERFMON`. The container image runs as `nobody`: give it `--user 0` and the capabilities, which `--privileged` grants.
 - It is refused with `--proto udp` and on other platforms. If the programs cannot be loaded, tcpulse exits with status 1 and the reason, before sending anything.
 
@@ -317,37 +317,40 @@ On Linux, `--kernel-events` loads eBPF programs that count kernel events on ever
 $ sudo tcpulse -c --show-only-results --kernel-events --flavor ephemeral --rate 200 --duration 4s 192.0.2.10:9100
 PEER                 CNT        LAT_MAX(µs)     LAT_MIN(µs)     LAT_MEAN(µs)    LAT_90p(µs)     LAT_95p(µs)     LAT_99p(µs)     RATE(/s)
 --- A result during total execution time ---
-192.0.2.10:9100      792        2049623         171             45133           528             205520          1031798         197.97
+192.0.2.10:9100      795        2047918         164             50962           647             206569          1023410         198.60
 --- Kernel events of the round trips (eBPF) ---
-PEER                 EVENT_RTS  SYN_RTX         TFO_RTX         RTO_RTX         FAST_RTX        EVENT_99p(µs)   CLEAN_99p(µs)   RST_RECV        UNMATCHED
-192.0.2.10:9100      61         26              0               2               37              2049623         692             0               0
+PEER                 EVENT_RTS  SYN_RTX         TFO_RTX         RTO_RTX         OTHER_RTX       EVENT_99p(µs)   CLEAN_99p(µs)   RST_RECV        UNMATCHED       UNTRACKED
+192.0.2.10:9100      65         30              0               2               36              2047918         827             0               0               0
 ```
 
-In this run, 5% of the packets to the server were dropped. The 99th percentile of the run, 1.03s, belongs to the 61 round trips that met kernel events (2.05s); the other round trips stayed below 692µs.
+In this run, 5% of the packets to the server were dropped. The 99th percentile of the run, 1.02s, comes from the 65 round trips that met kernel events: their own 99th percentile is 2.05s, while that of the other round trips is 827µs.
 
 - `EVENT_RTS`: The completed round trips during which at least one event was counted on their connection
-- `SYN_RTX`, `TFO_RTX`, `RTO_RTX`, `FAST_RTX`: The round trips during which at least one retransmission of that kind happened. A round trip can count under several kinds.
-  - `SYN_RTX`: of the SYN. A lost SYN is retransmitted after at least 1s.
-  - `TFO_RTX`: of data sent in a TCP Fast Open SYN that the server did not acknowledge. The client sends it again right after the handshake, without loss or timeout.
+- `SYN_RTX`, `TFO_RTX`, `RTO_RTX`, `OTHER_RTX`: The round trips during which at least one retransmission of that kind happened. A round trip can count under several kinds.
+  - `SYN_RTX`: of the SYN. A lost SYN is retransmitted after at least 1s. When TCP Fast Open is used, the data of the SYN, which its retries do not carry, is sent again after the handshake and counts here too.
+  - `TFO_RTX`: of data sent in a TCP Fast Open SYN that the server did not acknowledge although the SYN arrived: the server no longer accepts Fast Open, or its queue of pending Fast Open requests is full. The client sends the data again right after the handshake, without loss or timeout.
   - `RTO_RTX`: in the kernel's loss state, which a retransmission timeout enters (200ms at least).
-  - `FAST_RTX`: any other: fast retransmit, RACK, tail loss probes.
+  - `OTHER_RTX`: any other: fast retransmit, RACK, tail loss probes. These are not fast for tcpulse's messages either: when a single segment is in flight, the tail loss probe waits for two RTTs plus the minimum RTO (200ms).
 - `EVENT_99p(µs)`, `CLEAN_99p(µs)`: The 99th percentile latency of the round trips with events, and of the others
 - `RST_RECV`: The resets received by the connections
-- `UNMATCHED`: The retransmissions that no completed round trip owns. They belong to requests that failed or were cut off by the end of the run, or, in persistent mode, to a handshake the untimed dial waited for.
+- `UNMATCHED`: The retransmissions that no completed round trip owns. They come from dials that failed or were cut off by the end of the run (SYNs never answered), from requests that failed or were cut off, and, in persistent mode, from a handshake that the untimed dial waited for.
+- `UNTRACKED`: The completed round trips whose events could not be read. They count neither as round trips with events nor as round trips without.
 
 How events are attributed:
 - **Persistent mode:** the events of a round trip are those counted on its connection since the end of the previous round trip.
 - **Ephemeral mode:** a round trip includes the dial, so its events are all those counted since the connection was opened.
-- **Cost:** tcpulse checks the counters after each round trip, once the clock has stopped, with a load from memory it shares with the programs. A `bpf()` system call reads a connection's counters only the first time, and after an event was counted on any connection. No program runs for every packet.
-- **Untracked round trips:** a round trip whose events cannot be read is counted as untracked, never as one without events.
+- **Failed dials:** tcpulse keeps a duplicate of the descriptor of each socket it dials, so that it can read the events of a socket after the dial failed and closed it.
+- **Cost:** tcpulse checks the counters after each round trip, once the clock has stopped. On amd64 and arm64, it does so with a load from memory it shares with the programs; a `bpf()` system call reads a connection's counters only the first time, and after an event was counted on any connection. On other architectures, every check is a system call. Inside the clock, the only addition is the `dup(2)` of the socket in the dial (in ephemeral mode, the dial is timed). No program runs for every packet.
 
 With `--jsonlines`, each object ends with a `kernel_events` object (after `tcp_info`, if present). It has these fields:
-- `round_trips_with_events`;
-- `syn_retrans_round_trips`, `fastopen_retrans_round_trips`, `rto_retrans_round_trips`, `fast_retrans_round_trips`;
+- `round_trips_with_events`, `round_trips_without_events`;
+- `syn_retrans_round_trips`, `fastopen_retrans_round_trips`, `rto_retrans_round_trips`, `other_retrans_round_trips`;
 - `latency_99p_with_events_us`, `latency_max_with_events_us`, `latency_99p_without_events_us`, `latency_max_without_events_us`;
 - `resets_received`;
-- `unmatched_syn_retrans`, `unmatched_fastopen_retrans`, `unmatched_rto_retrans`, `unmatched_fast_retrans`;
+- `unmatched_syn_retrans`, `unmatched_fastopen_retrans`, `unmatched_rto_retrans`, `unmatched_other_retrans`;
 - `untracked_round_trips`.
+
+The round trips with and without events, plus the untracked ones, add up to `count`.
 
 ## Use Cases
 

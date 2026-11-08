@@ -13,9 +13,9 @@ type Events struct {
 	// RTORetrans counts the retransmissions in the loss state, which a
 	// retransmission timeout enters.
 	RTORetrans uint32
-	// FastRetrans counts the other retransmissions: fast retransmit, RACK,
+	// OtherRetrans counts the other retransmissions: fast retransmit, RACK,
 	// tail loss probes.
-	FastRetrans uint32
+	OtherRetrans uint32
 	// ResetsReceived counts the resets the connection accepted.
 	ResetsReceived uint32
 }
@@ -27,7 +27,7 @@ func (e Events) Sub(prev Events) Events {
 		SYNRetrans:      e.SYNRetrans - prev.SYNRetrans,
 		FastOpenRetrans: e.FastOpenRetrans - prev.FastOpenRetrans,
 		RTORetrans:      e.RTORetrans - prev.RTORetrans,
-		FastRetrans:     e.FastRetrans - prev.FastRetrans,
+		OtherRetrans:    e.OtherRetrans - prev.OtherRetrans,
 		ResetsReceived:  e.ResetsReceived - prev.ResetsReceived,
 	}
 }
@@ -41,11 +41,11 @@ type RetransCounts struct {
 	SYN      int64
 	FastOpen int64
 	RTO      int64
-	Fast     int64
+	Other    int64
 }
 
 // Total returns the sum of the counts.
-func (c RetransCounts) Total() int64 { return c.SYN + c.FastOpen + c.RTO + c.Fast }
+func (c RetransCounts) Total() int64 { return c.SYN + c.FastOpen + c.RTO + c.Other }
 
 // LatencySummary describes some of the round trips of a run.
 type LatencySummary struct {
@@ -109,7 +109,7 @@ func (s *eventStats) roundTrip(d time.Duration, ev Events) {
 	count(ev.SYNRetrans, &s.summary.RetransRoundTrips.SYN)
 	count(ev.FastOpenRetrans, &s.summary.RetransRoundTrips.FastOpen)
 	count(ev.RTORetrans, &s.summary.RetransRoundTrips.RTO)
-	count(ev.FastRetrans, &s.summary.RetransRoundTrips.Fast)
+	count(ev.OtherRetrans, &s.summary.RetransRoundTrips.Other)
 }
 
 func (s *eventStats) unmatched(ev Events) {
@@ -117,7 +117,7 @@ func (s *eventStats) unmatched(ev Events) {
 	s.summary.Unmatched.SYN += int64(ev.SYNRetrans)
 	s.summary.Unmatched.FastOpen += int64(ev.FastOpenRetrans)
 	s.summary.Unmatched.RTO += int64(ev.RTORetrans)
-	s.summary.Unmatched.Fast += int64(ev.FastRetrans)
+	s.summary.Unmatched.Other += int64(ev.OtherRetrans)
 }
 
 func (s *eventStats) summarize() EventSummary {

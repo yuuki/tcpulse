@@ -74,7 +74,7 @@ struct kevents_counts {
 	__u32 syn_retrans;
 	__u32 fastopen_retrans;
 	__u32 rto_retrans;
-	__u32 fast_retrans;
+	__u32 other_retrans;
 	__u32 resets_received;
 	__u32 flags;
 };

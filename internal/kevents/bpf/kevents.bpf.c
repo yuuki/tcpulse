@@ -82,7 +82,10 @@ int BPF_PROG(kevents_connect, const struct sock *sk, const int oldstate,
  *     which tcp_rcv_fastopen_synack sends again right after the handshake:
  *     the first other retransmission of a connection whose SYN carried data
  *     (syn_data) not acknowledged (!syn_data_acked). That resend also puts
- *     the socket in the loss state, so it is told apart first;
+ *     the socket in the loss state, so it is told apart first. When the SYN
+ *     itself was retransmitted, the resend is a consequence of that loss
+ *     (SYN retries carry no data: tcp_send_syn_data), and it is counted
+ *     with the SYN;
  *   - on a timeout: the socket is in the loss state (TCP_CA_Loss), which a
  *     retransmission timeout enters;
  *   - any other: fast retransmit, RACK, tail loss probe.
@@ -112,11 +115,11 @@ static __always_inline void count_retransmit(const struct sock *sk)
 	else if (first_retransmit(c) &&
 		 BPF_CORE_READ_BITFIELD_PROBED(tp, syn_data) &&
 		 !BPF_CORE_READ_BITFIELD_PROBED(tp, syn_data_acked))
-		counter = &c->fastopen_retrans;
+		counter = c->syn_retrans ? &c->syn_retrans : &c->fastopen_retrans;
 	else if (BPF_CORE_READ_BITFIELD_PROBED(icsk, icsk_ca_state) == TCP_CA_Loss)
 		counter = &c->rto_retrans;
 	else
-		counter = &c->fast_retrans;
+		counter = &c->other_retrans;
 	__sync_fetch_and_add(counter, 1);
 	bump_generation();
 }

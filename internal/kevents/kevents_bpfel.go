@@ -18,7 +18,7 @@ type keventsKeventsCounts struct {
 	SynRetrans      uint32
 	FastopenRetrans uint32
 	RtoRetrans      uint32
-	FastRetrans     uint32
+	OtherRetrans    uint32
 	ResetsReceived  uint32
 	Flags           uint32
 }

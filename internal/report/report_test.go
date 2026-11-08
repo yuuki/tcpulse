@@ -153,12 +153,12 @@ func TestJSONLinesTCPInfo(t *testing.T) {
 
 var sampleEvents = stats.EventSummary{
 	RoundTrips:        41,
-	RetransRoundTrips: stats.RetransCounts{SYN: 30, FastOpen: 2, RTO: 6, Fast: 4},
+	RetransRoundTrips: stats.RetransCounts{SYN: 30, FastOpen: 2, RTO: 6, Other: 4},
 	WithEvents:        stats.LatencySummary{Count: 41, P99: 1023456 * time.Microsecond, Max: 3045 * time.Millisecond},
 	WithoutEvents:     stats.LatencySummary{Count: 14758, P99: 812 * time.Microsecond, Max: 4108 * time.Microsecond},
 	ResetsReceived:    3,
 	Unmatched:         stats.RetransCounts{SYN: 7, RTO: 2},
-	Untracked:         0,
+	Untracked:         5,
 }
 
 func TestReportKernelEvents(t *testing.T) {
@@ -174,8 +174,8 @@ func TestReportKernelEvents(t *testing.T) {
 	if !ok || !strings.Contains(buf.String(), ConnSeparator) {
 		t.Fatalf("report:\n%s", buf.String())
 	}
-	want := "PEER                 EVENT_RTS  SYN_RTX         TFO_RTX         RTO_RTX         FAST_RTX        EVENT_99p(µs)   CLEAN_99p(µs)   RST_RECV        UNMATCHED \n" +
-		"10.0.150.2:9200      41         30              2               6               4               1023456         812             3               9         \n"
+	want := "PEER                 EVENT_RTS  SYN_RTX         TFO_RTX         RTO_RTX         OTHER_RTX       EVENT_99p(µs)   CLEAN_99p(µs)   RST_RECV        UNMATCHED       UNTRACKED \n" +
+		"10.0.150.2:9200      41         30              2               6               4               1023456         812             3               9               5         \n"
 	if events != want {
 		t.Fatalf("kernel events:\n got %q\nwant %q", events, want)
 	}
@@ -191,9 +191,9 @@ func TestJSONLinesKernelEvents(t *testing.T) {
 	// The fields of the run keep their names and order; kernel_events
 	// follows (and tcp_info would come before it).
 	want := `{"peer":"10.0.150.2:9200","count":14799,"latency_max_us":13736,"latency_min_us":223,"latency_mean_us":530,"latency_90p_us":501,"latency_95p_us":953,"latency_99p_us":5989,"rate_per_sec":996,"timestamp":"2025-01-07T10:30:00Z",` +
-		`"kernel_events":{"round_trips_with_events":41,"syn_retrans_round_trips":30,"fastopen_retrans_round_trips":2,"rto_retrans_round_trips":6,"fast_retrans_round_trips":4,` +
+		`"kernel_events":{"round_trips_with_events":41,"round_trips_without_events":14758,"syn_retrans_round_trips":30,"fastopen_retrans_round_trips":2,"rto_retrans_round_trips":6,"other_retrans_round_trips":4,` +
 		`"latency_99p_with_events_us":1023456,"latency_max_with_events_us":3045000,"latency_99p_without_events_us":812,"latency_max_without_events_us":4108,` +
-		`"resets_received":3,"unmatched_syn_retrans":7,"unmatched_fastopen_retrans":0,"unmatched_rto_retrans":2,"unmatched_fast_retrans":0,"untracked_round_trips":0}}` + "\n"
+		`"resets_received":3,"unmatched_syn_retrans":7,"unmatched_fastopen_retrans":0,"unmatched_rto_retrans":2,"unmatched_other_retrans":0,"untracked_round_trips":5}}` + "\n"
 	if buf.String() != want {
 		t.Fatalf("JSON Lines:\n got %s\nwant %s", buf.String(), want)
 	}

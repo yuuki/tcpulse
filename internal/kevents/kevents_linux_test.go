@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"syscall"
 	"testing"
 	"time"
 
@@ -67,9 +68,25 @@ func dial(t *testing.T, addr string) net.Conn {
 	return conn
 }
 
+// readConn reads the events of the socket of conn.
+func readConn(tr *Tracer, conn net.Conn) (stats.Events, error) {
+	raw, err := conn.(syscall.Conn).SyscallConn()
+	if err != nil {
+		return stats.Events{}, err
+	}
+	var (
+		ev      stats.Events
+		readErr error
+	)
+	if err := raw.Control(func(fd uintptr) { ev, readErr = tr.ReadEvents(int(fd)) }); err != nil {
+		return stats.Events{}, err
+	}
+	return ev, readErr
+}
+
 func readEvents(t *testing.T, tr *Tracer, conn net.Conn) stats.Events {
 	t.Helper()
-	ev, err := tr.ReadEvents(conn)
+	ev, err := readConn(tr, conn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,12 +127,48 @@ func TestTracerSYNRetransmissions(t *testing.T) {
 	}
 	defer conn.Close()
 	ev := readEvents(t, tr, conn)
-	if ev.SYNRetrans < 1 || ev.FastOpenRetrans+ev.RTORetrans+ev.FastRetrans+ev.ResetsReceived != 0 {
+	if ev.SYNRetrans < 1 || ev.FastOpenRetrans+ev.RTORetrans+ev.OtherRetrans+ev.ResetsReceived != 0 {
 		t.Fatalf("events = %+v, want SYN retransmissions only", ev)
 	}
 	// Other tests (or processes) may count events too: at least ours.
 	if after, _ := tr.Generation(); after-before < uint64(ev.SYNRetrans) {
 		t.Fatalf("generation went from %d to %d, want at least %d more", before, after, ev.SYNRetrans)
+	}
+}
+
+func TestTracerFailedDial(t *testing.T) {
+	tr := startTracer(t)
+	_, addr := fullListener(t)
+	dial(t, addr) // fills the accept queue
+
+	// Keep a duplicate of the socket, as the client does: the dialer closes
+	// its own descriptor when the dial fails.
+	dup := -1
+	d := net.Dialer{
+		Timeout: 1500 * time.Millisecond, // after the first SYN retransmission (1s)
+		Control: func(_, _ string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				var err error
+				if dup, err = unix.FcntlInt(fd, unix.F_DUPFD_CLOEXEC, 0); err != nil {
+					t.Error(err)
+				}
+			})
+		},
+	}
+	if conn, err := d.Dial("tcp", addr); err == nil {
+		_ = conn.Close()
+		t.Fatal("the dial succeeded, want a timeout")
+	}
+	if dup < 0 {
+		t.FailNow()
+	}
+	defer unix.Close(dup)
+	ev, err := tr.ReadEvents(dup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.SYNRetrans < 1 || ev.FastOpenRetrans+ev.RTORetrans+ev.OtherRetrans != 0 {
+		t.Fatalf("events of the failed dial = %+v, want SYN retransmissions only", ev)
 	}
 }
 
@@ -140,7 +193,7 @@ func TestTracerResets(t *testing.T) {
 		t.FailNow()
 	}
 	// A server-side socket was not opened with connect(2).
-	if _, err := tr.ReadEvents(server); !errors.Is(err, ErrNotTraced) {
+	if _, err := readConn(tr, server); !errors.Is(err, ErrNotTraced) {
 		t.Errorf("ReadEvents of an accepted socket: %v, want ErrNotTraced", err)
 	}
 	// Closing with a zero linger time sends a reset.
@@ -171,7 +224,7 @@ func TestTracerNotTraced(t *testing.T) {
 	// Opened before the programs were attached.
 	before := dial(t, ln.Addr().String())
 	tr := startTracer(t)
-	if _, err := tr.ReadEvents(before); !errors.Is(err, ErrNotTraced) {
+	if _, err := readConn(tr, before); !errors.Is(err, ErrNotTraced) {
 		t.Errorf("ReadEvents of a connection opened before Start: %v, want ErrNotTraced", err)
 	}
 	udp, err := net.Dial("udp4", "127.0.0.1:9")
@@ -179,7 +232,7 @@ func TestTracerNotTraced(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer udp.Close()
-	if _, err := tr.ReadEvents(udp); !errors.Is(err, ErrNotTraced) {
+	if _, err := readConn(tr, udp); !errors.Is(err, ErrNotTraced) {
 		t.Errorf("ReadEvents of a UDP socket: %v, want ErrNotTraced", err)
 	}
 }

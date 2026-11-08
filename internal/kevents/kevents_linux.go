@@ -6,10 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net"
 	"os"
+	"runtime"
 	"sync/atomic"
-	"syscall"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
@@ -25,16 +24,18 @@ import (
 const Supported = true
 
 // Tracer counts kernel TCP events on the connections that this process opens
-// while it runs. Its methods may be called concurrently.
+// while it runs. ReadEvents and Generation may be called concurrently, but
+// not concurrently with Close.
 type Tracer struct {
 	coll  *ebpf.Collection
 	conns *ebpf.Map
 	links []link.Link
 	// generation points to events_generation in genMem, the memory the
-	// programs share with the process; it is nil when that memory cannot be
-	// mapped.
+	// programs share with the process; it is nil, and genErr says why, when
+	// that memory is not mapped.
 	generation *uint64
 	genMem     []byte
+	genErr     error
 }
 
 // Start loads and attaches the programs. It needs a kernel with BTF (Linux
@@ -68,8 +69,8 @@ func Start() (*Tracer, error) {
 		return nil, loadError(err)
 	}
 	t := &Tracer{coll: coll, conns: coll.Maps[keventsMapConns]}
-	// Without the mapping, every read goes through a system call.
-	t.generation, t.genMem, _ = mapGeneration(spec, coll)
+	// Without the mapping, every reading is a system call.
+	t.generation, t.genMem, t.genErr = mapGeneration(spec, coll)
 	for _, name := range []string{keventsProgKeventsConnect, retransmit, keventsProgKeventsReset} {
 		l, err := link.AttachTracing(link.TracingOptions{Program: coll.Programs[name]})
 		if err != nil {
@@ -81,16 +82,24 @@ func Start() (*Tracer, error) {
 	return t, nil
 }
 
-// checkPrivileges creates the simplest map. Without the privileges, the
-// feature probes of the library fail too, and it reports the features as
-// missing (the map of the programs as needing Linux 4.6) rather than the
-// permission as denied.
+// checkPrivileges checks the capabilities the programs need: loading BTF and
+// socket storage needs CAP_BPF, tracing programs CAP_PERFMON (CAP_SYS_ADMIN
+// grants both). Without them, the feature probes of the library fail too,
+// and it reports the features as missing (the map of the programs as
+// needing Linux 4.6) rather than the permission as denied; and unprivileged
+// users may still create simple maps (kernel.unprivileged_bpf_disabled=0),
+// so creating one would not tell.
 func checkPrivileges() error {
-	m, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Array, KeySize: 4, ValueSize: 4, MaxEntries: 1})
-	if err != nil {
-		return loadError(fmt.Errorf("creating an eBPF map: %w", err))
+	hdr := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+	var data [2]unix.CapUserData
+	if err := unix.Capget(&hdr, &data[0]); err != nil {
+		return fmt.Errorf("reading the capabilities of the process: %w", err)
 	}
-	return m.Close()
+	has := func(c int) bool { return data[c/32].Effective&(1<<(c%32)) != 0 }
+	if !has(unix.CAP_SYS_ADMIN) && (!has(unix.CAP_BPF) || !has(unix.CAP_PERFMON)) {
+		return fmt.Errorf("loading the eBPF programs needs root, or CAP_BPF and CAP_PERFMON: %w", os.ErrPermission)
+	}
+	return nil
 }
 
 // setTarget makes the programs count the sockets of this process, as its
@@ -106,8 +115,10 @@ func setTarget(spec *ebpf.CollectionSpec) error {
 		return fmt.Errorf("unexpected process ID %d", pid)
 	}
 	for name, value := range map[string]any{
-		keventsVarPidnsDev:   st.Dev,
-		keventsVarPidnsIno:   st.Ino,
+		// Stat_t.Dev is 32-bit on some architectures (mipsle, mips64le):
+		// the variables are __u64.
+		keventsVarPidnsDev:   uint64(st.Dev), //nolint:unconvert // see above
+		keventsVarPidnsIno:   uint64(st.Ino), //nolint:unconvert // see above
 		keventsVarTargetTgid: uint32(pid),
 	} {
 		v, ok := spec.Variables[name]
@@ -158,6 +169,15 @@ func retransmitProgram() (string, error) {
 // only behind an experimental build tag, and its ReadAt is a plain copy:
 // Generation needs an atomic load, with acquire ordering.
 func mapGeneration(spec *ebpf.CollectionSpec, coll *ebpf.Collection) (*uint64, []byte, error) {
+	// The programs bump the generation with a fetching atomic add. The JITs
+	// make it a full barrier on amd64 and arm64; on other architectures,
+	// older kernels do not (ppc64 and riscv64 before Linux 6.10), and a
+	// reader could see the generation before the counter it follows.
+	switch runtime.GOARCH {
+	case "amd64", "arm64":
+	default:
+		return nil, nil, fmt.Errorf("not on %s, whose kernels do not all order the generation after the counters", runtime.GOARCH)
+	}
 	const section = ".bss"
 	ms, ok := spec.Maps[section]
 	if !ok {
@@ -204,10 +224,11 @@ func loadError(err error) error {
 
 // Generation returns a number that changes whenever an event is counted on
 // any connection, read from shared memory without a system call, and false
-// when it is not available. While it does not change, ReadEvents returns
-// what it returned before for every connection. The programs change it
-// after the counter of a connection, with a full barrier, so a Generation
-// read before ReadEvents never hides an event from the next comparison.
+// when it is not available (see GenerationError). While it does not change,
+// ReadEvents returns what it returned before for every socket. The programs
+// change it after the counter of a socket, with a full barrier, so a
+// Generation read before ReadEvents never hides an event from the next
+// comparison.
 func (t *Tracer) Generation() (uint64, bool) {
 	if t.generation == nil {
 		return 0, false
@@ -215,43 +236,31 @@ func (t *Tracer) Generation() (uint64, bool) {
 	return atomic.LoadUint64(t.generation), true
 }
 
-// ReadEvents returns the events counted on conn since it was opened, or
-// ErrNotTraced.
-func (t *Tracer) ReadEvents(conn net.Conn) (stats.Events, error) {
-	sc, ok := conn.(syscall.Conn)
-	if !ok {
-		return stats.Events{}, fmt.Errorf("not a socket: %T", conn)
+// GenerationError says why Generation is not available, or is nil.
+func (t *Tracer) GenerationError() error { return t.genErr }
+
+// ReadEvents returns the events counted on the socket whose descriptor is
+// fd since it was opened, or ErrNotTraced. Any descriptor of the socket
+// works, a duplicate included: it keeps the socket, and its counters, after
+// the connection's own descriptor is closed.
+func (t *Tracer) ReadEvents(fd int) (stats.Events, error) {
+	// The key of socket storage is the socket's file descriptor, a C int.
+	if fd < 0 || fd > math.MaxInt32 {
+		return stats.Events{}, fmt.Errorf("file descriptor %d out of range", fd)
 	}
-	raw, err := sc.SyscallConn()
-	if err != nil {
-		return stats.Events{}, fmt.Errorf("getting the socket of %s: %w", conn.RemoteAddr(), err)
-	}
-	var (
-		c         keventsKeventsCounts
-		lookupErr error
-	)
-	if err := raw.Control(func(fd uintptr) {
-		// The key of socket storage is the socket's file descriptor, a C
-		// int.
-		if fd > math.MaxInt32 {
-			lookupErr = fmt.Errorf("file descriptor %d out of range", fd)
-			return
-		}
-		lookupErr = t.conns.Lookup(int32(fd), &c)
-	}); err != nil {
-		return stats.Events{}, fmt.Errorf("reading the events of %s: %w", conn.RemoteAddr(), err)
-	}
-	if errors.Is(lookupErr, ebpf.ErrKeyNotExist) {
+	var c keventsKeventsCounts
+	err := t.conns.Lookup(int32(fd), &c)
+	if errors.Is(err, ebpf.ErrKeyNotExist) {
 		return stats.Events{}, ErrNotTraced
 	}
-	if lookupErr != nil {
-		return stats.Events{}, fmt.Errorf("reading the events of %s: %w", conn.RemoteAddr(), lookupErr)
+	if err != nil {
+		return stats.Events{}, fmt.Errorf("reading the events of socket %d: %w", fd, err)
 	}
 	return stats.Events{
 		SYNRetrans:      c.SynRetrans,
 		FastOpenRetrans: c.FastopenRetrans,
 		RTORetrans:      c.RtoRetrans,
-		FastRetrans:     c.FastRetrans,
+		OtherRetrans:    c.OtherRetrans,
 		ResetsReceived:  c.ResetsReceived,
 	}, nil
 }

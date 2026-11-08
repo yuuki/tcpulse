@@ -151,7 +151,7 @@ func TestRecorderEvents(t *testing.T) {
 	r.RecordEvents(100*time.Microsecond, Events{})
 	r.RecordEvents(200*time.Microsecond, Events{})
 	r.RecordEvents(time.Second, Events{SYNRetrans: 2})
-	r.RecordEvents(300*time.Millisecond, Events{RTORetrans: 1, FastRetrans: 3})
+	r.RecordEvents(300*time.Millisecond, Events{RTORetrans: 1, OtherRetrans: 3})
 	r.RecordEvents(time.Millisecond, Events{FastOpenRetrans: 1})
 	r.RecordEvents(time.Millisecond, Events{ResetsReceived: 1})
 	r.RecordUntracked()
@@ -159,7 +159,7 @@ func TestRecorderEvents(t *testing.T) {
 
 	want := EventSummary{
 		RoundTrips:        4,
-		RetransRoundTrips: RetransCounts{SYN: 1, FastOpen: 1, RTO: 1, Fast: 1},
+		RetransRoundTrips: RetransCounts{SYN: 1, FastOpen: 1, RTO: 1, Other: 1},
 		WithEvents:        LatencySummary{Count: 4, P99: time.Second, Max: time.Second},
 		WithoutEvents:     LatencySummary{Count: 2, P99: 200 * time.Microsecond, Max: 200 * time.Microsecond},
 		ResetsReceived:    3,
@@ -175,9 +175,9 @@ func TestRecorderEvents(t *testing.T) {
 }
 
 func TestEventsSub(t *testing.T) {
-	before := Events{SYNRetrans: 1, FastRetrans: 2}
-	after := Events{SYNRetrans: 1, FastRetrans: 5, ResetsReceived: 1}
-	if d := after.Sub(before); d != (Events{FastRetrans: 3, ResetsReceived: 1}) {
+	before := Events{SYNRetrans: 1, OtherRetrans: 2}
+	after := Events{SYNRetrans: 1, OtherRetrans: 5, ResetsReceived: 1}
+	if d := after.Sub(before); d != (Events{OtherRetrans: 3, ResetsReceived: 1}) {
 		t.Fatalf("Sub = %+v", d)
 	}
 	if !before.Sub(before).IsZero() || after.IsZero() {

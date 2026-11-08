@@ -4,7 +4,6 @@ package kevents
 
 import (
 	"errors"
-	"net"
 
 	"github.com/yuuki/tcpulse/internal/stats"
 )
@@ -21,8 +20,11 @@ func Start() (*Tracer, error) { return nil, errors.ErrUnsupported }
 // Generation is not supported on this platform.
 func (*Tracer) Generation() (uint64, bool) { return 0, false }
 
+// GenerationError reports that Generation is not supported.
+func (*Tracer) GenerationError() error { return errors.ErrUnsupported }
+
 // ReadEvents is not supported on this platform.
-func (*Tracer) ReadEvents(net.Conn) (stats.Events, error) {
+func (*Tracer) ReadEvents(int) (stats.Events, error) {
 	return stats.Events{}, errors.ErrUnsupported
 }
 

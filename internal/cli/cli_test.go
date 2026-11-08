@@ -400,7 +400,7 @@ func TestClientKernelEvents(t *testing.T) {
 	r := runMain(t.Context(), noEnvironment, args...)
 	switch {
 	case !kevents.Supported:
-		if r.code != exitError || !strings.Contains(r.stderr, "--kernel-events is only supported on Linux") {
+		if r.code != exitError || !strings.Contains(r.stderr, "--kernel-events is only supported on Linux on little-endian architectures") {
 			t.Fatalf("exit %d, stderr %q; want --kernel-events refused", r.code, r.stderr)
 		}
 		return
@@ -421,8 +421,8 @@ func TestClientKernelEvents(t *testing.T) {
 	}
 	for i, res := range results {
 		ev := res.KernelEvents
-		// Every round trip is accounted for: with events, or without.
-		if ev == nil || ev.UntrackedRoundTrips != 0 || ev.Latency99pWithoutEvents == 0 && ev.RoundTripsWithEvents != res.Count {
+		// Every round trip is accounted for once: with events, or without.
+		if ev == nil || res.Count != 20 || ev.UntrackedRoundTrips != 0 || ev.RoundTripsWithEvents+ev.RoundTripsWithoutEvents != res.Count {
 			t.Errorf("result %d = %+v, kernel_events %+v; want 20 tracked round trips", i, res, ev)
 		}
 	}

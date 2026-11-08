@@ -187,16 +187,17 @@ func validateKernelOptions(o *options) error {
 		name      string
 		set       bool
 		supported bool
+		platforms string
 	}{
-		{"--tcp-info", o.tcpInfo, client.TCPInfoSupported},
-		{"--kernel-events", o.kernelEvents, kevents.Supported},
+		{"--tcp-info", o.tcpInfo, client.TCPInfoSupported, "Linux"},
+		{"--kernel-events", o.kernelEvents, kevents.Supported, "Linux on little-endian architectures"},
 	} {
 		switch {
 		case !opt.set:
 		case o.proto != client.ProtocolTCP:
 			return fmt.Errorf("%s requires --proto tcp", opt.name)
 		case !opt.supported:
-			return fmt.Errorf("%s is only supported on Linux", opt.name)
+			return fmt.Errorf("%s is only supported on %s", opt.name, opt.platforms)
 		}
 	}
 	return nil
@@ -241,6 +242,9 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 			return fmt.Errorf("--kernel-events: %w", err)
 		}
 		defer func() { _ = tracer.Close() }()
+		if err := tracer.GenerationError(); err != nil {
+			logger.Warn("kernel events are read with a system call after every round trip", "reason", err)
+		}
 		events = tracer
 	}
 

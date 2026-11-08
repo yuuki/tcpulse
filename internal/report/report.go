@@ -55,8 +55,8 @@ const (
 	// output.
 	ConnSeparator = "--- TCP statistics of the connections (TCP_INFO) ---"
 
-	eventHeaderFormat = "%-20s %-10s %-15s %-15s %-15s %-15s %-15s %-15s %-15s %-10s\n"
-	eventLineFormat   = "%-20s %-10d %-15d %-15d %-15d %-15d %-15d %-15d %-15d %-10d\n"
+	eventHeaderFormat = "%-20s %-10s %-15s %-15s %-15s %-15s %-15s %-15s %-15s %-15s %-10s\n"
+	eventLineFormat   = "%-20s %-10d %-15d %-15d %-15d %-15d %-15d %-15d %-15d %-15d %-10d\n"
 	// EventSeparator precedes the kernel events of the round trips in text
 	// output.
 	EventSeparator = "--- Kernel events of the round trips (eBPF) ---"
@@ -112,8 +112,8 @@ func (p *Printer) eventReport(results []Result) error {
 		}
 		if !header {
 			if err := p.printf("%s\n"+eventHeaderFormat, EventSeparator,
-				"PEER", "EVENT_RTS", "SYN_RTX", "TFO_RTX", "RTO_RTX", "FAST_RTX",
-				"EVENT_99p(µs)", "CLEAN_99p(µs)", "RST_RECV", "UNMATCHED"); err != nil {
+				"PEER", "EVENT_RTS", "SYN_RTX", "TFO_RTX", "RTO_RTX", "OTHER_RTX",
+				"EVENT_99p(µs)", "CLEAN_99p(µs)", "RST_RECV", "UNMATCHED", "UNTRACKED"); err != nil {
 				return err
 			}
 			header = true
@@ -125,11 +125,12 @@ func (p *Printer) eventReport(results []Result) error {
 			e.RetransRoundTrips.SYN,
 			e.RetransRoundTrips.FastOpen,
 			e.RetransRoundTrips.RTO,
-			e.RetransRoundTrips.Fast,
+			e.RetransRoundTrips.Other,
 			e.WithEvents.P99.Microseconds(),
 			e.WithoutEvents.P99.Microseconds(),
 			e.ResetsReceived,
 			e.Unmatched.Total(),
+			e.Untracked,
 		); err != nil {
 			return err
 		}
@@ -193,10 +194,11 @@ type JSONLinesResult struct {
 // trips of a result.
 type JSONLinesKernelEvents struct {
 	RoundTripsWithEvents      int64 `json:"round_trips_with_events"`
+	RoundTripsWithoutEvents   int64 `json:"round_trips_without_events"`
 	SYNRetransRoundTrips      int64 `json:"syn_retrans_round_trips"`
 	FastOpenRetransRoundTrips int64 `json:"fastopen_retrans_round_trips"`
 	RTORetransRoundTrips      int64 `json:"rto_retrans_round_trips"`
-	FastRetransRoundTrips     int64 `json:"fast_retrans_round_trips"`
+	OtherRetransRoundTrips    int64 `json:"other_retrans_round_trips"`
 	Latency99pWithEvents      int64 `json:"latency_99p_with_events_us"`
 	LatencyMaxWithEvents      int64 `json:"latency_max_with_events_us"`
 	Latency99pWithoutEvents   int64 `json:"latency_99p_without_events_us"`
@@ -205,7 +207,7 @@ type JSONLinesKernelEvents struct {
 	UnmatchedSYNRetrans       int64 `json:"unmatched_syn_retrans"`
 	UnmatchedFastOpenRetrans  int64 `json:"unmatched_fastopen_retrans"`
 	UnmatchedRTORetrans       int64 `json:"unmatched_rto_retrans"`
-	UnmatchedFastRetrans      int64 `json:"unmatched_fast_retrans"`
+	UnmatchedOtherRetrans     int64 `json:"unmatched_other_retrans"`
 	UntrackedRoundTrips       int64 `json:"untracked_round_trips"`
 }
 
@@ -215,10 +217,11 @@ func jsonLinesKernelEvents(e *stats.EventSummary) *JSONLinesKernelEvents {
 	}
 	return &JSONLinesKernelEvents{
 		RoundTripsWithEvents:      e.RoundTrips,
+		RoundTripsWithoutEvents:   e.WithoutEvents.Count,
 		SYNRetransRoundTrips:      e.RetransRoundTrips.SYN,
 		FastOpenRetransRoundTrips: e.RetransRoundTrips.FastOpen,
 		RTORetransRoundTrips:      e.RetransRoundTrips.RTO,
-		FastRetransRoundTrips:     e.RetransRoundTrips.Fast,
+		OtherRetransRoundTrips:    e.RetransRoundTrips.Other,
 		Latency99pWithEvents:      e.WithEvents.P99.Microseconds(),
 		LatencyMaxWithEvents:      e.WithEvents.Max.Microseconds(),
 		Latency99pWithoutEvents:   e.WithoutEvents.P99.Microseconds(),
@@ -227,7 +230,7 @@ func jsonLinesKernelEvents(e *stats.EventSummary) *JSONLinesKernelEvents {
 		UnmatchedSYNRetrans:       e.Unmatched.SYN,
 		UnmatchedFastOpenRetrans:  e.Unmatched.FastOpen,
 		UnmatchedRTORetrans:       e.Unmatched.RTO,
-		UnmatchedFastRetrans:      e.Unmatched.Fast,
+		UnmatchedOtherRetrans:     e.Unmatched.Other,
 		UntrackedRoundTrips:       e.Untracked,
 	}
 }

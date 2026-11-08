@@ -46,9 +46,6 @@ test: ## Run the tests
 test-race: ## Run the tests with the race detector
 	go test -race $(PKG)
 
-# go test -list runs on its own so that a package that does not build fails
-# the target instead of silently having no fuzz targets. A failing input is
-# written to testdata/fuzz/<target>/ of its package.
 # Loading eBPF programs needs root, or CAP_BPF and CAP_PERFMON: without them,
 # these tests skip (as they do in `make test`).
 .PHONY: test-bpf
@@ -62,6 +59,9 @@ test-bpf: ## Run the tests that load the eBPF programs of --kernel-events (as ro
 generate: ## Rebuild the eBPF object of --kernel-events (needs clang)
 	go generate ./internal/kevents/
 
+# go test -list runs on its own so that a package that does not build fails
+# the target instead of silently having no fuzz targets. A failing input is
+# written to testdata/fuzz/<target>/ of its package.
 .PHONY: test-fuzz
 test-fuzz: ## Run every fuzz target for FUZZTIME (default 30s)
 	@set -e; for pkg in $$(go list $(PKG)); do \

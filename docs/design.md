@@ -31,7 +31,7 @@ internal/server  echo server
 internal/stats   latency histogram, per-peer recorders
 internal/report  text and JSON Lines output
 internal/sockopt Linux socket options and TCP_INFO (no-ops or unsupported elsewhere)
-internal/kevents eBPF programs counting kernel TCP events per connection (Linux)
+internal/kevents eBPF counters of kernel TCP events per connection (Linux)
 ```
 
 `main.go` stays at the root of the module so that
@@ -165,11 +165,11 @@ connection that sends more than 2³² segments wraps them.
 
 ### 3.5 Kernel events
 
-With `--kernel-events` (Linux 5.12+ with BTF; root, or CAP_BPF and
-CAP_PERFMON), the client loads the eBPF programs of `internal/kevents`
-before it sends anything, and attributes the kernel events of its TCP
-connections to their round trips. A failure to load them is an error (exit
-1) with its reason, not a report without events.
+With `--kernel-events` (Linux 5.12+ with BTF, little-endian; root, or
+CAP_BPF and CAP_PERFMON), the client loads the eBPF programs of
+`internal/kevents` before it sends anything, and attributes the kernel
+events of its TCP connections to their round trips. A failure to load them
+is an error (exit 1) with its reason, not a report without events.
 
 The programs are tracepoints through BTF (`tp_btf`), at state changes,
 retransmissions and resets; none runs for every packet or message.
@@ -187,38 +187,57 @@ The kind of a retransmission, decided in this order:
   carried data (`syn_data`) that the server did not acknowledge
   (`!syn_data_acked`). `tcp_rcv_fastopen_synack` sends that data again right
   after the handshake, and puts the socket in the loss state while doing so,
-  which is why this kind is told apart before the next one.
+  which is why this kind is told apart before the next one. When the SYN
+  itself was retransmitted, its retries carried no data
+  (`tcp_send_syn_data`), so the resend is a consequence of the lost SYN, and
+  counts as a SYN retransmission.
 - Timeout: the socket is in the loss state (`icsk_ca_state == TCP_CA_Loss`),
   which a retransmission timeout enters.
-- Fast: any other, i.e. fast retransmit, RACK and tail loss probes.
+- Other: any other, i.e. fast retransmit, RACK and tail loss probes. With a
+  single segment in flight, as for most of tcpulse's messages, a tail loss
+  probe waits for two RTTs plus the minimum RTO (`tcp_schedule_loss_probe`),
+  so these are not fast.
 
 The programs only count; the client attributes. After each completed round
-trip, once the clock has stopped, it reads the counters of the connection by
-socket descriptor (a `bpf()` lookup) and records the difference from its
-previous reading with the round trip. The counters are updated in the kernel
-before the retransmitted bytes leave, so before the echo that ends the round
-trip: no ring buffer, timestamps or matching by time are needed, and no
-event can arrive late.
+trip, once the clock has stopped, it reads the counters of the connection's
+socket (a `bpf()` lookup) and records the difference from its previous
+reading with the round trip. A retransmission that delays a round trip is
+counted before the echo that ends it can arrive, since the server echoes
+bytes only once it has them: no ring buffer, timestamps or matching by time
+are needed. A spurious retransmission that the kernel sends after the echo
+arrived goes to the next reading.
+
+The client reads through a duplicate of the socket's descriptor, taken in
+the dialer's `Control`, before `connect(2)`. It keeps the socket, and its
+counters, alive after the dialer closed it: the events of a dial that failed
+or was cut off (SYNs never answered, a reset) are read too, and counted as
+unmatched. After a dial that succeeded at its only attempt, the duplicate
+becomes the connection's; when the dialer tried several addresses, the
+sockets are told apart by their identity (`fstat`).
 
 Reading the counters at every round trip would be a system call per round
 trip: 50,000 per second for 50 persistent connections at 1,000 messages per
 second each, which raised the mean latency by about 20µs and lost round
 trips. So every count also increments a global `events_generation`, after
-the counter of the connection, with a fetching atomic add (a full barrier on
-every architecture; it needs `-mcpu=v3`, hence Linux 5.12). The client maps
-the page of the programs' `.bss` that holds it, read-only, and loads it
-atomically before each reading. While it has not changed since a
-connection's previous reading, no counter of any connection has, and the
-lookup is skipped. An event counted after the load changes it, and the next
-reading looks the counters up again. A connection is always looked up the
-first time, which also tells an untracked one.
+the counter of the connection, with a fetching atomic add (it needs
+`-mcpu=v3`, hence Linux 5.12). On amd64 and arm64, whose JITs make it a full
+barrier, the client maps the page of the programs' `.bss` that holds it,
+read-only, and loads it atomically before each reading. While it has not
+changed since a connection's previous reading, no counter of any connection
+has, and the lookup is skipped. An event counted after the load changes it,
+and the next reading looks the counters up again. A connection is always
+looked up the first time, which also tells an untracked one. On other
+architectures, older kernels do not order the generation after the counter
+(the ppc64 and riscv64 JITs before Linux 6.10), so every reading is a system
+call, and tcpulse says so at the start.
 
 - In persistent mode, a reading right after the dial takes out the events of
   a handshake the dial waited for: the dial is not timed. With TCP Fast
   Open, the SYN leaves with the first message, and its events go with the
   first round trip.
 - In ephemeral mode, the round trip includes the dial, so its events are all
-  those of the connection.
+  those of the connection. The dial then also times the `dup(2)` of the
+  socket, and the kernel's allocation of its storage in `connect(2)`.
 - At the close, the events no completed round trip took (requests that
   failed or were cut off) are counted as unmatched.
 - A connection whose counters cannot be read makes its round trips
@@ -227,7 +246,14 @@ first time, which also tells an untracked one.
 
 The `Recorder` counts the round trips with events, by kind, and keeps the
 latencies of the round trips with events and of the others in two
-`Histogram`s, so that the report can compare their percentiles.
+`Histogram`s, so that the report can compare their percentiles. Round trips
+with events, without, and untracked add up to the count of the run.
+
+Before loading, tcpulse checks the capabilities of the process: CAP_BPF and
+CAP_PERFMON, or CAP_SYS_ADMIN. Without them, the library's feature probes
+fail too and report features as missing, and unprivileged users may still be
+allowed to create simple maps (`kernel.unprivileged_bpf_disabled=0`), so a
+test map would not tell.
 
 The object that bpf2go builds from `internal/kevents/bpf` is committed, so
 that `go install` and the release builds need no C compiler; `make generate`
