@@ -168,22 +168,32 @@ int BPF_PROG(kevents_reset, struct sock *sk)
 }
 
 /*
- * count_drop counts a dropped packet of sk, if sk is a traced connection,
- * under its reason: in the slot that has the reason, or else in the first
- * free slot, which an atomic compare-and-exchange takes (two CPUs may drop
- * packets of the connection at once), or else in other_drops.
+ * skb_counts returns the counts of the connection that skb belongs to by
+ * skb->sk, or NULL. A packet whose sk is set without a destructor is a
+ * fragment queued for reassembly (struct sk_buff in kevents.h): its sk is an
+ * offset.
  */
-static __always_inline void count_drop(struct sock *sk, __u32 reason)
+static __always_inline struct kevents_counts *skb_counts(const struct sk_buff *skb)
 {
-	struct kevents_counts *c;
-	__u32 *counter;
+	if (!skb->destructor)
+		return 0;
+	return bpf_sk_storage_get(&conns, skb->sk, 0, 0);
+}
+
+/*
+ * count_drop counts a dropped packet under its reason: in the slot that has
+ * the reason, or else in the first free slot, which an atomic
+ * compare-and-exchange takes (two CPUs may drop packets of the connection at
+ * once), or else in other_drops. A slot holds the reason plus one, so that 0
+ * marks it free.
+ */
+static __always_inline void count_drop(struct kevents_counts *c, __u32 reason)
+{
+	__u32 *counter = &c->other_drops;
 	int i;
 
-	c = bpf_sk_storage_get(&conns, sk, 0, 0);
-	if (!c)
-		return;
-	counter = &c->other_drops;
-	/* 0 marks a free slot; the kernel never drops with it. */
+	reason++;
+	/* A reason of 0xffffffff, which no kernel has, cannot be kept. */
 	if (reason == 0)
 		goto count;
 	for (i = 0; i < KEVENTS_DROP_SLOTS; i++) {
@@ -220,15 +230,29 @@ count:
 SEC("tp_btf/kfree_skb")
 int BPF_PROG(kevents_drop, struct sk_buff *skb, void *location, int reason)
 {
-	count_drop(skb->sk, reason);
+	struct kevents_counts *c = skb_counts(skb);
+
+	if (c)
+		count_drop(c, reason);
 	return 0;
 }
 
+/*
+ * rx_sk is NULL for most drops, but some verifiers (Linux 6.11 and 6.12)
+ * take the arguments of tracepoints for pointers that are never NULL, and
+ * would remove a test of it with its other branch. The helper takes NULL,
+ * and its result may be NULL: two lookups cannot be pruned.
+ */
 SEC("tp_btf/kfree_skb")
 int BPF_PROG(kevents_drop_rx, struct sk_buff *skb, void *location, int reason,
 	     struct sock *rx_sk)
 {
-	count_drop(rx_sk ? rx_sk : skb->sk, reason);
+	struct kevents_counts *c = bpf_sk_storage_get(&conns, rx_sk, 0, 0);
+
+	if (!c)
+		c = skb_counts(skb);
+	if (c)
+		count_drop(c, reason);
 	return 0;
 }
 

@@ -364,6 +364,7 @@ Which drops are counted:
 - **Received, by TCP:** a packet that TCP dropped after it found the connection: a full receive buffer, data out of the window, a duplicate. This needs Linux 6.11, which passes the socket to the tracepoint.
 - **Received, before TCP:** a packet dropped before TCP looked the connection up, e.g. by netfilter's INPUT hook, only if early demux had found the connection first (`net.ipv4.tcp_early_demux`, on by default). Over loopback, packets keep their route and skip early demux: these drops are not counted.
 - **Not seen:** drops in the network and on the server's host. They show up as retransmissions.
+- **Too many:** some network drivers free the packets they sent as drops rather than as consumed. Then every packet sent counts, as `NOT_SPECIFIED`, and `DROP_RTS` approaches the count of round trips.
 
 How events are attributed:
 - **Persistent mode:** the events of a round trip are those counted on its connection since the end of the previous round trip.

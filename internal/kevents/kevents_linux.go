@@ -45,10 +45,12 @@ type Tracer struct {
 	genMem     []byte
 	genErr     error
 	// drop is the program that counts drops, or empty when they are not
-	// counted, and dropErr says why; dropReasons names the reasons.
+	// counted, and dropErr says why; dropReasons names the reasons. The
+	// program is in a collection of its own, dropColl.
 	drop        string
 	dropErr     error
 	dropReasons map[uint32]string
+	dropColl    *ebpf.Collection
 }
 
 // Start loads and attaches the programs of what opts asks for. It needs a
@@ -73,8 +75,10 @@ func Start(opts Options) (*Tracer, error) {
 		return nil, fmt.Errorf("reading the kernel's BTF (CONFIG_DEBUG_INFO_BTF): %w", err)
 	}
 	t := &Tracer{}
-	// The programs to attach; the variant of a program that matches the
-	// kernel's tracepoint, as the others would not load.
+	// The programs to attach: the variants that match the kernel's
+	// tracepoints, as the others would not load. The drop program loads
+	// apart (loadDrops).
+	dropSpec := spec.Copy()
 	var progs []string
 	if opts.Events {
 		retransmit, err := retransmitProgram(kernel)
@@ -94,19 +98,12 @@ func Start(opts Options) (*Tracer, error) {
 		progs = append(progs, keventsProgKeventsWakeup, keventsProgKeventsWakeupNew, sw)
 	}
 	for name := range spec.Programs {
-		if name != t.drop && !slices.Contains(progs, name) {
+		if !slices.Contains(progs, name) {
 			delete(spec.Programs, name)
 		}
 	}
 
 	coll, err := ebpf.NewCollection(spec)
-	if err != nil && t.drop != "" {
-		// The drops are an addition to the other events: count those
-		// without them, and say why. If the drops were not the cause, this
-		// fails again.
-		t.noDrops(spec, fmt.Errorf("loading its program: %w", err))
-		coll, err = ebpf.NewCollection(spec)
-	}
 	if err != nil {
 		return nil, loadError(err)
 	}
@@ -121,22 +118,24 @@ func Start(opts Options) (*Tracer, error) {
 		t.runq = coll.Maps[keventsMapRunq]
 	}
 	for _, name := range progs {
-		if err := t.attach(name); err != nil {
+		if err := t.attach(coll.Programs[name], name); err != nil {
 			_ = t.Close()
 			return nil, loadError(err)
 		}
 	}
 	if t.drop != "" {
-		if err := t.attach(t.drop); err != nil {
-			t.noDrops(spec, err)
+		if err := t.loadDrops(dropSpec); err != nil {
+			// The drops are an addition to the other events: count those
+			// without them, and say why.
+			t.drop, t.dropReasons, t.dropErr = "", nil, err
 		}
 	}
 	return t, nil
 }
 
-// attach attaches the program name.
-func (t *Tracer) attach(name string) error {
-	l, err := link.AttachTracing(link.TracingOptions{Program: t.coll.Programs[name]})
+// attach attaches the program prog, called name.
+func (t *Tracer) attach(prog *ebpf.Program, name string) error {
+	l, err := link.AttachTracing(link.TracingOptions{Program: prog})
 	if err != nil {
 		return fmt.Errorf("attaching %s: %w", name, err)
 	}
@@ -144,11 +143,27 @@ func (t *Tracer) attach(name string) error {
 	return nil
 }
 
-// noDrops gives up counting drops, because of err.
-func (t *Tracer) noDrops(spec *ebpf.CollectionSpec, err error) {
-	delete(spec.Programs, t.drop)
-	t.drop, t.dropReasons = "", nil
-	t.dropErr = fmt.Errorf("the drops of packets are not counted: %w", err)
+// loadDrops loads and attaches the drop program of spec, in a collection of
+// its own that shares the maps the other programs loaded: a failure of the
+// drop program is told apart from the others', and only stops the drops from
+// being counted.
+func (t *Tracer) loadDrops(spec *ebpf.CollectionSpec) error {
+	for name := range spec.Programs {
+		if name != t.drop {
+			delete(spec.Programs, name)
+		}
+	}
+	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
+		MapReplacements: map[string]*ebpf.Map{
+			keventsMapConns: t.conns,
+			".bss":          t.coll.Maps[".bss"],
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("loading %s: %w", t.drop, err)
+	}
+	t.dropColl = coll
+	return t.attach(coll.Programs[t.drop], t.drop)
 }
 
 // checkPrivileges checks the capabilities the programs need: loading BTF and
@@ -265,14 +280,14 @@ const dropReasonPrefix = "SKB_DROP_REASON_"
 func dropProgram(kernel *btf.Spec) (string, map[uint32]string, error) {
 	params, err := tracepointParams(kernel, "kfree_skb")
 	if err != nil {
-		return "", nil, fmt.Errorf("the drops of packets are not counted: %w", err)
+		return "", nil, err
 	}
 	if len(params) < 3 {
-		return "", nil, errors.New("the drops of packets are not counted: the kernel's kfree_skb tracepoint has no reason (Linux 5.17 added it)")
+		return "", nil, errors.New("the kernel's kfree_skb tracepoint has no reason (Linux 5.17 added it)")
 	}
 	reasons, ok := btf.UnderlyingType(params[2].Type).(*btf.Enum)
 	if !ok || reasons.Name != "skb_drop_reason" {
-		return "", nil, fmt.Errorf("the drops of packets are not counted: unexpected reason of the kfree_skb tracepoint: %v", params[2].Type)
+		return "", nil, fmt.Errorf("unexpected reason of the kfree_skb tracepoint: %v", params[2].Type)
 	}
 	var prog string
 	switch len(params) {
@@ -281,7 +296,7 @@ func dropProgram(kernel *btf.Spec) (string, map[uint32]string, error) {
 	case 4:
 		prog = keventsProgKeventsDropRx
 	default:
-		return "", nil, fmt.Errorf("the drops of packets are not counted: unexpected prototype of the kfree_skb tracepoint: %d parameters", len(params))
+		return "", nil, fmt.Errorf("unexpected prototype of the kfree_skb tracepoint: %d parameters", len(params))
 	}
 	names := make(map[uint32]string, len(reasons.Values))
 	for _, v := range reasons.Values {
@@ -407,7 +422,13 @@ func (t *Tracer) ReadEvents(fd int) (stats.Events, error) {
 		OtherDrops:      c.OtherDrops,
 	}
 	for i, d := range c.Drops {
-		ev.Drops[i] = stats.DropCount{Reason: d.Reason, Count: d.Count}
+		// The programs keep the reason plus one, 0 in a free slot. A slot
+		// whose count is read without its reason (the copy raced with the
+		// program taking the slot) is read again whole at the next reading:
+		// the program changes the generation after the count.
+		if d.Reason != 0 {
+			ev.Drops[i] = stats.DropCount{Reason: d.Reason - 1, Count: d.Count}
+		}
 	}
 	return ev, nil
 }
@@ -504,6 +525,10 @@ func (t *Tracer) Close() error {
 		t.generation = nil
 		errs = append(errs, unix.Munmap(t.genMem))
 		t.genMem = nil
+	}
+	if t.dropColl != nil {
+		t.dropColl.Close()
+		t.dropColl = nil
 	}
 	if t.coll != nil {
 		t.coll.Close()

@@ -209,29 +209,47 @@ loopback, a packet keeps the route of its sender and skips early demux
 (`ip_rcv_finish_core`), so drops before TCP, such as in netfilter's INPUT
 hook, are not attributed there; across a veth pair they are. `kfree_skb`
 does not fire for the packets the kernel consumes (`consume_skb`,
-`SKB_CONSUMED`): a clean run counts no drop.
+`SKB_CONSUMED`): a clean run counts no drop, unless the network driver frees
+the packets it sent as drops (`dev_kfree_skb_any` rather than
+`dev_consume_skb_any`), which then all count, as `NOT_SPECIFIED`.
+
+Two guards keep the programs from reading what is not a socket:
+
+- Before Linux 6.9, `skb->sk` shares a union with `ip_defrag_offset`, which a
+  fragment queued for reassembly sets, and such fragments are dropped when
+  their queue expires. Every packet that belongs to a socket has a
+  destructor (`tcp_wfree`, `sock_edemux`, `sock_rfree`), and a queued
+  fragment has none: `skb->sk` is only used when `skb->destructor` is set.
+- `rx_sk` is NULL for most drops, but the verifiers of Linux 6.11 and 6.12
+  take the arguments of tracepoints for pointers that are never NULL, and
+  would remove a test of it along with its other branch. The program looks
+  `rx_sk` up first, then `skb->sk` when that found nothing: the helper takes
+  NULL, and its result may be NULL, so neither lookup can be pruned.
 
 The storage of a socket keeps four slots of a reason and its count, and the
 drops of further reasons in `other_drops`. A drop goes to the slot of its
 reason, or takes the first free slot with a compare-and-exchange
 (`BPF_CMPXCHG`, also `-mcpu=v3`), since two CPUs can drop packets of a
 connection at once. A slot keeps its reason, so the client subtracts two
-readings slot by slot; reason 0 (`SKB_NOT_DROPPED_YET`, which the kernel
-never drops with) marks a free slot. The loader names the reasons from the
-values of `enum skb_drop_reason` in the kernel's BTF, so that tcpulse need
-not know them; a reason that is not there (a subsystem's, in the high 16
-bits) is printed as its number.
+readings slot by slot. A slot holds the reason plus one, so that 0 marks it
+free: on Linux 5.17, reason 0 is `NOT_SPECIFIED`. The copy of a lookup can
+race with the program taking a slot, and see its count without its reason:
+the client ignores that count, which the next reading sees whole (the
+program changes the generation after the count). The loader names the
+reasons from the values of `enum skb_drop_reason` in the kernel's BTF, so
+that tcpulse need not know them; a reason that is not there (a subsystem's,
+in the high 16 bits) is printed as its number.
 
 A packet that the host drops before it leaves was never sent: TCP sends it
 again from its probe timer, as new data, not as a retransmission. Round
 trips with drops can thus be slow without any retransmission of their own.
 
-Drops are an addition to the other events. When the kernel's tracepoint has
-no reason, or the drop program does not load or attach, tcpulse counts the
-other events, logs why, and reports drops as unknown (`-`, and no `drops`
-object), not as none. After a failure to load the collection with the drop
-program, the loader tries again without it: if the drops were not the
-cause, that fails too, with the error.
+Drops are an addition to the other events. The drop program loads in a
+collection of its own, which shares the maps of the others
+(`MapReplacements`), so that its failure is told apart from theirs. When the
+kernel's tracepoint has no reason, or the drop program does not load or
+attach, tcpulse counts the other events, logs why, and reports drops as
+unknown (`-`, and no `drops` object), not as none.
 
 The programs only count; the client attributes. After each completed round
 trip, once the clock has stopped, it reads the counters of the connection's
@@ -298,7 +316,9 @@ instead of a generated `vmlinux.h`. The programs declare the license "Dual
 BSD/GPL", which the kernel requires of tracing programs (see `NOTICE`).
 
 The tests that load the programs skip without the privileges, as in CI;
-`make test-bpf` runs them as root. The attribution itself is tested with a
+`make test-bpf` runs them as root. The test of a drop on the send path adds
+an nftables rule in a network namespace of its own, so that the host's
+firewall is left alone. The attribution itself is tested with a
 fake reader.
 
 ### 3.6 Run queue latency
