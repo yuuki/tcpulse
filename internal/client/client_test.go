@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"testing"
 	"time"
@@ -337,5 +338,39 @@ func TestRunDoesNotRecordFailedRequests(t *testing.T) {
 	}
 	if got := rec.Total().Count; got != 0 {
 		t.Fatalf("%d reset requests recorded as round trips", got)
+	}
+}
+
+func TestMessages(t *testing.T) {
+	for _, tc := range []struct {
+		rate     int
+		duration time.Duration
+		want     int64
+	}{
+		{100, 10 * time.Second, 1000},
+		{1, time.Second, 1},
+		{1, 999 * time.Millisecond, 0},
+		{100, 500 * time.Millisecond, 50},
+		{3, 1500 * time.Millisecond, 4},
+		{40000, 2 * time.Minute, 4800000},
+		{math.MaxInt32, 24 * time.Hour, math.MaxInt32 * 86400},
+	} {
+		r := &run{cfg: Config{Rate: tc.rate, Duration: tc.duration}}
+		if got := r.messages(); got != tc.want {
+			t.Errorf("messages() at %d/s for %v = %d, want %d", tc.rate, tc.duration, got, tc.want)
+		}
+	}
+}
+
+func TestRunSubsecondDuration(t *testing.T) {
+	cfg := config(ProtocolTCP, FlavorPersistent)
+	cfg.Rate = 20
+	cfg.Duration = 500 * time.Millisecond
+	rec := stats.NewRecorder()
+	if err := Run(t.Context(), cfg, echoServer(t, ProtocolTCP), rec); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := rec.Total().Count; got != 20 {
+		t.Fatalf("%d round trips, want 20 (2 connections × 20/s × 500ms)", got)
 	}
 }

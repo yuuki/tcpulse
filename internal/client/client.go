@@ -108,9 +108,10 @@ type run struct {
 }
 
 // messages returns how many messages a sender at cfg.Rate per second sends
-// during cfg.Duration.
+// during cfg.Duration: rate × duration, rounded down.
 func (r *run) messages() int64 {
-	return int64(r.cfg.Rate) * int64(r.cfg.Duration.Seconds())
+	rate, d := int64(r.cfg.Rate), r.cfg.Duration
+	return rate*int64(d/time.Second) + rate*int64(d%time.Second)/int64(time.Second)
 }
 
 // measure records how long f takes, if it succeeds. The message must be
