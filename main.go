@@ -28,6 +28,9 @@ import (
 	"github.com/yuuki/tcpulse/internal/cli"
 )
 
+// The thousands of sockets of a run need a high limit of open files: the Go
+// runtime raises the soft limit to the hard one at startup (on macOS, to
+// kern.maxfilesperproc), so tcpulse does not.
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 

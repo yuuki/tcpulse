@@ -14,7 +14,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -103,10 +102,6 @@ func runServer(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 	if err := validateServer(o); err != nil {
 		return err
 	}
-	if err := raiseFileLimit(); err != nil {
-		return fmt.Errorf("setting file limit: %w", err)
-	}
-
 	addrs := o.args
 	if len(addrs) == 0 {
 		addrs = []string{defaultListenAddr}
@@ -187,10 +182,6 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 			return err
 		}
 		defer stop()
-	}
-
-	if err := raiseFileLimit(); err != nil {
-		return fmt.Errorf("setting file limit: %w", err)
 	}
 
 	addrs := o.args
@@ -294,21 +285,6 @@ func startPprof(addr string, logger *slog.Logger) (stop func(), err error) {
 		}
 	}()
 	return func() { _ = srv.Close() }, nil
-}
-
-// raiseFileLimit raises the soft limit of open files to the hard limit.
-func raiseFileLimit() error {
-	var rLimit syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
-		return fmt.Errorf("could not get rlimit: %w", err)
-	}
-	if rLimit.Cur < rLimit.Max {
-		rLimit.Cur = rLimit.Max
-		if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
-			return fmt.Errorf("could not set rlimit: %w", err)
-		}
-	}
-	return nil
 }
 
 // readAddrs returns the whitespace-separated addresses of a file, which
