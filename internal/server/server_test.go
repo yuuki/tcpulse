@@ -99,7 +99,8 @@ func TestUDPEcho(t *testing.T) {
 	}
 	defer conn.Close()
 
-	for _, size := range []int{1, 64, 1400, udpBufferSize} {
+	// 65507 bytes is the largest UDP payload over IPv4.
+	for _, size := range []int{1, 64, 1400, 4097, 9000, 65507} {
 		msg := randomBytes(size)
 		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 		if _, err := conn.Write(msg); err != nil {

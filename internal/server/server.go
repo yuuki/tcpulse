@@ -26,7 +26,9 @@ const (
 
 const (
 	tcpBufferSize = 4 * 1024
-	udpBufferSize = 4 * 1024
+	// udpBufferSize holds the largest UDP payload over IPv4 (65507 bytes):
+	// a datagram larger than the buffer would be truncated.
+	udpBufferSize = 64 * 1024
 	// acceptRetryDelay is how long the server waits after a timeout from
 	// accept before trying again.
 	acceptRetryDelay = time.Second
