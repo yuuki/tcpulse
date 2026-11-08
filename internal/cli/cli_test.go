@@ -178,7 +178,7 @@ func TestMainHelp(t *testing.T) {
 			"\n  -c, --client                     run in client mode\n",
 			"\n      --message-bytes int32        [client mode] TCP/UDP message size (bytes) (default 64)\n",
 			"\n      --tcp-info                   [client mode] report TCP statistics of the connections read from the kernel (TCP_INFO, Linux only)\n",
-			"\n      --kernel-events              [client mode] attribute kernel TCP events (retransmissions, resets) to the round trips with eBPF (Linux only, needs root or CAP_BPF and CAP_PERFMON)\n",
+			"\n      --kernel-events              [client mode] attribute kernel TCP events (retransmissions, resets, drops) to the round trips with eBPF (Linux only, needs root or CAP_BPF and CAP_PERFMON)\n",
 			"TCPULSE_MESSAGE_BYTES=1024",
 			"Examples:",
 		} {

@@ -53,7 +53,10 @@ struct sock {
 	struct sock_common __sk_common;
 } __attribute__((preserve_access_index));
 
-struct sk_buff;
+/* sk is in a union: CO-RE finds it by name. */
+struct sk_buff {
+	struct sock *sk;
+} __attribute__((preserve_access_index));
 
 /* Bit fields: read with BPF_CORE_READ_BITFIELD_PROBED, which relocates
  * their offset, size and shifts. */
@@ -66,9 +69,19 @@ struct tcp_sock {
 	__u8 syn_data_acked : 1;
 } __attribute__((preserve_access_index));
 
+/* The drop reasons a connection keeps apart (count_drop). */
+#define KEVENTS_DROP_SLOTS 4
+
+/* The drops of one reason. */
+struct kevents_drop_count {
+	/* enum skb_drop_reason; 0 (SKB_NOT_DROPPED_YET) marks a free slot. */
+	__u32 reason;
+	__u32 count;
+};
+
 /*
  * The events counted on a connection, kept in its socket storage. User space
- * reads it by socket file descriptor (internal/kevents: counts).
+ * reads it by socket file descriptor (internal/kevents: ReadEvents).
  */
 struct kevents_counts {
 	__u32 syn_retrans;
@@ -77,6 +90,11 @@ struct kevents_counts {
 	__u32 other_retrans;
 	__u32 resets_received;
 	__u32 flags;
+	/* The drops of the first reasons met, in the order they were met; a
+	 * slot keeps its reason once it has one. */
+	struct kevents_drop_count drops[KEVENTS_DROP_SLOTS];
+	/* The drops of the reasons met after the slots were all taken. */
+	__u32 other_drops;
 };
 
 /* flags */

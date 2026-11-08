@@ -172,13 +172,15 @@ events of its TCP connections to their round trips. A failure to load them
 is an error (exit 1) with its reason, not a report without events.
 
 The programs are tracepoints through BTF (`tp_btf`), at state changes,
-retransmissions and resets; none runs for every packet or message.
+retransmissions, resets and drops; none runs for every packet or message
+(`kfree_skb` runs for every packet the host drops, whatever its socket).
 
 | Tracepoint | What it does |
 | --- | --- |
 | `inet_sock_set_state` | CLOSE → SYN_SENT of a socket of the tcpulse process: gives the socket its storage (`BPF_MAP_TYPE_SK_STORAGE`). It runs inside `connect(2)`, even when TCP Fast Open defers the SYN to the first write (tcp_v4_connect and tcp_v6_connect set SYN_SENT first). The process is matched in its PID namespace (`bpf_get_ns_current_pid_tgid`), so that it works in a container. |
 | `tcp_retransmit_skb` | Counts a retransmission of a socket with storage, by kind (below). Before Linux 6.17 the tracepoint fires for retransmissions that were sent; since then it also fires for failed attempts, with their error, and only `err == 0` counts. The loader reads the tracepoint's prototype in the kernel's BTF and loads the matching program. |
 | `tcp_receive_reset` | Counts a reset the connection accepted. |
+| `kfree_skb` | Counts a dropped packet of a socket with storage, by reason (below). Linux 5.17 added the reason, and Linux 6.11 the socket a received packet was for (`rx_sk`). The loader reads the prototype and loads the matching program, or none before Linux 5.17. |
 
 The kind of a retransmission, decided in this order:
 
@@ -197,6 +199,39 @@ The kind of a retransmission, decided in this order:
   single segment in flight, as for most of tcpulse's messages, a tail loss
   probe waits for two RTTs plus the minimum RTO (`tcp_schedule_loss_probe`),
   so these are not fast.
+
+A dropped packet belongs to the socket that sent it (`skb->sk`, which the
+packet keeps until it leaves the host: `loopback_xmit` orphans it), or to
+the socket it was received for: `rx_sk`, which the receive path of TCP
+passes once it found the socket (`sk_skb_reason_drop`), or `skb->sk`, which
+early demux sets for an established connection before routing. Over
+loopback, a packet keeps the route of its sender and skips early demux
+(`ip_rcv_finish_core`), so drops before TCP, such as in netfilter's INPUT
+hook, are not attributed there; across a veth pair they are. `kfree_skb`
+does not fire for the packets the kernel consumes (`consume_skb`,
+`SKB_CONSUMED`): a clean run counts no drop.
+
+The storage of a socket keeps four slots of a reason and its count, and the
+drops of further reasons in `other_drops`. A drop goes to the slot of its
+reason, or takes the first free slot with a compare-and-exchange
+(`BPF_CMPXCHG`, also `-mcpu=v3`), since two CPUs can drop packets of a
+connection at once. A slot keeps its reason, so the client subtracts two
+readings slot by slot; reason 0 (`SKB_NOT_DROPPED_YET`, which the kernel
+never drops with) marks a free slot. The loader names the reasons from the
+values of `enum skb_drop_reason` in the kernel's BTF, so that tcpulse need
+not know them; a reason that is not there (a subsystem's, in the high 16
+bits) is printed as its number.
+
+A packet that the host drops before it leaves was never sent: TCP sends it
+again from its probe timer, as new data, not as a retransmission. Round
+trips with drops can thus be slow without any retransmission of their own.
+
+Drops are an addition to the other events. When the kernel's tracepoint has
+no reason, or the drop program does not load or attach, tcpulse counts the
+other events, logs why, and reports drops as unknown (`-`, and no `drops`
+object), not as none. After a failure to load the collection with the drop
+program, the loader tries again without it: if the drops were not the
+cause, that fails too, with the error.
 
 The programs only count; the client attributes. After each completed round
 trip, once the clock has stopped, it reads the counters of the connection's
@@ -370,7 +405,9 @@ are whole microseconds, truncated. With `--tcp-info`, the text report ends
 with a section of its own: a separator, a header, and a line per peer (or a
 single merged line) of TCP statistics. Each JSON object ends with a
 `tcp_info` object. `--kernel-events` adds a section of the same form after
-it, and a `kernel_events` object. Without these options, the output is
+it, and a `kernel_events` object; when the host dropped packets of the
+connections, a last section lists them by peer and reason. Without these
+options, the output is
 unchanged. The column layout and the JSON field names and order are a public
 format, pinned by golden tests in `internal/report`.
 

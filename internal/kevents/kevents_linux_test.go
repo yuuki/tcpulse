@@ -5,12 +5,15 @@ package kevents
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/cilium/ebpf/btf"
 	"golang.org/x/sys/unix"
 
 	"github.com/yuuki/tcpulse/internal/stats"
@@ -234,5 +237,127 @@ func TestTracerNotTraced(t *testing.T) {
 	defer udp.Close()
 	if _, err := readConn(tr, udp); !errors.Is(err, ErrNotTraced) {
 		t.Errorf("ReadEvents of a UDP socket: %v, want ErrNotTraced", err)
+	}
+}
+
+// kernelSpec returns the kernel's BTF, or skips the test without it.
+func kernelSpec(t *testing.T) *btf.Spec {
+	t.Helper()
+	kernel, err := btf.LoadKernelSpec()
+	if err != nil {
+		t.Skipf("no BTF: %v", err)
+	}
+	return kernel
+}
+
+func TestDropProgram(t *testing.T) {
+	kernel := kernelSpec(t)
+	params, err := tracepointParams(kernel, "kfree_skb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prog, names, err := dropProgram(kernel)
+	if len(params) < 3 {
+		if err == nil {
+			t.Fatalf("dropProgram on a kfree_skb without reason = %q, want an error", prog)
+		}
+		t.Skipf("Linux 5.17 or later: %v", err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[int]string{3: keventsProgKeventsDrop, 4: keventsProgKeventsDropRx}[len(params)]
+	if prog != want {
+		t.Errorf("dropProgram = %q for %d parameters, want %q", prog, len(params), want)
+	}
+	// Linux 5.17 has these two first; there is no reason 0.
+	if names[2] != "NOT_SPECIFIED" || names[3] != "NO_SOCKET" {
+		t.Errorf("reasons 2 and 3 = %q, %q, want NOT_SPECIFIED, NO_SOCKET", names[2], names[3])
+	}
+	if name, ok := names[0]; ok {
+		t.Errorf("reason 0 = %q, want none", name)
+	}
+	for v, name := range names {
+		if name == "" || name == "MAX" || strings.HasPrefix(name, dropReasonPrefix) {
+			t.Errorf("reason %d = %q", v, name)
+		}
+	}
+}
+
+// dropReason returns the value of the drop reason name, or skips the test
+// when the kernel does not have it.
+func dropReason(t *testing.T, tr *Tracer, name string) uint32 {
+	t.Helper()
+	for v, n := range tr.DropReasons() {
+		if n == name {
+			return v
+		}
+	}
+	t.Skipf("the kernel has no drop reason %s", name)
+	return 0
+}
+
+// TestTracerDrops counts a packet that the kernel drops on the receive path
+// of a connection: data that arrives after it was shut down for reading,
+// which TCP drops and answers with a reset.
+func TestTracerDrops(t *testing.T) {
+	tr := startTracer(t)
+	if err := tr.DropsError(); err != nil {
+		t.Skip(err)
+	}
+	if tr.drop != keventsProgKeventsDropRx {
+		t.Skip("the receive path of TCP passes the socket to kfree_skb since Linux 6.11")
+	}
+	reason := dropReason(t, tr, "TCP_ABORT_ON_DATA")
+
+	var lc net.ListenConfig
+	lc.SetMultipathTCP(false)
+	ln, err := lc.Listen(t.Context(), "tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	conn := dial(t, ln.Addr().String())
+	server, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	if ev := readEvents(t, tr, conn); !ev.IsZero() {
+		t.Fatalf("events of a new connection = %+v, want none", ev)
+	}
+
+	raw, err := conn.(syscall.Conn).SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shutErr error
+	if err := raw.Control(func(fd uintptr) { shutErr = unix.Shutdown(int(fd), unix.SHUT_RDWR) }); err != nil {
+		t.Fatal(err)
+	}
+	if shutErr != nil {
+		t.Fatal(shutErr)
+	}
+	// The server reads the FIN, then sends data the client no longer takes.
+	if _, err := server.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("server read: %v, want EOF", err)
+	}
+	if _, err := server.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ev := readEvents(t, tr, conn)
+		if ev.DroppedPackets() > 0 {
+			if ev.Drops[0] != (stats.DropCount{Reason: reason, Count: 1}) || ev.DroppedPackets() != 1 {
+				t.Fatalf("drops = %+v, other %d, want one of reason TCP_ABORT_ON_DATA (%d)", ev.Drops, ev.OtherDrops, reason)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("events = %+v, want a drop", ev)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

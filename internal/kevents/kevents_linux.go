@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"unsafe"
 
@@ -23,6 +24,9 @@ import (
 // little-endian architectures the object is built for.
 const Supported = true
 
+// The slots of the programs (KEVENTS_DROP_SLOTS) are those of stats.Events.
+var _ [stats.DropSlots]keventsKeventsDropCount = keventsKeventsCounts{}.Drops
+
 // Tracer counts kernel TCP events on the connections that this process opens
 // while it runs. ReadEvents and Generation may be called concurrently, but
 // not concurrently with Close.
@@ -36,6 +40,11 @@ type Tracer struct {
 	generation *uint64
 	genMem     []byte
 	genErr     error
+	// drop is the program that counts drops, or empty when they are not
+	// counted, and dropErr says why; dropReasons names the reasons.
+	drop        string
+	dropErr     error
+	dropReasons map[uint32]string
 }
 
 // Start loads and attaches the programs. It needs a kernel with BTF (Linux
@@ -52,34 +61,70 @@ func Start() (*Tracer, error) {
 	if err := setTarget(spec); err != nil {
 		return nil, err
 	}
-	retransmit, err := retransmitProgram()
+	kernel, err := btf.LoadKernelSpec()
+	if err != nil {
+		return nil, fmt.Errorf("reading the kernel's BTF (CONFIG_DEBUG_INFO_BTF): %w", err)
+	}
+	retransmit, err := retransmitProgram(kernel)
 	if err != nil {
 		return nil, err
 	}
-	// Keep the variant of the retransmission program that matches the
-	// kernel's tracepoint: the other would not load.
-	for _, name := range []string{keventsProgKeventsRetransmit, keventsProgKeventsRetransmitErr} {
-		if name != retransmit {
+	t := &Tracer{}
+	t.drop, t.dropReasons, t.dropErr = dropProgram(kernel)
+	// Keep the variants of the programs that match the kernel's
+	// tracepoints: the others would not load.
+	for _, name := range []string{
+		keventsProgKeventsRetransmit, keventsProgKeventsRetransmitErr,
+		keventsProgKeventsDrop, keventsProgKeventsDropRx,
+	} {
+		if name != retransmit && name != t.drop {
 			delete(spec.Programs, name)
 		}
 	}
 
 	coll, err := ebpf.NewCollection(spec)
+	if err != nil && t.drop != "" {
+		// The drops are an addition to the other events: count those
+		// without them, and say why. If the drops were not the cause, this
+		// fails again.
+		t.noDrops(spec, fmt.Errorf("loading its program: %w", err))
+		coll, err = ebpf.NewCollection(spec)
+	}
 	if err != nil {
 		return nil, loadError(err)
 	}
-	t := &Tracer{coll: coll, conns: coll.Maps[keventsMapConns]}
+	t.coll, t.conns = coll, coll.Maps[keventsMapConns]
 	// Without the mapping, every reading is a system call.
 	t.generation, t.genMem, t.genErr = mapGeneration(spec, coll)
 	for _, name := range []string{keventsProgKeventsConnect, retransmit, keventsProgKeventsReset} {
-		l, err := link.AttachTracing(link.TracingOptions{Program: coll.Programs[name]})
-		if err != nil {
+		if err := t.attach(name); err != nil {
 			_ = t.Close()
-			return nil, loadError(fmt.Errorf("attaching %s: %w", name, err))
+			return nil, loadError(err)
 		}
-		t.links = append(t.links, l)
+	}
+	if t.drop != "" {
+		if err := t.attach(t.drop); err != nil {
+			t.noDrops(spec, err)
+		}
 	}
 	return t, nil
+}
+
+// attach attaches the program name.
+func (t *Tracer) attach(name string) error {
+	l, err := link.AttachTracing(link.TracingOptions{Program: t.coll.Programs[name]})
+	if err != nil {
+		return fmt.Errorf("attaching %s: %w", name, err)
+	}
+	t.links = append(t.links, l)
+	return nil
+}
+
+// noDrops gives up counting drops, because of err.
+func (t *Tracer) noDrops(spec *ebpf.CollectionSpec, err error) {
+	delete(spec.Programs, t.drop)
+	t.drop, t.dropReasons = "", nil
+	t.dropErr = fmt.Errorf("the drops of packets are not counted: %w", err)
 }
 
 // checkPrivileges checks the capabilities the programs need: loading BTF and
@@ -132,35 +177,82 @@ func setTarget(spec *ebpf.CollectionSpec) error {
 	return nil
 }
 
-// retransmitProgram returns the retransmission program that matches the
-// kernel's tcp_retransmit_skb tracepoint: Linux 6.17 added an err argument
-// (and fires it for failed attempts too).
-func retransmitProgram() (string, error) {
-	kernel, err := btf.LoadKernelSpec()
-	if err != nil {
-		return "", fmt.Errorf("reading the kernel's BTF (CONFIG_DEBUG_INFO_BTF): %w", err)
-	}
+// tracepointParams returns the parameters of a tracepoint, as the kernel's
+// BTF declares them.
+func tracepointParams(kernel *btf.Spec, name string) ([]btf.FuncParam, error) {
 	var typedef *btf.Typedef
-	if err := kernel.TypeByName("btf_trace_tcp_retransmit_skb", &typedef); err != nil {
-		return "", fmt.Errorf("finding the tcp_retransmit_skb tracepoint: %w", err)
+	if err := kernel.TypeByName("btf_trace_"+name, &typedef); err != nil {
+		return nil, fmt.Errorf("finding the %s tracepoint: %w", name, err)
 	}
 	ptr, ok := typedef.Type.(*btf.Pointer)
 	if !ok {
-		return "", fmt.Errorf("unexpected type of the tcp_retransmit_skb tracepoint: %v", typedef.Type)
+		return nil, fmt.Errorf("unexpected type of the %s tracepoint: %v", name, typedef.Type)
 	}
 	proto, ok := ptr.Target.(*btf.FuncProto)
-	if !ok {
-		return "", fmt.Errorf("unexpected type of the tcp_retransmit_skb tracepoint: %v", ptr.Target)
+	if !ok || len(proto.Params) == 0 {
+		return nil, fmt.Errorf("unexpected type of the %s tracepoint: %v", name, ptr.Target)
 	}
 	// The first parameter is the tracepoint's context.
-	switch len(proto.Params) {
-	case 3:
+	return proto.Params[1:], nil
+}
+
+// retransmitProgram returns the retransmission program that matches the
+// kernel's tcp_retransmit_skb tracepoint: Linux 6.17 added an err argument
+// (and fires it for failed attempts too).
+func retransmitProgram(kernel *btf.Spec) (string, error) {
+	params, err := tracepointParams(kernel, "tcp_retransmit_skb")
+	if err != nil {
+		return "", err
+	}
+	switch len(params) {
+	case 2:
 		return keventsProgKeventsRetransmit, nil
-	case 4:
+	case 3:
 		return keventsProgKeventsRetransmitErr, nil
 	default:
-		return "", fmt.Errorf("unexpected prototype of the tcp_retransmit_skb tracepoint: %d parameters", len(proto.Params)-1)
+		return "", fmt.Errorf("unexpected prototype of the tcp_retransmit_skb tracepoint: %d parameters", len(params))
 	}
+}
+
+// dropReasonPrefix starts the names of the values of enum skb_drop_reason.
+const dropReasonPrefix = "SKB_DROP_REASON_"
+
+// dropProgram returns the drop program that matches the kernel's kfree_skb
+// tracepoint, and the names of the drop reasons, or why drops cannot be
+// counted. Linux 5.17 added the reason (skb, location, reason), and Linux
+// 6.11 the socket a packet was received for (rx_sk).
+func dropProgram(kernel *btf.Spec) (string, map[uint32]string, error) {
+	params, err := tracepointParams(kernel, "kfree_skb")
+	if err != nil {
+		return "", nil, fmt.Errorf("the drops of packets are not counted: %w", err)
+	}
+	if len(params) < 3 {
+		return "", nil, errors.New("the drops of packets are not counted: the kernel's kfree_skb tracepoint has no reason (Linux 5.17 added it)")
+	}
+	reasons, ok := btf.UnderlyingType(params[2].Type).(*btf.Enum)
+	if !ok || reasons.Name != "skb_drop_reason" {
+		return "", nil, fmt.Errorf("the drops of packets are not counted: unexpected reason of the kfree_skb tracepoint: %v", params[2].Type)
+	}
+	var prog string
+	switch len(params) {
+	case 3:
+		prog = keventsProgKeventsDrop
+	case 4:
+		prog = keventsProgKeventsDropRx
+	default:
+		return "", nil, fmt.Errorf("the drops of packets are not counted: unexpected prototype of the kfree_skb tracepoint: %d parameters", len(params))
+	}
+	names := make(map[uint32]string, len(reasons.Values))
+	for _, v := range reasons.Values {
+		// SKB_DROP_REASON_MAX and SUBSYS_MASK are bounds, not reasons; the
+		// reasons of a subsystem (the high 16 bits) have no name here.
+		name, ok := strings.CutPrefix(v.Name, dropReasonPrefix)
+		if !ok || name == "MAX" || name == "SUBSYS_MASK" || v.Value > math.MaxUint32 {
+			continue
+		}
+		names[uint32(v.Value)] = name
+	}
+	return prog, names, nil
 }
 
 // mapGeneration maps, read-only, the memory of the programs' zeroed global
@@ -239,6 +331,15 @@ func (t *Tracer) Generation() (uint64, bool) {
 // GenerationError says why Generation is not available, or is nil.
 func (t *Tracer) GenerationError() error { return t.genErr }
 
+// DropsError says why the drops of packets are not counted (ReadEvents
+// returns none), or is nil.
+func (t *Tracer) DropsError() error { return t.dropErr }
+
+// DropReasons returns the names of the reasons for which the kernel drops
+// packets, without their SKB_DROP_REASON_ prefix, by value. It is nil when
+// drops are not counted.
+func (t *Tracer) DropReasons() map[uint32]string { return t.dropReasons }
+
 // ReadEvents returns the events counted on the socket whose descriptor is
 // fd since it was opened, or ErrNotTraced. Any descriptor of the socket
 // works, a duplicate included: it keeps the socket, and its counters, after
@@ -256,13 +357,18 @@ func (t *Tracer) ReadEvents(fd int) (stats.Events, error) {
 	if err != nil {
 		return stats.Events{}, fmt.Errorf("reading the events of socket %d: %w", fd, err)
 	}
-	return stats.Events{
+	ev := stats.Events{
 		SYNRetrans:      c.SynRetrans,
 		FastOpenRetrans: c.FastopenRetrans,
 		RTORetrans:      c.RtoRetrans,
 		OtherRetrans:    c.OtherRetrans,
 		ResetsReceived:  c.ResetsReceived,
-	}, nil
+		OtherDrops:      c.OtherDrops,
+	}
+	for i, d := range c.Drops {
+		ev.Drops[i] = stats.DropCount{Reason: d.Reason, Count: d.Count}
+	}
+	return ev, nil
 }
 
 // Close detaches and unloads the programs.
