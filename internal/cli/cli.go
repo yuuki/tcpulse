@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/yuuki/tcpulse/internal/client"
+	"github.com/yuuki/tcpulse/internal/kevents"
 	"github.com/yuuki/tcpulse/internal/report"
 	"github.com/yuuki/tcpulse/internal/server"
 	"github.com/yuuki/tcpulse/internal/stats"
@@ -175,12 +176,29 @@ func validateClient(o *options) error {
 	if o.proto == client.ProtocolUDP && o.messageBytes > maxUDPMessageBytes {
 		return fmt.Errorf("--message-bytes must be at most %d with --proto udp, got %d", maxUDPMessageBytes, o.messageBytes)
 	}
-	// UDP has no TCP_INFO, and other platforms none that tcpulse reads.
-	if o.tcpInfo && o.proto != client.ProtocolTCP {
-		return errors.New("--tcp-info requires --proto tcp")
-	}
-	if o.tcpInfo && !client.TCPInfoSupported {
-		return errors.New("--tcp-info is only supported on Linux")
+	return validateKernelOptions(o)
+}
+
+// validateKernelOptions rejects the options that read the kernel's view of
+// TCP connections (TCP_INFO, eBPF) where there is none: with UDP, or on a
+// platform other than Linux.
+func validateKernelOptions(o *options) error {
+	for _, opt := range []struct {
+		name      string
+		set       bool
+		supported bool
+		platforms string
+	}{
+		{"--tcp-info", o.tcpInfo, client.TCPInfoSupported, "Linux"},
+		{"--kernel-events", o.kernelEvents, kevents.Supported, "Linux on little-endian architectures"},
+	} {
+		switch {
+		case !opt.set:
+		case o.proto != client.ProtocolTCP:
+			return fmt.Errorf("%s requires --proto tcp", opt.name)
+		case !opt.supported:
+			return fmt.Errorf("%s is only supported on %s", opt.name, opt.platforms)
+		}
 	}
 	return nil
 }
@@ -215,6 +233,21 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 		}
 	}
 
+	// The programs count the connections the process opens from now on,
+	// for every target.
+	var events client.EventReader
+	if o.kernelEvents {
+		tracer, err := kevents.Start()
+		if err != nil {
+			return fmt.Errorf("--kernel-events: %w", err)
+		}
+		defer func() { _ = tracer.Close() }()
+		if err := tracer.GenerationError(); err != nil {
+			logger.Warn("kernel events are read with a system call after every round trip", "reason", err)
+		}
+		events = tracer
+	}
+
 	printer := report.NewPrinter(stdout)
 	if !o.jsonlines {
 		if err := printer.Header(); err != nil {
@@ -230,6 +263,7 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 		Duration:     o.duration,
 		MessageBytes: int(o.messageBytes),
 		TCPInfo:      o.tcpInfo,
+		Events:       events,
 		Logger:       logger,
 	}
 	recorders := stats.NewSet(len(addrs), o.mergeResultsEachHost)
@@ -272,6 +306,10 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 		if o.tcpInfo {
 			conns := rec.Conns()
 			r.Conns = &conns
+		}
+		if o.kernelEvents {
+			ev := rec.Events()
+			r.Events = &ev
 		}
 		return r
 	}

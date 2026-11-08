@@ -13,7 +13,8 @@ RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w" -o /out/tc
 
 FROM alpine:${ALPINE_VERSION}
 COPY --from=build /out/tcpulse /usr/local/bin/tcpulse
-COPY LICENSE /usr/share/licenses/tcpulse/LICENSE
+COPY LICENSE NOTICE /usr/share/licenses/tcpulse/
+COPY LICENSES/ /usr/share/licenses/tcpulse/LICENSES/
 USER nobody:nobody
 EXPOSE 9100/tcp 9100/udp
 ENTRYPOINT ["/usr/local/bin/tcpulse"]

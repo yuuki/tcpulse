@@ -62,6 +62,10 @@ type Config struct {
 	// connection (TCP_INFO) when it is closed, once the clock of its last
 	// round trip has stopped. It needs TCPInfoSupported; UDP ignores it.
 	TCPInfo bool
+	// Events, when not nil, reads the kernel events of every TCP connection
+	// after each of its round trips, once the clock has stopped, and
+	// records them in the Recorder with the round trip. UDP ignores it.
+	Events EventReader
 	// Logger receives the errors the run tolerates; nil means
 	// slog.Default().
 	Logger *slog.Logger
@@ -104,6 +108,19 @@ func Run(ctx context.Context, cfg Config, addr string, rec *stats.Recorder) erro
 // (Linux).
 const TCPInfoSupported = sockopt.TCPInfoSupported
 
+// EventReader reads the kernel events counted on a TCP socket since it was
+// opened (--kernel-events). It may be called concurrently.
+type EventReader interface {
+	// Generation returns a number that changes whenever an event is counted
+	// on any socket, cheaply, and false when there is none. While it does
+	// not change, ReadEvents returns the same events for every socket; an
+	// event counted before it changes is seen by ReadEvents after it.
+	Generation() (uint64, bool)
+	// ReadEvents reads the events of the socket of descriptor fd, which may
+	// be a duplicate of the descriptor of a connection.
+	ReadEvents(fd int) (stats.Events, error)
+}
+
 // errTolerated is returned by a request that failed in a way the run
 // tolerates: the failure is logged, and the request is not recorded.
 var errTolerated = errors.New("request failed")
@@ -117,6 +134,8 @@ type run struct {
 	// tcpInfoWarning logs once a connection whose TCP_INFO could not be
 	// read.
 	tcpInfoWarning sync.Once
+	// eventWarning logs once a connection whose events could not be read.
+	eventWarning sync.Once
 }
 
 // Messages returns how many messages a sender at rate per second sends
@@ -181,13 +200,163 @@ func cutOff(ctx context.Context, err error) bool {
 }
 
 // closeTCP closes a TCP connection, after recording what the kernel reports
-// of it when the run asks for it. It runs after the clock of the last round
-// trip of the connection has stopped.
-func (r *run) closeTCP(conn net.Conn) {
+// of it when the run asks for it: the events that none of its completed
+// round trips took (events may be nil), and its TCP_INFO. It runs after the
+// clock of the last round trip of the connection has stopped.
+func (r *run) closeTCP(conn net.Conn, events *eventCursor) {
+	r.recordUnmatched(events)
+	events.close()
 	if r.cfg.TCPInfo {
 		r.recordTCPInfo(conn)
 	}
 	_ = conn.Close()
+}
+
+// eventCursor attributes the kernel events of a TCP connection to its round
+// trips: take returns the events counted since its previous call. It reads
+// them through fd, a duplicate of the descriptor of the connection's socket,
+// which close closes.
+type eventCursor struct {
+	run  *run
+	fd   int
+	seen stats.Events
+	// generation is the reader's generation before the latest read, and
+	// read is set once there was one.
+	generation uint64
+	read       bool
+	// broken is set once the events of the connection could not be read.
+	broken bool
+}
+
+// dialTCP dials the target. When the run reads kernel events, it also
+// returns the cursor of the connection, and records as unmatched the events
+// of the dial attempts that did not become the connection: those of a dial
+// that failed or was cut off (SYNs never answered, a reset), whose socket
+// the dialer closes. A duplicate of the descriptor of every attempt, taken
+// in the dialer's Control (one dup(2), during the dial), keeps them
+// readable.
+func (r *run) dialTCP(ctx context.Context, dialer *net.Dialer) (net.Conn, *eventCursor, error) {
+	if r.cfg.Events == nil {
+		conn, err := dialer.DialContext(ctx, "tcp", r.addr)
+		return conn, nil, err
+	}
+	var held heldSockets
+	d := *dialer
+	d.Control = held.control(dialer.Control)
+	conn, err := d.DialContext(ctx, "tcp", r.addr)
+	return conn, r.adopt(&held, conn, err), err
+}
+
+// heldSockets holds a duplicate of the descriptor of every socket a dial
+// attempts to connect; the attempts may run concurrently (dual-stack
+// fallback).
+type heldSockets struct {
+	mu  sync.Mutex
+	fds []int
+	err error
+}
+
+func (h *heldSockets) control(next func(network, address string, c syscall.RawConn) error) func(network, address string, c syscall.RawConn) error {
+	return func(network, address string, c syscall.RawConn) error {
+		if next != nil {
+			if err := next(network, address, c); err != nil {
+				return err
+			}
+		}
+		return c.Control(func(fd uintptr) {
+			dup, err := dupSocket(fd)
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if err != nil {
+				h.err = err
+				return
+			}
+			h.fds = append(h.fds, dup)
+		})
+	}
+}
+
+// adopt sorts the sockets of a dial: the descriptor of the connection's
+// socket goes to its cursor, nil when the dial failed. The events of the
+// other attempts are recorded as unmatched, and their descriptors closed.
+// After a dial that succeeded at its only attempt, it makes no system call.
+func (r *run) adopt(held *heldSockets, conn net.Conn, err error) *eventCursor {
+	var cursor *eventCursor
+	if err == nil {
+		cursor = &eventCursor{run: r, fd: -1}
+	}
+	for _, fd := range held.fds {
+		if cursor != nil && cursor.fd < 0 && (len(held.fds) == 1 || sameSocket(fd, conn)) {
+			cursor.fd = fd
+			continue
+		}
+		if ev, err := r.cfg.Events.ReadEvents(fd); err == nil && !ev.IsZero() {
+			r.rec.RecordUnmatched(ev)
+		}
+		closeFD(fd)
+	}
+	if cursor != nil && cursor.fd < 0 {
+		cursor.broken = true
+		r.eventWarning.Do(func() {
+			r.logger.Warn("could not keep the socket of a connection to read its kernel events", "addr", r.addr, "error", held.err)
+		})
+	}
+	return cursor
+}
+
+// close closes the descriptor of the cursor.
+func (c *eventCursor) close() {
+	if c != nil && c.fd >= 0 {
+		closeFD(c.fd)
+		c.fd = -1
+	}
+}
+
+// take returns the events counted on the connection since the previous
+// call, or false when they cannot be read.
+func (c *eventCursor) take() (stats.Events, bool) {
+	if c == nil || c.broken || c.fd < 0 {
+		return stats.Events{}, false
+	}
+	// The generation is read before the events: an event counted after it
+	// is read changes it, and the next take reads the events again.
+	gen, ok := c.run.cfg.Events.Generation()
+	if ok && c.read && gen == c.generation {
+		return stats.Events{}, true
+	}
+	ev, err := c.run.cfg.Events.ReadEvents(c.fd)
+	if err != nil {
+		c.broken = true
+		c.run.eventWarning.Do(func() {
+			c.run.logger.Warn("could not read the kernel events of a connection", "addr", c.run.addr, "error", err)
+		})
+		return stats.Events{}, false
+	}
+	d := ev.Sub(c.seen)
+	c.seen, c.generation, c.read = ev, gen, true
+	return d, true
+}
+
+// recordEvents records the events of a round trip that took elapsed, once
+// its clock has stopped. A round trip whose events cannot be read is counted
+// as untracked, never as one without events.
+func (r *run) recordEvents(events *eventCursor, elapsed time.Duration) {
+	if events == nil {
+		return
+	}
+	if d, ok := events.take(); ok {
+		r.rec.RecordEvents(elapsed, d)
+	} else {
+		r.rec.RecordUntracked()
+	}
+}
+
+// recordUnmatched records the events of the connection that no completed
+// round trip takes.
+func (r *run) recordUnmatched(events *eventCursor) {
+	if d, ok := events.take(); ok && !d.IsZero() {
+		r.rec.RecordUnmatched(d)
+	}
 }
 
 // recordTCPInfo records the TCP_INFO of conn. A connection whose TCP_INFO
@@ -293,15 +462,20 @@ func (r *run) persistent(ctx context.Context) error {
 	eg, ctx := errgroup.WithContext(ctx)
 	for range r.cfg.Connections {
 		eg.Go(func() error {
-			conn, err := dialer.DialContext(ctx, "tcp", r.addr)
+			conn, events, err := r.dialTCP(ctx, &dialer)
 			if err != nil {
 				if cutOff(ctx, err) {
 					return nil
 				}
 				return fmt.Errorf("dialing %q: %w", r.addr, err)
 			}
-			defer r.closeTCP(conn)
+			defer r.closeTCP(conn, events)
 			defer bindToRun(ctx, conn)()
+			// The dial is not timed: the events of a handshake it waited
+			// for belong to no round trip. With TCP Fast Open the SYN
+			// leaves with the first message, and its events with the first
+			// round trip.
+			r.recordUnmatched(events)
 
 			msg := make([]byte, r.cfg.MessageBytes)
 			echo := echoBuffer(msg)
@@ -313,7 +487,11 @@ func (r *run) persistent(ctx context.Context) error {
 				fill(msg)
 				start := time.Now()
 				err := exchange(conn, msg, echo)
-				if err := r.finish(ctx, time.Since(start), err); err != nil {
+				elapsed := time.Since(start)
+				if err == nil {
+					r.recordEvents(events, elapsed)
+				}
+				if err := r.finish(ctx, elapsed, err); err != nil {
 					return err
 				}
 				if err != nil {
@@ -360,7 +538,9 @@ func (r *run) ephemeral(ctx context.Context) error {
 // calls run after the result is evaluated).
 func (r *run) ephemeralRequest(ctx context.Context, dialer *net.Dialer, msg, echo []byte) (time.Duration, error) {
 	start := time.Now()
-	conn, err := dialer.DialContext(ctx, "tcp", r.addr)
+	// The round trip includes the dial: the events of the connection are
+	// all its own.
+	conn, events, err := r.dialTCP(ctx, dialer)
 	if err != nil {
 		if errors.Is(err, syscall.ETIMEDOUT) {
 			r.logger.Warn("connection timeout", "addr", r.addr)
@@ -368,7 +548,7 @@ func (r *run) ephemeralRequest(ctx context.Context, dialer *net.Dialer, msg, ech
 		}
 		return 0, fmt.Errorf("dialing %q: %w", r.addr, err)
 	}
-	defer r.closeTCP(conn)
+	defer r.closeTCP(conn, events)
 	defer bindToRun(ctx, conn)()
 
 	if err := sockopt.SetQuickAck(conn); err != nil {
@@ -386,7 +566,9 @@ func (r *run) ephemeralRequest(ctx context.Context, dialer *net.Dialer, msg, ech
 		}
 		return 0, err
 	}
-	return time.Since(start), nil
+	elapsed := time.Since(start)
+	r.recordEvents(events, elapsed)
+	return elapsed, nil
 }
 
 func (r *run) udp(ctx context.Context) error {

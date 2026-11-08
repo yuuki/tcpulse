@@ -42,6 +42,12 @@ archives:
           group: root
           mode: 0644
           mtime: "{{ .CommitDate }}"
+      # The binary embeds the eBPF object of --kernel-events, distributed
+      # under BSD-2-Clause: see NOTICE.
+      - src: NOTICE
+        info: *doc
+      - src: LICENSES/*
+        info: *doc
       - src: README.md
         info: *doc
       - src: CHANGELOG.md
@@ -74,9 +80,14 @@ dockers_v2:
       - linux/arm64
     extra_files:
       - LICENSE
+      - NOTICE
+      - LICENSES/BSD-2-Clause.txt
+      - LICENSES/GPL-2.0-only.txt
     # Labels and annotations carry the same data on purpose: ghcr.io links a
     # package to its repository from the image config label, while the
     # manifest annotations are what a multi-platform aware client reads.
+    # The licenses include BSD-2-Clause for the eBPF object of
+    # --kernel-events, which the binary embeds (NOTICE).
     labels:
       org.opencontainers.image.title: "{{ .ProjectName }}"
       org.opencontainers.image.description: "Concurrent TCP/UDP load generator with fine-grained, flow-level control"
@@ -84,7 +95,7 @@ dockers_v2:
       org.opencontainers.image.revision: "{{ .FullCommit }}"
       org.opencontainers.image.version: "{{ .Version }}"
       org.opencontainers.image.source: "{{ .GitURL }}"
-      org.opencontainers.image.licenses: "Apache-2.0"
+      org.opencontainers.image.licenses: "Apache-2.0 AND BSD-2-Clause"
     annotations:
       org.opencontainers.image.title: "{{ .ProjectName }}"
       org.opencontainers.image.description: "Concurrent TCP/UDP load generator with fine-grained, flow-level control"
@@ -92,7 +103,7 @@ dockers_v2:
       org.opencontainers.image.revision: "{{ .FullCommit }}"
       org.opencontainers.image.version: "{{ .Version }}"
       org.opencontainers.image.source: "{{ .GitURL }}"
-      org.opencontainers.image.licenses: "Apache-2.0"
+      org.opencontainers.image.licenses: "Apache-2.0 AND BSD-2-Clause"
 
 snapshot:
   version_template: "{{ incpatch .Version }}-next"

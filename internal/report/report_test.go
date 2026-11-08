@@ -151,6 +151,54 @@ func TestJSONLinesTCPInfo(t *testing.T) {
 	}
 }
 
+var sampleEvents = stats.EventSummary{
+	RoundTrips:        41,
+	RetransRoundTrips: stats.RetransCounts{SYN: 30, FastOpen: 2, RTO: 6, Other: 4},
+	WithEvents:        stats.LatencySummary{Count: 41, P99: 1023456 * time.Microsecond, Max: 3045 * time.Millisecond},
+	WithoutEvents:     stats.LatencySummary{Count: 14758, P99: 812 * time.Microsecond, Max: 4108 * time.Microsecond},
+	ResetsReceived:    3,
+	Unmatched:         stats.RetransCounts{SYN: 7, RTO: 2},
+	Untracked:         5,
+}
+
+func TestReportKernelEvents(t *testing.T) {
+	var buf bytes.Buffer
+	err := NewPrinter(&buf).Report([]Result{
+		{Peer: "10.0.150.2:9200", Summary: sample, Conns: &sampleConns, Events: &sampleEvents},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The kernel events follow the TCP statistics, with their own header.
+	_, events, ok := strings.Cut(buf.String(), EventSeparator+"\n")
+	if !ok || !strings.Contains(buf.String(), ConnSeparator) {
+		t.Fatalf("report:\n%s", buf.String())
+	}
+	want := "PEER                 EVENT_RTS  SYN_RTX         TFO_RTX         RTO_RTX         OTHER_RTX       EVENT_99p(µs)   CLEAN_99p(µs)   RST_RECV        UNMATCHED       UNTRACKED \n" +
+		"10.0.150.2:9200      41         30              2               6               4               1023456         812             3               9               5         \n"
+	if events != want {
+		t.Fatalf("kernel events:\n got %q\nwant %q", events, want)
+	}
+}
+
+func TestJSONLinesKernelEvents(t *testing.T) {
+	var buf bytes.Buffer
+	p := NewPrinter(&buf)
+	p.now = func() time.Time { return time.Date(2025, 1, 7, 10, 30, 0, 0, time.UTC) }
+	if err := p.JSONLines([]Result{{Peer: "10.0.150.2:9200", Summary: sample, Events: &sampleEvents}}); err != nil {
+		t.Fatal(err)
+	}
+	// The fields of the run keep their names and order; kernel_events
+	// follows (and tcp_info would come before it).
+	want := `{"peer":"10.0.150.2:9200","count":14799,"latency_max_us":13736,"latency_min_us":223,"latency_mean_us":530,"latency_90p_us":501,"latency_95p_us":953,"latency_99p_us":5989,"rate_per_sec":996,"timestamp":"2025-01-07T10:30:00Z",` +
+		`"kernel_events":{"round_trips_with_events":41,"round_trips_without_events":14758,"syn_retrans_round_trips":30,"fastopen_retrans_round_trips":2,"rto_retrans_round_trips":6,"other_retrans_round_trips":4,` +
+		`"latency_99p_with_events_us":1023456,"latency_max_with_events_us":3045000,"latency_99p_without_events_us":812,"latency_max_without_events_us":4108,` +
+		`"resets_received":3,"unmatched_syn_retrans":7,"unmatched_fastopen_retrans":0,"unmatched_rto_retrans":2,"unmatched_other_retrans":0,"untracked_round_trips":5}}` + "\n"
+	if buf.String() != want {
+		t.Fatalf("JSON Lines:\n got %s\nwant %s", buf.String(), want)
+	}
+}
+
 type failingWriter struct{}
 
 func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
@@ -158,11 +206,12 @@ func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("broken p
 func TestWriteErrors(t *testing.T) {
 	p := NewPrinter(failingWriter{})
 	for name, err := range map[string]error{
-		"Header":     p.Header(),
-		"Line":       p.Line(Result{Peer: "a:1"}),
-		"Report":     p.Report([]Result{{Peer: "a:1"}}),
-		"connReport": NewPrinter(failingWriter{}).connReport([]Result{{Peer: "a:1", Conns: &stats.ConnSummary{}}}),
-		"JSONLines":  p.JSONLines([]Result{{Peer: "a:1"}}),
+		"Header":      p.Header(),
+		"Line":        p.Line(Result{Peer: "a:1"}),
+		"Report":      p.Report([]Result{{Peer: "a:1"}}),
+		"connReport":  NewPrinter(failingWriter{}).connReport([]Result{{Peer: "a:1", Conns: &stats.ConnSummary{}}}),
+		"eventReport": NewPrinter(failingWriter{}).eventReport([]Result{{Peer: "a:1", Events: &stats.EventSummary{}}}),
+		"JSONLines":   p.JSONLines([]Result{{Peer: "a:1"}}),
 	} {
 		if err == nil {
 			t.Errorf("%s returned no error on a failing writer", name)
