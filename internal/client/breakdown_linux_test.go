@@ -11,6 +11,11 @@ import (
 )
 
 func TestRunBreakdown(t *testing.T) {
+	release, err := PrepareBreakdown()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
 	for _, size := range []int{64, 3 * concurrentEchoBytes} {
 		cfg := config(ProtocolTCP, FlavorPersistent)
 		cfg.MessageBytes = size
@@ -23,8 +28,8 @@ func TestRunBreakdown(t *testing.T) {
 		// Every round trip counts once. The first round trip of a
 		// connection that TCP Fast Open deferred the handshake to has no
 		// timestamps: the stream offsets are not known before it.
-		if total.Count != 20 || b.RoundTrips+b.Missing+b.Negative != total.Count ||
-			b.Missing > int64(cfg.Connections) || b.Negative != 0 {
+		if total.Count != 20 || b.RoundTrips+b.Missing+b.OutOfOrder+b.Negative != total.Count ||
+			b.Missing > int64(cfg.Connections) || b.OutOfOrder != 0 || b.Negative != 0 {
 			t.Fatalf("%d bytes: %d round trips, breakdown %+v", size, total.Count, b)
 		}
 		t.Logf("%d bytes: %d round trips, max %v, breakdown %+v", size, total.Count, total.Max, b)

@@ -200,7 +200,7 @@ func TestJSONLinesKernelEvents(t *testing.T) {
 }
 
 var sampleBreakdown = stats.BreakdownSummary{
-	RoundTrips: 14790, Missing: 7, Negative: 2,
+	RoundTrips: 14787, Missing: 7, OutOfOrder: 3, Negative: 2,
 	Send:    stats.PartSummary{P50: 21 * time.Microsecond, P99: 81 * time.Microsecond},
 	Network: stats.PartSummary{P50: 455 * time.Microsecond, P99: 5480 * time.Microsecond},
 	Receive: stats.PartSummary{P50: 18 * time.Microsecond, P99: 4520 * time.Microsecond},
@@ -219,8 +219,8 @@ func TestReportBreakdown(t *testing.T) {
 	if !ok || !strings.Contains(buf.String(), EventSeparator) {
 		t.Fatalf("report:\n%s", buf.String())
 	}
-	want := "PEER                 SPLIT_RTS  MISSING    NEGATIVE   SEND_50p(µs)    SEND_99p(µs)    NET_50p(µs)     NET_99p(µs)     RECV_50p(µs)    RECV_99p(µs)   \n" +
-		"10.0.150.2:9200      14790      7          2          21              81              455             5480            18              4520           \n"
+	want := "PEER                 SPLIT_RTS  MISSING    OUT_OF_ORDER NEGATIVE   SEND_50p(µs)    SEND_99p(µs)    NET_50p(µs)     NET_99p(µs)     RECV_50p(µs)    RECV_99p(µs)   \n" +
+		"10.0.150.2:9200      14787      7          3            2          21              81              455             5480            18              4520           \n"
 	if breakdown != want {
 		t.Fatalf("breakdown:\n got %q\nwant %q", breakdown, want)
 	}
@@ -233,7 +233,7 @@ func TestJSONLinesBreakdown(t *testing.T) {
 		t.Fatal(err)
 	}
 	// latency_breakdown ends the object, after kernel_events.
-	want := `"untracked_round_trips":5},"latency_breakdown":{"round_trips":14790,"missing_timestamps":7,"negative_parts":2,` +
+	want := `"untracked_round_trips":5},"latency_breakdown":{"round_trips":14787,"missing_timestamps":7,"out_of_order":3,"negative_parts":2,` +
 		`"send_50p_us":21,"send_99p_us":81,"network_50p_us":455,"network_99p_us":5480,"receive_50p_us":18,"receive_99p_us":4520}}` + "\n"
 	if !strings.HasSuffix(buf.String(), want) {
 		t.Fatalf("JSON Lines: %s\nwant it to end with %s", buf.String(), want)

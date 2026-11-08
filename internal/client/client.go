@@ -22,7 +22,6 @@ import (
 
 	"github.com/yuuki/tcpulse/internal/sockopt"
 	"github.com/yuuki/tcpulse/internal/stats"
-	"github.com/yuuki/tcpulse/internal/tstamp"
 )
 
 // Protocols.
@@ -70,7 +69,8 @@ type Config struct {
 	// Breakdown splits every round trip of FlavorPersistent TCP into send,
 	// network and receive time, by the kernel's timestamps of the last byte
 	// of the message (SO_TIMESTAMPING), and records the parts in the
-	// Recorder. It needs BreakdownSupported; FlavorEphemeral and UDP ignore
+	// Recorder. It needs BreakdownSupported, and the receive timestamps of
+	// the host turned on (PrepareBreakdown); FlavorEphemeral and UDP ignore
 	// it.
 	Breakdown bool
 	// Logger receives the errors the run tolerates; nil means
@@ -96,15 +96,6 @@ func Run(ctx context.Context, cfg Config, addr string, rec *stats.Recorder) erro
 	var err error
 	switch {
 	case cfg.Protocol == ProtocolTCP && cfg.Flavor == FlavorPersistent:
-		if cfg.Breakdown {
-			// Before the run: the packets of its first round trips would
-			// have no receive timestamp otherwise.
-			if release, err := tstamp.Prepare(time.Second); err != nil {
-				r.logger.Warn("the first round trips may have no receive timestamp", "error", err)
-			} else {
-				defer release()
-			}
-		}
 		err = r.persistent(ctx)
 	case cfg.Protocol == ProtocolTCP && cfg.Flavor == FlavorEphemeral:
 		err = r.ephemeral(ctx)
@@ -453,14 +444,16 @@ func exchange(conn net.Conn, msg, echo []byte) error {
 	}()
 	_, readErr := io.ReadFull(conn, echo)
 	if readErr != nil {
-		// Unblock the write: the connection is done.
+		// Unblock the write: the connection is done. The write then fails
+		// because of the deadline: the read's error is the one to report.
 		_ = conn.SetDeadline(time.Now())
+		if err := <-written; err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+			return fmt.Errorf("reading from connection: %w (and writing: %w)", readErr, err)
+		}
+		return fmt.Errorf("reading from connection: %w", readErr)
 	}
 	if err := <-written; err != nil {
 		return fmt.Errorf("writing to connection: %w", err)
-	}
-	if readErr != nil {
-		return fmt.Errorf("reading from connection: %w", readErr)
 	}
 	return nil
 }
@@ -514,8 +507,9 @@ func (r *run) persistent(ctx context.Context) error {
 					received time.Time
 					err      error
 				)
+				timed := split.timed()
 				start := time.Now()
-				if split.timed() {
+				if timed {
 					received, err = exchangeTimestamped(conn, split.ts, msg, echo)
 				} else {
 					err = exchange(conn, msg, echo)

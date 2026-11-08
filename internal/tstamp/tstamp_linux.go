@@ -30,10 +30,33 @@ const tcpEstablished = 1
 // sizeofSockExtendedErr is the size of struct sock_extended_err.
 const sizeofSockExtendedErr = int(unsafe.Sizeof(unix.SockExtendedErr{}))
 
+// option returns the socket option that turns the timestamps on, which is
+// also the type of their control messages: SO_TIMESTAMPING_NEW (Linux 5.1),
+// whose timestamps have 64-bit fields on every architecture, or else, on
+// 64-bit architectures, SO_TIMESTAMPING, whose layout is then the same.
+func option(fd int, flags int) (int, error) {
+	err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TIMESTAMPING_NEW, flags)
+	if !errors.Is(err, unix.ENOPROTOOPT) {
+		return unix.SO_TIMESTAMPING_NEW, err
+	}
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		return 0, fmt.Errorf("%w: SO_TIMESTAMPING_NEW needs Linux 5.1 or later on 32-bit architectures", ErrNoTimestamping)
+	}
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TIMESTAMPING, flags); err != nil {
+		if errors.Is(err, unix.ENOPROTOOPT) {
+			return 0, fmt.Errorf("%w: %w", ErrNoTimestamping, err)
+		}
+		return 0, err
+	}
+	return unix.SO_TIMESTAMPING, nil
+}
+
 // Conn reads the timestamps of a TCP connection. Its methods must not be
 // called concurrently.
 type Conn struct {
 	raw syscall.RawConn
+	// typ is the type of the control messages of the timestamps (option).
+	typ int32
 	// oob receives control messages; payload the (empty) payload of the
 	// messages of the error queue.
 	oob     []byte
@@ -51,8 +74,11 @@ func Enable(c syscall.Conn) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	var serr error
-	err = raw.Control(func(fd uintptr) { serr = enable(int(fd)) })
+	var (
+		typ  int
+		serr error
+	)
+	err = raw.Control(func(fd uintptr) { typ, serr = enable(int(fd)) })
 	if err == nil {
 		err = serr
 	}
@@ -62,30 +88,30 @@ func Enable(c syscall.Conn) (*Conn, error) {
 	// Room for a timestamp, and the error with its offender address.
 	oob := make([]byte, unix.CmsgSpace(int(unsafe.Sizeof(timestamps{})))+
 		unix.CmsgSpace(sizeofSockExtendedErr+unix.SizeofSockaddrInet6))
-	return &Conn{raw: raw, oob: oob, tx: map[uint32]time.Time{}}, nil
+	return &Conn{raw: raw, typ: int32(typ), oob: oob, tx: map[uint32]time.Time{}}, nil //nolint:gosec // a socket option
 }
 
-func enable(fd int) error {
+func enable(fd int) (int, error) {
 	info, err := unix.GetsockoptTCPInfo(fd, unix.IPPROTO_TCP, unix.TCP_INFO)
 	if err != nil {
-		return fmt.Errorf("reading TCP_INFO: %w", err)
+		return 0, fmt.Errorf("reading TCP_INFO: %w", err)
 	}
 	if info.State != tcpEstablished {
-		return ErrNotReady
+		return 0, ErrNotReady
 	}
 	// With OPT_ID_TCP (Linux 6.2), the keys count from the next byte
 	// written; without, from the first byte not acknowledged.
-	err = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TIMESTAMPING_NEW, flags|unix.SOF_TIMESTAMPING_OPT_ID_TCP)
+	typ, err := option(fd, flags|unix.SOF_TIMESTAMPING_OPT_ID_TCP)
 	if errors.Is(err, unix.EINVAL) {
 		if info.Unacked != 0 || info.Notsent_bytes != 0 {
-			return ErrNotReady
+			return 0, ErrNotReady
 		}
-		err = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TIMESTAMPING_NEW, flags)
+		typ, err = option(fd, flags)
 	}
 	if err != nil {
-		return fmt.Errorf("setting SO_TIMESTAMPING: %w", err)
+		return 0, fmt.Errorf("setting SO_TIMESTAMPING: %w", err)
 	}
-	return nil
+	return typ, nil
 }
 
 // timestamps is struct scm_timestamping64, the payload of SO_TIMESTAMPING_NEW
@@ -110,7 +136,14 @@ func (c *Conn) ReadFull(buf []byte) (time.Time, error) {
 			n, oobn, _, _, rerr = unix.Recvmsg(int(fd), buf[got:], c.oob, 0)
 			return rerr != unix.EAGAIN
 		})
-		if err == nil {
+		if notPollable(err) {
+			// Until the poller sees the socket readable or writable, it
+			// refuses to wait: read without it.
+			n, oobn, err = c.recvWithoutPoller(buf[got:])
+			if errors.Is(err, unix.EAGAIN) {
+				continue
+			}
+		} else if err == nil {
 			err = rerr
 		}
 		if err != nil {
@@ -125,12 +158,83 @@ func (c *Conn) ReadFull(buf []byte) (time.Time, error) {
 		got += n
 		rx = time.Time{}
 		eachMessage(c.oob[:oobn], func(level, typ int32, data []byte) {
-			if level == unix.SOL_SOCKET && typ == unix.SO_TIMESTAMPING_NEW {
+			if level == unix.SOL_SOCKET && typ == c.typ {
 				rx = software(data)
 			}
 		})
 	}
 	return rx, nil
+}
+
+// notPollable reports whether err is the poller's "not pollable"
+// (internal/poll.ErrNotPollable, which is not exported). The poller returns
+// it, without waiting, after it saw an error event alone on the socket:
+// a transmit timestamp queued while the socket was neither readable nor
+// writable (an echo not yet back, a send buffer full), which signals
+// EPOLLERR. It keeps returning it until it sees the socket readable or
+// writable. Past the socket's deadline, it returns the deadline's error
+// instead.
+func notPollable(err error) bool {
+	for ; err != nil; err = errors.Unwrap(err) {
+		if err.Error() == "not pollable" {
+			return true
+		}
+	}
+	return false
+}
+
+// pollWait is how long recvWithoutPoller waits for data, so that the
+// deadline of the socket, which the poller checks, ends the read soon after
+// it passes.
+const pollWait = 10 // milliseconds
+
+// recvWithoutPoller reads the transmit timestamps queued, whose error event
+// stops poll(2) from waiting too, waits up to pollWait for data, and reads
+// it. It returns EAGAIN when none came.
+func (c *Conn) recvWithoutPoller(buf []byte) (n, oobn int, err error) {
+	if err := c.Drain(); err != nil {
+		return 0, 0, err
+	}
+	var rerr error
+	err = c.raw.Control(func(fd uintptr) {
+		fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}} //nolint:gosec // a file descriptor
+		if _, rerr = unix.Poll(fds, pollWait); rerr != nil && !errors.Is(rerr, unix.EINTR) {
+			return
+		}
+		n, oobn, _, _, rerr = unix.Recvmsg(int(fd), buf, c.oob, unix.MSG_DONTWAIT)
+	})
+	if err == nil {
+		err = rerr
+	}
+	return n, oobn, err
+}
+
+// OutOfOrder returns the number of packets that the connection received out
+// of order since it was opened (tcpi_rcv_ooopack, Linux 5.4), or false when
+// the kernel does not count them.
+func (c *Conn) OutOfOrder() (uint32, bool, error) {
+	var (
+		info unix.TCPInfo
+		gerr error
+	)
+	size := uint32(unsafe.Sizeof(info))
+	err := c.raw.Control(func(fd uintptr) {
+		_, _, errno := unix.Syscall6(unix.SYS_GETSOCKOPT, fd, unix.IPPROTO_TCP, unix.TCP_INFO,
+			uintptr(unsafe.Pointer(&info)), uintptr(unsafe.Pointer(&size)), 0)
+		if errno != 0 {
+			gerr = errno
+		}
+	})
+	if err == nil {
+		err = gerr
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("reading TCP_INFO: %w", err)
+	}
+	if uintptr(size) < unsafe.Offsetof(info.Rcv_ooopack)+unsafe.Sizeof(info.Rcv_ooopack) {
+		return 0, false, nil
+	}
+	return info.Rcv_ooopack, true, nil
 }
 
 // Drain reads the transmit timestamps that the kernel queued (the error
@@ -165,7 +269,7 @@ func (c *Conn) Drain() error {
 		)
 		eachMessage(c.oob[:oobn], func(level, typ int32, data []byte) {
 			switch {
-			case level == unix.SOL_SOCKET && typ == unix.SO_TIMESTAMPING_NEW:
+			case level == unix.SOL_SOCKET && typ == c.typ:
 				ts = software(data)
 			case level == unix.SOL_IP && typ == unix.IP_RECVERR, level == unix.SOL_IPV6 && typ == unix.IPV6_RECVERR:
 				if len(data) < sizeofSockExtendedErr {
@@ -264,8 +368,8 @@ func Prepare(timeout time.Duration) (release func(), err error) {
 	if err := unix.Connect(fd, self); err != nil {
 		return nil, fmt.Errorf("connecting a UDP socket to itself: %w", err)
 	}
-	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TIMESTAMPING_NEW,
-		unix.SOF_TIMESTAMPING_RX_SOFTWARE|unix.SOF_TIMESTAMPING_SOFTWARE); err != nil {
+	typ, err := option(fd, unix.SOF_TIMESTAMPING_RX_SOFTWARE|unix.SOF_TIMESTAMPING_SOFTWARE)
+	if err != nil {
 		return nil, fmt.Errorf("setting SO_TIMESTAMPING: %w", err)
 	}
 	wait := unix.NsecToTimeval((10 * time.Millisecond).Nanoseconds())
@@ -286,8 +390,8 @@ func Prepare(timeout time.Duration) (release func(), err error) {
 			return nil, fmt.Errorf("receiving from the loopback device: %w", err)
 		}
 		stamped := false
-		eachMessage(oob[:oobn], func(level, typ int32, data []byte) {
-			if level == unix.SOL_SOCKET && typ == unix.SO_TIMESTAMPING_NEW && !software(data).IsZero() {
+		eachMessage(oob[:oobn], func(level, t int32, data []byte) {
+			if level == unix.SOL_SOCKET && int(t) == typ && !software(data).IsZero() {
 				stamped = true
 			}
 		})

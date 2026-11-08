@@ -261,6 +261,20 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 		}
 	}
 
+	// Before the clock of the run: the first round trips would have no
+	// receive timestamp otherwise.
+	if o.latencyBreakdown {
+		release, err := client.PrepareBreakdown()
+		switch {
+		case errors.Is(err, client.ErrNoTimestamping):
+			return fmt.Errorf("--latency-breakdown: %w", err)
+		case err != nil:
+			logger.Warn("the first round trips may have no receive timestamp", "error", err)
+		default:
+			defer release()
+		}
+	}
+
 	cfg := client.Config{
 		Protocol:     o.proto,
 		Flavor:       o.flavor,

@@ -302,6 +302,25 @@ through `internal/tstamp`. Issue #50 records the analysis.
 - **Late timestamps:** a transmit timestamp that is not there when the round
   trip ends waits for the end of the next round trip, or the close, and only
   then counts as missing. Of several timestamps of one byte, the first counts.
+  The error queue is charged to the receive buffer: when a large echo fills
+  it, the kernel drops the timestamp, and a retransmission of the last byte
+  would bring a later one.
+- **Out of order:** the receive timestamp is the arrival of the packet that
+  holds the last byte, not the moment the echo became readable: when an
+  earlier packet of the echo was lost or reordered, the last arrived first,
+  and the wait for the others would go to the receive part, blaming the
+  client for the network. After each round trip, the client compares the
+  packets received out of order (`tcpi_rcv_ooopack`, Linux 5.4) with their
+  count after the previous one, and counts such a round trip apart.
+- **Error events:** a transmit timestamp on the error queue makes the socket
+  signal `EPOLLERR`. When the socket is neither readable nor writable then
+  (the echo not back, the send buffer full, as with messages larger than
+  it), epoll reports the error alone, and Go's poller refuses to wait on the
+  socket ("not pollable") until it sees it readable or writable. `ReadFull`
+  then reads the timestamps queued, which clears the error, waits with
+  `poll(2)` for up to 10ms, and reads; the poller still checks the deadline
+  at every turn. Without it, messages of 50 KB on a path of 1500 bytes
+  failed the run.
 - **Clock:** the kernel's timestamps are in the system's time
   (`CLOCK_REALTIME`). `time.Now` reads it just before the monotonic time
   that times the round trip; the end is read right after the clock stops.
@@ -312,15 +331,23 @@ through `internal/tstamp`. Issue #50 records the analysis.
   the receive part negative.
 - **Receive timestamps of the host:** the kernel stamps received packets only
   while a socket asks for it, and turns that on a moment after the first one
-  does (`net_enable_timestamp`, through a work queue). Before the run,
-  `tstamp.Prepare` asks with a UDP socket on the loopback device, sends to it
-  until a datagram is stamped, and keeps it open until the end.
+  does (`net_enable_timestamp`, through a work queue). Before the clock of
+  the run starts, the command calls `tstamp.Prepare` once, which asks with a
+  UDP socket on the loopback device, sends to it until a datagram is stamped
+  (in about a millisecond), and keeps it open until the end. If that fails,
+  the first round trips may miss their receive timestamps; if the kernel
+  cannot timestamp at all, the run fails.
+- **Kernels:** `SO_TIMESTAMPING_NEW` (Linux 5.1) has 64-bit timestamps on
+  every architecture; on 64-bit ones, older kernels fall back to
+  `SO_TIMESTAMPING`, whose layout is then the same.
 - **Default path:** without the option, the echo is still read with
-  `io.ReadFull`, and nothing else changes.
+  `io.ReadFull`, and nothing else changes inside the clock.
+- **Cost:** inside the clock, the `recvmsg(2)` of the echo, and the wakeup
+  of the reading goroutine by the error event of each transmit timestamp.
 
 The `Recorder` keeps the parts in three `Histogram`s, and counts the round
-trips with a breakdown, missing a timestamp, and with a negative part, which
-add up to the count of the run.
+trips with a breakdown, missing a timestamp, with their echo out of order,
+and with a negative part, which add up to the count of the run.
 
 ## 4. Statistics
 

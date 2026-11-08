@@ -218,3 +218,62 @@ func FuzzEachMessage(f *testing.F) {
 		}
 	})
 }
+
+// TestReadFullErrorEvent reads echoes while transmit timestamps are queued
+// on a socket that is neither readable nor writable: a message larger than
+// its send buffer. The poller then sees an error event alone (EPOLLERR) and
+// would refuse to wait for the socket ("not pollable").
+func TestReadFullErrorEvent(t *testing.T) {
+	client, server := echoPair(t)
+	if err := client.(*net.TCPConn).SetWriteBuffer(8192); err != nil {
+		t.Fatal(err)
+	}
+	go func() { _, _ = io.Copy(server, server) }()
+	ts, err := Enable(client.(*net.TCPConn))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := make([]byte, 32*1024)
+	echo := make([]byte, len(msg))
+	_ = client.SetDeadline(time.Now().Add(10 * time.Second))
+	for i := range 20 {
+		written := make(chan error, 1)
+		go func() {
+			_, err := client.Write(msg)
+			written <- err
+		}()
+		if _, err := ts.ReadFull(echo); err != nil {
+			t.Fatalf("round trip %d: %v", i, err)
+		}
+		if err := <-written; err != nil {
+			t.Fatal(err)
+		}
+		if err := ts.Drain(); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := ts.Transmitted(uint32((i+1)*len(msg) - 1)); !ok {
+			t.Logf("round trip %d: no transmit timestamp of its last byte", i)
+		}
+	}
+}
+
+func TestOutOfOrder(t *testing.T) {
+	client, server := echoPair(t)
+	ts, err := Enable(client.(*net.TCPConn))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Write([]byte("in order")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ts.ReadFull(make([]byte, 8)); err != nil {
+		t.Fatal(err)
+	}
+	n, ok, err := ts.OutOfOrder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok && n != 0 {
+		t.Fatalf("%d packets out of order over loopback, want 0", n)
+	}
+}

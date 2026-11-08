@@ -31,3 +31,6 @@ func (*Conn) Forget(uint32) {}
 
 // Prepare is not supported on this platform.
 func Prepare(time.Duration) (func(), error) { return nil, errors.ErrUnsupported }
+
+// OutOfOrder is not supported on this platform.
+func (*Conn) OutOfOrder() (uint32, bool, error) { return 0, false, errors.ErrUnsupported }

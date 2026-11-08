@@ -16,3 +16,7 @@ import "errors"
 // handshake to the first write), or with bytes written and not acknowledged
 // on a kernel without OPT_ID_TCP.
 var ErrNotReady = errors.New("the connection's stream is not at a known offset")
+
+// ErrNoTimestamping is returned when the kernel cannot timestamp: it lacks
+// SO_TIMESTAMPING_NEW (Linux 5.1) on a 32-bit architecture, or both options.
+var ErrNoTimestamping = errors.New("the kernel has no SO_TIMESTAMPING")

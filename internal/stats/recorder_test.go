@@ -195,9 +195,10 @@ func TestRecorderBreakdown(t *testing.T) {
 	}
 	r.RecordMissingBreakdown()
 	r.RecordMissingBreakdown()
+	r.RecordOutOfOrderBreakdown()
 	r.RecordNegativeBreakdown()
 	s := r.Breakdown()
-	if s.RoundTrips != 100 || s.Missing != 2 || s.Negative != 1 {
+	if s.RoundTrips != 100 || s.Missing != 2 || s.OutOfOrder != 1 || s.Negative != 1 {
 		t.Fatalf("counts = %+v", s)
 	}
 	// Nearest rank, within the 1/128 of the histogram.

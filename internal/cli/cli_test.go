@@ -739,7 +739,7 @@ func TestClientLatencyBreakdown(t *testing.T) {
 		// Every round trip is accounted for once. The first round trip of a
 		// connection opened with TCP Fast Open has no timestamps.
 		b := res.LatencyBreakdown
-		if b == nil || res.Count != 20 || b.RoundTrips+b.Missing+b.Negative != res.Count || b.Missing > 2 || b.Negative != 0 {
+		if b == nil || res.Count != 20 || b.RoundTrips+b.Missing+b.OutOfOrder+b.Negative != res.Count || b.Missing > 2 || b.Negative != 0 {
 			t.Errorf("result %d = %+v, latency_breakdown %+v; want 20 round trips split", i, res, b)
 		}
 	}

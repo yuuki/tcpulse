@@ -5,13 +5,18 @@ import "time"
 // BreakdownSummary describes how the round trips of a run split into send,
 // network and receive time, by the kernel's timestamps of the last byte of
 // each message (--latency-breakdown). Every completed round trip counts
-// once: with a breakdown, missing a timestamp, or with a negative part.
+// once: with a breakdown, missing a timestamp, with its echo out of order,
+// or with a negative part.
 type BreakdownSummary struct {
 	// RoundTrips is the number of completed round trips with a breakdown.
 	RoundTrips int64
 	// Missing is the number of completed round trips without one, for
 	// lack of a timestamp that it needs.
 	Missing int64
+	// OutOfOrder is the number of completed round trips whose echo had
+	// packets out of order: an earlier one lost or reordered on the way
+	// back, whose wait the receive part would take.
+	OutOfOrder int64
 	// Negative is the number of completed round trips whose breakdown had
 	// a negative part, which would come from a step of the system clock or
 	// from packets reordered: their breakdown is not used.
@@ -58,6 +63,14 @@ func (r *Recorder) RecordMissingBreakdown() {
 	r.breakdownMu.Lock()
 	defer r.breakdownMu.Unlock()
 	r.breakdown.summary.Missing++
+}
+
+// RecordOutOfOrderBreakdown counts a completed round trip whose echo had
+// packets out of order.
+func (r *Recorder) RecordOutOfOrderBreakdown() {
+	r.breakdownMu.Lock()
+	defer r.breakdownMu.Unlock()
+	r.breakdown.summary.OutOfOrder++
 }
 
 // RecordNegativeBreakdown counts a completed round trip whose breakdown had

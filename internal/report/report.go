@@ -65,8 +65,8 @@ const (
 	// output.
 	EventSeparator = "--- Kernel events of the round trips (eBPF) ---"
 
-	breakdownHeaderFormat = "%-20s %-10s %-10s %-10s %-15s %-15s %-15s %-15s %-15s %-15s\n"
-	breakdownLineFormat   = "%-20s %-10d %-10d %-10d %-15d %-15d %-15d %-15d %-15d %-15d\n"
+	breakdownHeaderFormat = "%-20s %-10s %-10s %-12s %-10s %-15s %-15s %-15s %-15s %-15s %-15s\n"
+	breakdownLineFormat   = "%-20s %-10d %-10d %-12d %-10d %-15d %-15d %-15d %-15d %-15d %-15d\n"
 	// BreakdownSeparator precedes the breakdown of the round trips in text
 	// output.
 	BreakdownSeparator = "--- Breakdown of the round trips (SO_TIMESTAMPING) ---"
@@ -126,13 +126,13 @@ func (p *Printer) breakdownReport(results []Result) error {
 		}
 		if !header {
 			if err := p.printf("%s\n"+breakdownHeaderFormat, BreakdownSeparator,
-				"PEER", "SPLIT_RTS", "MISSING", "NEGATIVE", "SEND_50p(µs)", "SEND_99p(µs)",
+				"PEER", "SPLIT_RTS", "MISSING", "OUT_OF_ORDER", "NEGATIVE", "SEND_50p(µs)", "SEND_99p(µs)",
 				"NET_50p(µs)", "NET_99p(µs)", "RECV_50p(µs)", "RECV_99p(µs)"); err != nil {
 				return err
 			}
 			header = true
 		}
-		if err := p.printf(breakdownLineFormat, r.Peer, b.RoundTrips, b.Missing, b.Negative,
+		if err := p.printf(breakdownLineFormat, r.Peer, b.RoundTrips, b.Missing, b.OutOfOrder, b.Negative,
 			b.Send.P50.Microseconds(), b.Send.P99.Microseconds(),
 			b.Network.P50.Microseconds(), b.Network.P99.Microseconds(),
 			b.Receive.P50.Microseconds(), b.Receive.P99.Microseconds()); err != nil {
@@ -236,6 +236,7 @@ type JSONLinesResult struct {
 type JSONLinesBreakdown struct {
 	RoundTrips int64 `json:"round_trips"`
 	Missing    int64 `json:"missing_timestamps"`
+	OutOfOrder int64 `json:"out_of_order"`
 	Negative   int64 `json:"negative_parts"`
 	Send50p    int64 `json:"send_50p_us"`
 	Send99p    int64 `json:"send_99p_us"`
@@ -252,6 +253,7 @@ func jsonLinesBreakdown(b *stats.BreakdownSummary) *JSONLinesBreakdown {
 	return &JSONLinesBreakdown{
 		RoundTrips: b.RoundTrips,
 		Missing:    b.Missing,
+		OutOfOrder: b.OutOfOrder,
 		Negative:   b.Negative,
 		Send50p:    b.Send.P50.Microseconds(),
 		Send99p:    b.Send.P99.Microseconds(),
