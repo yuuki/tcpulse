@@ -419,3 +419,92 @@ func TestCutOff(t *testing.T) {
 		}
 	}
 }
+
+// silentServer accepts TCP connections and reads from them without ever
+// answering, until the test ends.
+func silentServer(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = io.Copy(io.Discard, conn)
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func TestRunStopsWhenCanceledDuringARequest(t *testing.T) {
+	blackhole, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Not defer: the parallel subtests run after this function returns.
+	t.Cleanup(func() { _ = blackhole.Close() })
+
+	for _, tc := range []struct {
+		name     string
+		protocol string
+		flavor   string
+		addr     string
+	}{
+		{"tcp persistent", ProtocolTCP, FlavorPersistent, silentServer(t)},
+		{"tcp ephemeral", ProtocolTCP, FlavorEphemeral, silentServer(t)},
+		{"udp", ProtocolUDP, FlavorPersistent, blackhole.LocalAddr().String()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := config(tc.protocol, tc.flavor)
+			cfg.Duration = time.Minute
+			ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+			defer cancel()
+
+			// Every request waits for an echo that never comes: canceling
+			// the run must interrupt them, not wait for its end.
+			start := time.Now()
+			rec := stats.NewRecorder()
+			if err := Run(ctx, cfg, tc.addr, rec); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if elapsed := time.Since(start); elapsed > 5*time.Second {
+				t.Fatalf("Run returned %v after its context was canceled at 300ms", elapsed)
+			}
+			if got := rec.Total().Count; got != 0 {
+				t.Fatalf("%d round trips without an echo", got)
+			}
+		})
+	}
+}
+
+// TestRunMessagesLargerThanSocketBuffers sends messages that do not fit in
+// the socket buffers of both sides, which only complete when the echo is
+// read while the message is written. Serial and light: copying 16 MiB under
+// the race detector is slow.
+func TestRunMessagesLargerThanSocketBuffers(t *testing.T) {
+	for _, flavor := range []string{FlavorPersistent, FlavorEphemeral} {
+		t.Run(flavor, func(t *testing.T) {
+			cfg := config(ProtocolTCP, flavor)
+			cfg.Connections = 1
+			cfg.Rate = 2
+			cfg.Duration = 2 * time.Second
+			cfg.MessageBytes = 16 << 20
+			rec := stats.NewRecorder()
+			if err := Run(t.Context(), cfg, echoServer(t, ProtocolTCP), rec); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if got := rec.Total().Count; got != 4 {
+				t.Fatalf("%d round trips, want 4", got)
+			}
+		})
+	}
+}

@@ -114,26 +114,24 @@ func (r *run) messages() int64 {
 	return rate*int64(d/time.Second) + rate*int64(d%time.Second)/int64(time.Second)
 }
 
-// measure records how long f takes, if it succeeds. The message must be
-// ready before: generating it is not part of the round trip. A request that
-// failed with errTolerated, or that the end of the run cut off, is neither
-// recorded nor an error.
-func (r *run) measure(ctx context.Context, f func() error) error {
-	start := time.Now()
-	if err := f(); err != nil {
+// finish records a round trip that took elapsed, or returns the error of a
+// failed request. A request that failed with errTolerated, or that the end
+// of the run cut off, is neither recorded nor an error.
+func (r *run) finish(ctx context.Context, elapsed time.Duration, err error) error {
+	if err != nil {
 		if errors.Is(err, errTolerated) || cutOff(ctx, err) {
 			return nil
 		}
 		return err
 	}
-	r.rec.Record(time.Since(start))
+	r.rec.Record(elapsed)
 	return nil
 }
 
 // cutOff reports whether err comes from the end of the run, ctx, rather than
 // from the connection: either ctx is done, or err is a timeout (of a dial,
 // or of the connection deadline, which is the deadline of ctx: see
-// setDeadline) and the deadline of ctx has passed. The I/O can time out a
+// bindToRun) and the deadline of ctx has passed. The I/O can time out a
 // moment before ctx reports it.
 func cutOff(ctx context.Context, err error) bool {
 	if ctx.Err() != nil {
@@ -169,11 +167,62 @@ func waitLimit(ctx context.Context, rl ratelimit.Limiter) error {
 	}
 }
 
-// setDeadline makes the I/O on conn give up when ctx ends.
-func setDeadline(ctx context.Context, conn net.Conn) {
+// bindToRun makes the I/O on conn give up when the run ends: at the deadline
+// of ctx, or at once when ctx is canceled (Ctrl-C, another peer failing).
+// The returned function releases conn from ctx.
+func bindToRun(ctx context.Context, conn net.Conn) (release func() bool) {
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}
+	return context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+}
+
+// concurrentEchoBytes is the size above which a TCP message is written while
+// its echo is read. The server writes back as it reads, so when a message
+// does not fit in the socket buffers of both sides, writing all of it before
+// reading would block the client and the server on each other.
+const concurrentEchoBytes = 64 * 1024
+
+// exchange writes msg on conn and reads its whole echo into echo, which may
+// be msg itself when msg is at most concurrentEchoBytes long. The echo of a
+// message larger than a segment, or than the server's buffer, arrives in
+// several reads.
+func exchange(conn net.Conn, msg, echo []byte) error {
+	if len(msg) <= concurrentEchoBytes {
+		if _, err := conn.Write(msg); err != nil {
+			return fmt.Errorf("writing to connection: %w", err)
+		}
+		if _, err := io.ReadFull(conn, echo); err != nil {
+			return fmt.Errorf("reading from connection: %w", err)
+		}
+		return nil
+	}
+
+	written := make(chan error, 1)
+	go func() {
+		_, err := conn.Write(msg)
+		written <- err
+	}()
+	_, readErr := io.ReadFull(conn, echo)
+	if readErr != nil {
+		// Unblock the write: the connection is done.
+		_ = conn.SetDeadline(time.Now())
+	}
+	if err := <-written; err != nil {
+		return fmt.Errorf("writing to connection: %w", err)
+	}
+	if readErr != nil {
+		return fmt.Errorf("reading from connection: %w", readErr)
+	}
+	return nil
+}
+
+// echoBuffer returns the buffer exchange reads the echo of msg into.
+func echoBuffer(msg []byte) []byte {
+	if len(msg) <= concurrentEchoBytes {
+		return msg
+	}
+	return make([]byte, len(msg))
 }
 
 func (r *run) persistent(ctx context.Context) error {
@@ -192,27 +241,24 @@ func (r *run) persistent(ctx context.Context) error {
 				return fmt.Errorf("dialing %q: %w", r.addr, err)
 			}
 			defer func() { _ = conn.Close() }()
-			setDeadline(ctx, conn)
+			defer bindToRun(ctx, conn)()
 
 			msg := make([]byte, r.cfg.MessageBytes)
+			echo := echoBuffer(msg)
 			limiter := ratelimit.New(r.cfg.Rate)
 			for range r.messages() {
 				if err := waitLimit(ctx, limiter); err != nil {
 					return nil
 				}
 				fill(msg)
-				if err := r.measure(ctx, func() error {
-					if _, err := conn.Write(msg); err != nil {
-						return fmt.Errorf("writing to connection: %w", err)
-					}
-					// The echo of a message larger than a segment, or than
-					// the server's buffer, arrives in several reads.
-					if _, err := io.ReadFull(conn, msg); err != nil {
-						return fmt.Errorf("reading from connection: %w", err)
-					}
-					return nil
-				}); err != nil {
+				start := time.Now()
+				err := exchange(conn, msg, echo)
+				if err := r.finish(ctx, time.Since(start), err); err != nil {
 					return err
+				}
+				if err != nil {
+					// Cut off by the end of the run.
+					return nil
 				}
 			}
 			return nil
@@ -235,46 +281,51 @@ func (r *run) ephemeral(ctx context.Context) error {
 		eg.Go(func() error {
 			msgp := r.bufPool.Get().(*[]byte)
 			defer r.bufPool.Put(msgp)
-			fill(*msgp)
-			return r.measure(ctx, func() error {
-				return r.ephemeralRequest(ctx, &dialer, *msgp)
-			})
+			msg, echo := *msgp, *msgp
+			if len(msg) > concurrentEchoBytes {
+				echop := r.bufPool.Get().(*[]byte)
+				defer r.bufPool.Put(echop)
+				echo = *echop
+			}
+			fill(msg)
+			elapsed, err := r.ephemeralRequest(ctx, &dialer, msg, echo)
+			return r.finish(ctx, elapsed, err)
 		})
 	}
 	return eg.Wait()
 }
 
-func (r *run) ephemeralRequest(ctx context.Context, dialer *net.Dialer, msg []byte) error {
+// ephemeralRequest connects, sends msg, reads its echo and returns how long
+// that took; the connection is closed after the clock stops.
+func (r *run) ephemeralRequest(ctx context.Context, dialer *net.Dialer, msg, echo []byte) (time.Duration, error) {
+	start := time.Now()
 	conn, err := dialer.DialContext(ctx, "tcp", r.addr)
 	if err != nil {
 		if errors.Is(err, syscall.ETIMEDOUT) {
 			r.logger.Warn("connection timeout", "addr", r.addr)
-			return errTolerated
+			return 0, errTolerated
 		}
-		return fmt.Errorf("dialing %q: %w", r.addr, err)
+		return 0, fmt.Errorf("dialing %q: %w", r.addr, err)
 	}
 	defer func() { _ = conn.Close() }()
-	setDeadline(ctx, conn)
+	defer bindToRun(ctx, conn)()
 
 	if err := sockopt.SetQuickAck(conn); err != nil {
-		return fmt.Errorf("setting quick ack: %w", err)
+		return 0, fmt.Errorf("setting quick ack: %w", err)
 	}
 
-	if _, err := conn.Write(msg); err != nil {
-		if errors.Is(err, syscall.EINPROGRESS) {
+	if err := exchange(conn, msg, echo); err != nil {
+		switch {
+		case errors.Is(err, syscall.EINPROGRESS):
 			r.logger.Warn("write in progress", "addr", r.addr)
-			return errTolerated
-		}
-		return fmt.Errorf("writing to connection: %w", err)
-	}
-	if _, err := io.ReadFull(conn, msg); err != nil {
-		if errors.Is(err, syscall.ECONNRESET) {
+			return 0, errTolerated
+		case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE):
 			r.logger.Warn("connection reset", "addr", r.addr)
-			return errTolerated
+			return 0, errTolerated
 		}
-		return fmt.Errorf("reading from connection: %w", err)
+		return 0, err
 	}
-	return nil
+	return time.Since(start), nil
 }
 
 func (r *run) udp(ctx context.Context) error {
@@ -292,27 +343,29 @@ func (r *run) udp(ctx context.Context) error {
 			msgp := r.bufPool.Get().(*[]byte)
 			defer r.bufPool.Put(msgp)
 			fill(*msgp)
-			return r.measure(ctx, func() error {
-				return r.udpRequest(ctx, &dialer, *msgp)
-			})
+			elapsed, err := r.udpRequest(ctx, &dialer, *msgp)
+			return r.finish(ctx, elapsed, err)
 		})
 	}
 	return eg.Wait()
 }
 
-func (r *run) udpRequest(ctx context.Context, dialer *net.Dialer, msg []byte) error {
+// udpRequest sends msg from a new socket, reads its echo and returns how long
+// that took; the socket is closed after the clock stops.
+func (r *run) udpRequest(ctx context.Context, dialer *net.Dialer, msg []byte) (time.Duration, error) {
+	start := time.Now()
 	conn, err := dialer.DialContext(ctx, "udp4", r.addr)
 	if err != nil {
-		return fmt.Errorf("dialing UDP %q: %w", r.addr, err)
+		return 0, fmt.Errorf("dialing UDP %q: %w", r.addr, err)
 	}
 	defer func() { _ = conn.Close() }()
-	setDeadline(ctx, conn)
+	defer bindToRun(ctx, conn)()
 
 	if _, err := conn.Write(msg); err != nil {
-		return fmt.Errorf("writing to UDP connection: %w", err)
+		return 0, fmt.Errorf("writing to UDP connection: %w", err)
 	}
 	if _, err := conn.Read(msg); err != nil {
-		return fmt.Errorf("reading from UDP connection: %w", err)
+		return 0, fmt.Errorf("reading from UDP connection: %w", err)
 	}
-	return nil
+	return time.Since(start), nil
 }
