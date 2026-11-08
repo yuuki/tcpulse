@@ -176,18 +176,28 @@ func validateClient(o *options) error {
 	if o.proto == client.ProtocolUDP && o.messageBytes > maxUDPMessageBytes {
 		return fmt.Errorf("--message-bytes must be at most %d with --proto udp, got %d", maxUDPMessageBytes, o.messageBytes)
 	}
-	// UDP has no TCP_INFO, and other platforms none that tcpulse reads.
-	if o.tcpInfo && o.proto != client.ProtocolTCP {
-		return errors.New("--tcp-info requires --proto tcp")
-	}
-	if o.tcpInfo && !client.TCPInfoSupported {
-		return errors.New("--tcp-info is only supported on Linux")
-	}
-	if o.kernelEvents && o.proto != client.ProtocolTCP {
-		return errors.New("--kernel-events requires --proto tcp")
-	}
-	if o.kernelEvents && !kevents.Supported {
-		return errors.New("--kernel-events is only supported on Linux")
+	return validateKernelOptions(o)
+}
+
+// validateKernelOptions rejects the options that read the kernel's view of
+// TCP connections (TCP_INFO, eBPF) where there is none: with UDP, or on a
+// platform other than Linux.
+func validateKernelOptions(o *options) error {
+	for _, opt := range []struct {
+		name      string
+		set       bool
+		supported bool
+	}{
+		{"--tcp-info", o.tcpInfo, client.TCPInfoSupported},
+		{"--kernel-events", o.kernelEvents, kevents.Supported},
+	} {
+		switch {
+		case !opt.set:
+		case o.proto != client.ProtocolTCP:
+			return fmt.Errorf("%s requires --proto tcp", opt.name)
+		case !opt.supported:
+			return fmt.Errorf("%s is only supported on Linux", opt.name)
+		}
 	}
 	return nil
 }
