@@ -102,6 +102,55 @@ func TestJSONLines(t *testing.T) {
 	}
 }
 
+var sampleConns = stats.ConnSummary{
+	Conns:         14799,
+	RetransConns:  12,
+	RetransSegs:   15,
+	SegsOut:       44410,
+	RTTMean:       187*time.Microsecond + 999*time.Nanosecond,
+	RTTP99:        412 * time.Microsecond,
+	RTTMax:        1003 * time.Microsecond,
+	FastOpenConns: 14798,
+}
+
+func TestReportTCPInfo(t *testing.T) {
+	var buf bytes.Buffer
+	err := NewPrinter(&buf).Report([]Result{
+		{Peer: "10.0.150.2:9200", Summary: sample, Conns: &sampleConns},
+		{Peer: "10.0.150.2:9300", Conns: &stats.ConnSummary{}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The rows of the run keep their columns; the TCP statistics follow
+	// with their own header.
+	want := ReportSeparator + "\n" +
+		wantLine +
+		"10.0.150.2:9300      0          0               0               0               0               0               0               0.00      \n" +
+		ConnSeparator + "\n" +
+		"PEER                 CONNS      RETRANS_CONNS   RETRANS_SEGS    SEGS_OUT        SRTT_MEAN(µs)   SRTT_99p(µs)    SRTT_MAX(µs)    TFO_CONNS \n" +
+		"10.0.150.2:9200      14799      12              15              44410           187             412             1003            14798     \n" +
+		"10.0.150.2:9300      0          0               0               0               0               0               0               0         \n"
+	if buf.String() != want {
+		t.Fatalf("report:\n got %q\nwant %q", buf.String(), want)
+	}
+}
+
+func TestJSONLinesTCPInfo(t *testing.T) {
+	var buf bytes.Buffer
+	p := NewPrinter(&buf)
+	p.now = func() time.Time { return time.Date(2025, 1, 7, 10, 30, 0, 0, time.UTC) }
+	if err := p.JSONLines([]Result{{Peer: "10.0.150.2:9200", Summary: sample, Conns: &sampleConns}}); err != nil {
+		t.Fatal(err)
+	}
+	// The fields of the run keep their names and order; tcp_info follows.
+	want := `{"peer":"10.0.150.2:9200","count":14799,"latency_max_us":13736,"latency_min_us":223,"latency_mean_us":530,"latency_90p_us":501,"latency_95p_us":953,"latency_99p_us":5989,"rate_per_sec":996,"timestamp":"2025-01-07T10:30:00Z",` +
+		`"tcp_info":{"connections":14799,"retrans_connections":12,"retrans_segments":15,"segments_out":44410,"srtt_mean_us":187,"srtt_99p_us":412,"srtt_max_us":1003,"fastopen_connections":14798}}` + "\n"
+	if buf.String() != want {
+		t.Fatalf("JSON Lines:\n got %s\nwant %s", buf.String(), want)
+	}
+}
+
 type failingWriter struct{}
 
 func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
@@ -109,10 +158,11 @@ func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("broken p
 func TestWriteErrors(t *testing.T) {
 	p := NewPrinter(failingWriter{})
 	for name, err := range map[string]error{
-		"Header":    p.Header(),
-		"Line":      p.Line(Result{Peer: "a:1"}),
-		"Report":    p.Report([]Result{{Peer: "a:1"}}),
-		"JSONLines": p.JSONLines([]Result{{Peer: "a:1"}}),
+		"Header":     p.Header(),
+		"Line":       p.Line(Result{Peer: "a:1"}),
+		"Report":     p.Report([]Result{{Peer: "a:1"}}),
+		"connReport": NewPrinter(failingWriter{}).connReport([]Result{{Peer: "a:1", Conns: &stats.ConnSummary{}}}),
+		"JSONLines":  p.JSONLines([]Result{{Peer: "a:1"}}),
 	} {
 		if err == nil {
 			t.Errorf("%s returned no error on a failing writer", name)

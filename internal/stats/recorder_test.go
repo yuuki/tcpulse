@@ -88,3 +88,57 @@ func TestSet(t *testing.T) {
 		t.Fatal("merged targets do not share a Recorder")
 	}
 }
+
+func TestRecorderConns(t *testing.T) {
+	r := NewRecorder()
+	if s := r.Conns(); s != (ConnSummary{}) {
+		t.Fatalf("no connection = %+v, want zero", s)
+	}
+	r.RecordConn(Conn{SegsOut: 10, RTT: 100 * time.Microsecond})
+	r.RecordConn(Conn{RetransSegs: 2, SegsOut: 12, RTT: 300 * time.Microsecond, FastOpen: true})
+	// An unanswered SYN: retransmitted, without an RTT.
+	r.RecordConn(Conn{RetransSegs: 4, SegsOut: 5})
+
+	want := ConnSummary{
+		Conns:         3,
+		RetransConns:  2,
+		RetransSegs:   6,
+		SegsOut:       27,
+		RTTMean:       200 * time.Microsecond, // the connection without an RTT does not count
+		RTTP99:        300 * time.Microsecond,
+		RTTMax:        300 * time.Microsecond,
+		FastOpenConns: 1,
+	}
+	if s := r.Conns(); s != want {
+		t.Fatalf("connections = %+v, want %+v", s, want)
+	}
+	// Round trips are counted apart.
+	if s := r.Total(time.Second); s.Count != 0 {
+		t.Fatalf("round trips = %+v, want none", s)
+	}
+}
+
+func TestRecorderConnsWithoutRTT(t *testing.T) {
+	r := NewRecorder()
+	r.RecordConn(Conn{RetransSegs: 6, SegsOut: 7})
+	if s := r.Conns(); s.Conns != 1 || s.RetransConns != 1 || s.RTTMean != 0 || s.RTTP99 != 0 || s.RTTMax != 0 {
+		t.Fatalf("connections = %+v, want one retransmitting connection and no RTT", s)
+	}
+}
+
+func TestRecorderConnsConcurrent(t *testing.T) {
+	r := NewRecorder()
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 100 {
+				r.RecordConn(Conn{RetransSegs: 1, SegsOut: 3, RTT: time.Millisecond})
+				r.Record(time.Millisecond)
+			}
+		})
+	}
+	wg.Wait()
+	if s := r.Conns(); s.Conns != 800 || s.RetransSegs != 800 || s.SegsOut != 2400 || s.RTTMax != time.Millisecond {
+		t.Fatalf("connections = %+v, want 800", s)
+	}
+}

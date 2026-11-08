@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yuuki/tcpulse/internal/client"
 	"github.com/yuuki/tcpulse/internal/report"
 	"github.com/yuuki/tcpulse/internal/server"
 )
@@ -80,6 +81,7 @@ func TestParseEnvironment(t *testing.T) {
 		"TCPULSE_RATE":          "1000", // the command line takes precedence
 		"TCPULSE_MESSAGE_BYTES": "1024",
 		"TCPULSE_DURATION":      "3s",
+		"TCPULSE_TCP_INFO":      "true",
 		"TCPULSE_FLAVOR":        "", // empty: ignored
 		"TCPULSE_VERSION":       "true",
 		"TCPULSE_HELP":          "true",
@@ -87,7 +89,7 @@ func TestParseEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !o.client || o.rate != 7 || o.messageBytes != 1024 || o.duration != 3*time.Second || o.flavor != "persistent" {
+	if !o.client || o.rate != 7 || o.messageBytes != 1024 || o.duration != 3*time.Second || o.flavor != "persistent" || !o.tcpInfo {
 		t.Fatalf("options = %+v", *o)
 	}
 	if o.showVersion || o.showHelp {
@@ -173,6 +175,7 @@ func TestMainHelp(t *testing.T) {
 		for _, want := range []string{
 			"\n  -c, --client                     run in client mode\n",
 			"\n      --message-bytes int32        [client mode] TCP/UDP message size (bytes) (default 64)\n",
+			"\n      --tcp-info                   [client mode] report TCP statistics of the connections read from the kernel (TCP_INFO, Linux only)\n",
 			"TCPULSE_MESSAGE_BYTES=1024",
 			"Examples:",
 		} {
@@ -208,6 +211,7 @@ func TestMainUsageErrors(t *testing.T) {
 		{"no interval", []string{"-c", "--interval", "0s", "host:1"}, exitError, "--interval must be positive"},
 		{"empty messages", []string{"-c", "--message-bytes", "0", "host:1"}, exitError, "--message-bytes must be at least 1"},
 		{"oversized datagrams", []string{"-c", "--proto", "udp", "--message-bytes", "65508", "host:1"}, exitError, "at most 65507"},
+		{"TCP_INFO of UDP", []string{"-c", "--proto", "udp", "--tcp-info", "host:1"}, exitError, "--tcp-info requires --proto tcp"},
 		{"unknown server protocol", []string{"-s", "--protocol", "sctp"}, exitError, `unexpected protocol "sctp"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -317,8 +321,56 @@ func TestClientJSONLines(t *testing.T) {
 				if _, err := time.Parse(time.RFC3339, res.Timestamp); err != nil {
 					t.Errorf("timestamp %q: %v", res.Timestamp, err)
 				}
+				if res.TCPInfo != nil {
+					t.Errorf("result %d has tcp_info without --tcp-info", i)
+				}
 			}
 		})
+	}
+}
+
+func TestClientTCPInfo(t *testing.T) {
+	addrs := echoServers(t, server.ProtocolTCP, 2)
+	args := append([]string{"-c", "--jsonlines", "--tcp-info", "--connections", "2", "--rate", "10", "--duration", "1s"}, addrs...)
+	r := runMain(t.Context(), noEnvironment, args...)
+	if !client.TCPInfoSupported {
+		if r.code != exitError || !strings.Contains(r.stderr, "--tcp-info is only supported on Linux") {
+			t.Fatalf("exit %d, stderr %q; want --tcp-info refused", r.code, r.stderr)
+		}
+		return
+	}
+	if r.code != 0 {
+		t.Fatalf("exit %d: %s", r.code, r.stderr)
+	}
+	results := decodeJSONLines(t, r.stdout)
+	if len(results) != len(addrs) {
+		t.Fatalf("%d results, want %d:\n%s", len(results), len(addrs), r.stdout)
+	}
+	for i, res := range results {
+		info := res.TCPInfo
+		if res.Count != 20 || info == nil || info.Connections != 2 || info.SegmentsOut < 20 || info.SRTTMax < info.SRTTMean {
+			t.Errorf("result %d = %+v, tcp_info %+v; want 20 round trips over 2 connections", i, res, info)
+		}
+	}
+}
+
+func TestClientTCPInfoMergedText(t *testing.T) {
+	if !client.TCPInfoSupported {
+		t.Skip("TCP_INFO is read on Linux only")
+	}
+	addrs := echoServers(t, server.ProtocolTCP, 2)
+	args := append([]string{"-c", "--show-only-results", "--merge-results-each-host", "--tcp-info", "--flavor", "ephemeral", "--rate", "10", "--duration", "1s"}, addrs...)
+	r := runMain(t.Context(), noEnvironment, args...)
+	if r.code != 0 {
+		t.Fatalf("exit %d: %s", r.code, r.stderr)
+	}
+	lines := strings.Split(strings.TrimSuffix(r.stdout, "\n"), "\n")
+	if len(lines) != 6 || lines[1] != report.ReportSeparator || lines[3] != report.ConnSeparator || !strings.HasPrefix(lines[4], "PEER                 CONNS ") {
+		t.Fatalf("output:\n%s", r.stdout)
+	}
+	// One connection per message of each host.
+	if fields := strings.Fields(lines[5]); fields[0] != "merged(2" || fields[2] != "20" {
+		t.Fatalf("TCP statistics %q, want 20 connections of 2 hosts", lines[5])
 	}
 }
 
@@ -489,6 +541,7 @@ func FuzzParse(f *testing.F) {
 	f.Add("-s --protocol udp 127.0.0.1:0", "TCPULSE_LISTEN_ADDRS_FILE=")
 	f.Add("--connections=-1 --interval=0s -c a", "TCPULSE_FLAVOR=ephemeral\nTCPULSE_DURATION=1ns")
 	f.Add("-c --rate 1 --duration 999ms a", "TCPULSE_RATE=x")
+	f.Add("-c --tcp-info a", "TCPULSE_PROTO=udp")
 	f.Fuzz(func(t *testing.T, cmdline, env string) {
 		vars := map[string]string{}
 		for _, kv := range strings.Split(env, "\n") {
@@ -523,6 +576,9 @@ func FuzzParse(f *testing.F) {
 		}
 		if o.proto == "udp" && o.messageBytes > maxUDPMessageBytes {
 			t.Fatalf("accepted %d-byte datagrams", o.messageBytes)
+		}
+		if o.tcpInfo && (o.proto != "tcp" || !client.TCPInfoSupported) {
+			t.Fatalf("accepted --tcp-info with --proto %s (supported: %v)", o.proto, client.TCPInfoSupported)
 		}
 	})
 }

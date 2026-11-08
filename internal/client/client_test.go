@@ -95,6 +95,91 @@ func TestRun(t *testing.T) {
 	}
 }
 
+func TestRunTCPInfo(t *testing.T) {
+	if !TCPInfoSupported {
+		t.Skip("TCP_INFO is read on Linux only")
+	}
+	for _, tc := range []struct {
+		name      string
+		flavor    string
+		wantConns int64
+		wantCount int64
+	}{
+		// One per connection, read when it ends.
+		{"persistent", FlavorPersistent, 2, 20},
+		// One per message.
+		{"ephemeral", FlavorEphemeral, 10, 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			addr := echoServer(t, server.ProtocolTCP)
+			cfg := config(ProtocolTCP, tc.flavor)
+			cfg.TCPInfo = true
+			rec := stats.NewRecorder()
+			if err := Run(t.Context(), cfg, addr, rec); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			conns := rec.Conns()
+			// Every message is at least one segment.
+			if conns.Conns != tc.wantConns || conns.SegsOut < tc.wantCount || conns.RTTMax <= 0 {
+				t.Fatalf("connections = %+v, want %d with segments and RTTs", conns, tc.wantConns)
+			}
+			if conns.RetransConns > conns.Conns || conns.FastOpenConns > conns.Conns || conns.RTTMean > conns.RTTMax {
+				t.Fatalf("inconsistent connections: %+v", conns)
+			}
+			// Reading TCP_INFO loses no round trip.
+			if total := rec.Total(time.Second); total.Count != tc.wantCount {
+				t.Fatalf("%d round trips, want %d", total.Count, tc.wantCount)
+			}
+		})
+	}
+}
+
+func TestRunTCPInfoOfUnansweredConnections(t *testing.T) {
+	if !TCPInfoSupported {
+		t.Skip("TCP_INFO is read on Linux only")
+	}
+	for _, tc := range []struct {
+		name      string
+		flavor    string
+		wantConns int64
+	}{
+		{"persistent", FlavorPersistent, 2},
+		// rate × duration
+		{"ephemeral", FlavorEphemeral, 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := config(ProtocolTCP, tc.flavor)
+			cfg.Duration = 500 * time.Millisecond
+			cfg.TCPInfo = true
+			rec := stats.NewRecorder()
+			if err := Run(t.Context(), cfg, silentServer(t), rec); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			// The end of the run cuts off every request: no round trip,
+			// but every connection is read.
+			if total := rec.Total(time.Second); total.Count != 0 {
+				t.Fatalf("%d round trips, want none", total.Count)
+			}
+			if conns := rec.Conns(); conns.Conns != tc.wantConns || conns.SegsOut < tc.wantConns {
+				t.Fatalf("connections = %+v, want %d", conns, tc.wantConns)
+			}
+		})
+	}
+}
+
+func TestRunWithoutTCPInfo(t *testing.T) {
+	addr := echoServer(t, server.ProtocolTCP)
+	rec := stats.NewRecorder()
+	if err := Run(t.Context(), config(ProtocolTCP, FlavorEphemeral), addr, rec); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if conns := rec.Conns(); conns != (stats.ConnSummary{}) {
+		t.Fatalf("connections = %+v, want none recorded", conns)
+	}
+}
+
 func TestRunStopsWhenCanceled(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

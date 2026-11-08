@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -74,4 +75,42 @@ func SetQuickAck(conn net.Conn) error {
 		return fmt.Errorf("setting TCP_QUICKACK on %s: %w", conn.RemoteAddr(), err)
 	}
 	return nil
+}
+
+// TCPInfoSupported reports whether ReadTCPInfo works on this platform.
+const TCPInfoSupported = true
+
+// tcpiOptSYNData is TCPI_OPT_SYN_DATA of tcpi_options (linux/tcp.h): the
+// SYN-ACK acknowledged the data sent in the SYN.
+const tcpiOptSYNData = 32
+
+// ReadTCPInfo returns what the kernel reports of a TCP connection
+// (getsockopt TCP_INFO).
+func ReadTCPInfo(conn net.Conn) (TCPInfo, error) {
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		return TCPInfo{}, fmt.Errorf("not a TCP connection: %T", conn)
+	}
+	raw, err := tcpConn.SyscallConn()
+	if err != nil {
+		return TCPInfo{}, fmt.Errorf("getting the socket of %s: %w", conn.RemoteAddr(), err)
+	}
+	var (
+		info    *unix.TCPInfo
+		infoErr error
+	)
+	if err := raw.Control(func(fd uintptr) {
+		info, infoErr = unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO)
+	}); err != nil {
+		return TCPInfo{}, fmt.Errorf("reading TCP_INFO of %s: %w", conn.RemoteAddr(), err)
+	}
+	if infoErr != nil {
+		return TCPInfo{}, fmt.Errorf("reading TCP_INFO of %s: %w", conn.RemoteAddr(), infoErr)
+	}
+	return TCPInfo{
+		RetransSegs: info.Total_retrans,
+		SegsOut:     info.Segs_out,
+		RTT:         time.Duration(info.Rtt) * time.Microsecond,
+		FastOpen:    info.Options&tcpiOptSYNData != 0,
+	}, nil
 }

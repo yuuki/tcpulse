@@ -17,6 +17,9 @@ import (
 type Result struct {
 	Peer    string
 	Summary stats.Summary
+	// Conns describes the TCP connections of the run when it read their
+	// TCP_INFO (--tcp-info), and is nil otherwise.
+	Conns *stats.ConnSummary
 }
 
 // MergedPeer is the peer name of the merged result of n peers.
@@ -43,6 +46,11 @@ const (
 	lineFormat   = "%-20s %-10d %-15d %-15d %-15d %-15d %-15d %-15d %-10.2f\n"
 	// ReportSeparator precedes the results of the whole run in text output.
 	ReportSeparator = "--- A result during total execution time ---"
+
+	connLineFormat = "%-20s %-10d %-15d %-15d %-15d %-15d %-15d %-15d %-10d\n"
+	// ConnSeparator precedes the TCP statistics of the connections in text
+	// output.
+	ConnSeparator = "--- TCP statistics of the connections (TCP_INFO) ---"
 )
 
 // Header writes the column header of the text output.
@@ -69,13 +77,47 @@ func (p *Printer) Line(r Result) error {
 }
 
 // Report writes the results of the whole run as text: a separator line,
-// then one row per result.
+// then one row per result. The results that describe their TCP connections
+// follow in a section of their own, with its own header, so that the rows
+// above keep the columns of the header that starts the output.
 func (p *Printer) Report(results []Result) error {
 	if err := p.printf("%s\n", ReportSeparator); err != nil {
 		return err
 	}
 	for _, r := range results {
 		if err := p.Line(r); err != nil {
+			return err
+		}
+	}
+	return p.connReport(results)
+}
+
+func (p *Printer) connReport(results []Result) error {
+	header := false
+	for _, r := range results {
+		if r.Conns == nil {
+			continue
+		}
+		if !header {
+			if err := p.printf("%s\n"+headerFormat, ConnSeparator,
+				"PEER", "CONNS", "RETRANS_CONNS", "RETRANS_SEGS", "SEGS_OUT",
+				"SRTT_MEAN(µs)", "SRTT_99p(µs)", "SRTT_MAX(µs)", "TFO_CONNS"); err != nil {
+				return err
+			}
+			header = true
+		}
+		c := r.Conns
+		if err := p.printf(connLineFormat,
+			r.Peer,
+			c.Conns,
+			c.RetransConns,
+			c.RetransSegs,
+			c.SegsOut,
+			c.RTTMean.Microseconds(),
+			c.RTTP99.Microseconds(),
+			c.RTTMax.Microseconds(),
+			c.FastOpenConns,
+		); err != nil {
 			return err
 		}
 	}
@@ -94,6 +136,38 @@ type JSONLinesResult struct {
 	Latency99p  int64   `json:"latency_99p_us"`
 	Rate        float64 `json:"rate_per_sec"`
 	Timestamp   string  `json:"timestamp"`
+	// TCPInfo is only there when the run read the TCP_INFO of its
+	// connections (--tcp-info).
+	TCPInfo *JSONLinesTCPInfo `json:"tcp_info,omitempty"`
+}
+
+// JSONLinesTCPInfo is the JSON object of the TCP statistics of the
+// connections of a result.
+type JSONLinesTCPInfo struct {
+	Connections         int64 `json:"connections"`
+	RetransConnections  int64 `json:"retrans_connections"`
+	RetransSegments     int64 `json:"retrans_segments"`
+	SegmentsOut         int64 `json:"segments_out"`
+	SRTTMean            int64 `json:"srtt_mean_us"`
+	SRTT99p             int64 `json:"srtt_99p_us"`
+	SRTTMax             int64 `json:"srtt_max_us"`
+	FastOpenConnections int64 `json:"fastopen_connections"`
+}
+
+func jsonLinesTCPInfo(c *stats.ConnSummary) *JSONLinesTCPInfo {
+	if c == nil {
+		return nil
+	}
+	return &JSONLinesTCPInfo{
+		Connections:         c.Conns,
+		RetransConnections:  c.RetransConns,
+		RetransSegments:     c.RetransSegs,
+		SegmentsOut:         c.SegsOut,
+		SRTTMean:            c.RTTMean.Microseconds(),
+		SRTT99p:             c.RTTP99.Microseconds(),
+		SRTTMax:             c.RTTMax.Microseconds(),
+		FastOpenConnections: c.FastOpenConns,
+	}
 }
 
 // JSONLines writes the results of the whole run as JSON Lines, one object
@@ -116,6 +190,7 @@ func (p *Printer) JSONLines(results []Result) error {
 			Latency99p:  s.P99.Microseconds(),
 			Rate:        s.Rate,
 			Timestamp:   timestamp,
+			TCPInfo:     jsonLinesTCPInfo(r.Conns),
 		}); err != nil {
 			return fmt.Errorf("writing JSON Lines: %w", err)
 		}
