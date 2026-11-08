@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"syscall"
 	"testing"
@@ -102,8 +103,13 @@ func TestUDPEcho(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// 65507 bytes is the largest UDP payload over IPv4.
-	for _, size := range []int{1, 64, 1400, 4097, 9000, 65507} {
+	// 65507 bytes is the largest UDP payload over IPv4, but macOS sends at
+	// most net.inet.udp.maxdgram bytes, 9216 by default.
+	sizes := []int{1, 64, 1400, 4097, 9000, 65507}
+	if runtime.GOOS == "darwin" {
+		sizes = sizes[:len(sizes)-1]
+	}
+	for _, size := range sizes {
 		msg := randomBytes(size)
 		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 		if _, err := conn.Write(msg); err != nil {

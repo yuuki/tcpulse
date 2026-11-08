@@ -1,0 +1,99 @@
+name: Complexity
+
+# Measures Cognitive Complexity (SonarSource) and Cyclomatic Complexity (McCabe)
+# with cccc (https://github.com/moznion/cccc) and tracks them as custom metrics
+# in octocov (https://github.com/k1LoW/octocov): a pull request gets a comment
+# comparing them with main, and each push to main stores a report in the
+# octocov branch. Nothing fails on a score; what is analyzed is configured in
+# cccc.toml, and the octocov settings are in .octocov.complexity.yml.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  complexity:
+    name: Measure complexity
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # octocov stores the reports in the octocov branch
+      pull-requests: write # octocov comments on the pull request
+      actions: read # octocov reads the workflow run
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Measure complexity (cccc)
+        uses: moznion/cccc-action@1d5313811f8451953e46a268c61791a01e40b7df # v1.1.2
+        with:
+          version: v1.8.6
+          path: .
+          output-file: cccc.json
+
+      # Turn the summary of cccc into octocov custom metrics:
+      # https://github.com/k1LoW/octocov#custom-metrics
+      - name: Build octocov custom metrics
+        run: |
+          jq '{
+            key: "code_complexity",
+            name: "Code Complexity",
+            metrics: [
+              { key: "function_count",    name: "Function count",     value: .summary.function_count },
+              { key: "cognitive_sum",     name: "Cognitive: total",   value: .summary.cognitive.sum },
+              { key: "cognitive_max",     name: "Cognitive: max",     value: .summary.cognitive.max },
+              { key: "cognitive_median",  name: "Cognitive: median",  value: .summary.cognitive.median },
+              { key: "cognitive_p90",     name: "Cognitive: p90",     value: .summary.cognitive.p90 },
+              { key: "cyclomatic_sum",    name: "Cyclomatic: total",  value: .summary.cyclomatic.sum },
+              { key: "cyclomatic_max",    name: "Cyclomatic: max",    value: .summary.cyclomatic.max },
+              { key: "cyclomatic_median", name: "Cyclomatic: median", value: .summary.cyclomatic.median },
+              { key: "cyclomatic_p90",    name: "Cyclomatic: p90",    value: .summary.cyclomatic.p90 }
+            ]
+          }' cccc.json > custom_metrics_complexity.json
+          echo "::group::custom_metrics_complexity.json"
+          cat custom_metrics_complexity.json
+          echo "::endgroup::"
+
+      # For people: the hotspots behind the numbers.
+      - name: Write job summary
+        run: |
+          {
+            echo "## Top 20 functions by cognitive complexity"
+            echo
+            jq -r '.summary | select(.parse_error_file_count > 0)
+              | "\(.parse_error_count) parse error(s) in \(.parse_error_file_count) file(s); results for those files may be partial.\n"' cccc.json
+            echo "| Cognitive | Cyclomatic | Function | File:Line |"
+            echo "| ---: | ---: | --- | --- |"
+            jq -r '[ .files[] | (.path | ltrimstr("./")) as $p | .functions[] | recurse(.children[]?)
+                | { path: $p, name, line, cognitive, cyclomatic } ]
+              | sort_by(-.cognitive, -.cyclomatic) | .[:20][]
+              | "| \(.cognitive) | \(.cyclomatic) | `\(.name)` | \(.path):\(.line) |"' cccc.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # octocov stores its reports in the octocov branch but does not create
+      # it. Until it exists, skip octocov rather than fail; create it once
+      # with:
+      #   git switch --orphan octocov && git commit --allow-empty -m "octocov" && git push origin octocov
+      - name: Check for the octocov branch
+        id: octocov-branch
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if git ls-remote --exit-code --heads "https://github.com/$REPOSITORY" octocov >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No octocov branch: the metrics are not tracked (see .github/workflows/complexity.yml)."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Track the metrics (octocov)
+        if: steps.octocov-branch.outputs.exists == 'true'
+        uses: k1LoW/octocov-action@a167dc0dee441b7ffc45e1b862ab55ec0d87f278 # v1.5.2
+        with:
+          version: v0.83.3
+          config: .octocov.complexity.yml
+        env:
+          OCTOCOV_CUSTOM_METRICS_COMPLEXITY: custom_metrics_complexity.json

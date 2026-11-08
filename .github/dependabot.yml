@@ -1,0 +1,40 @@
+# Version updates arrive monthly, grouped into one PR per ecosystem, and only
+# after a release has been public for a week (compromised releases are usually
+# pulled within days). Security updates are not delayed by this schedule.
+#
+# Not covered here, so bump them by hand: the Go toolchain (go.mod, mise.toml
+# and the devcontainer together), the tool versions in the Makefile and the
+# matching `version:` inputs in .github/workflows, and the Alpine and Go base
+# images of Dockerfile and Dockerfile.goreleaser, referenced by tags.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+      include: scope
+
+  - package-ecosystem: gomod
+    directories: ["/"]
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      go-modules:
+        patterns: ["*"]
+    ignore:
+      # pflag 1.1 prints boolean options as --client[=true|false] in the help
+      # text (TestMainHelp in internal/cli).
+      - dependency-name: github.com/spf13/pflag
+        versions: [">= 1.1.0"]
+    commit-message:
+      prefix: build
+      include: scope

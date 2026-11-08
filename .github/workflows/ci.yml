@@ -1,0 +1,163 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # Weekly, for what changes without a commit (Go patch releases, runner
+  # images), and for a longer fuzz run.
+  schedule:
+    - cron: "17 3 * * 3"
+  # The release workflow runs CI on the tagged commit before releasing it.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  # "ci" keeps the group apart from the caller's when called by the release
+  # workflow (github.workflow is then the caller's name).
+  group: ${{ github.workflow }}-ci-${{ github.event.pull_request.number || github.ref }}
+  # Only a new push to a pull request cancels its previous run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # The released platforms.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Test
+        run: make test-race
+      - name: Build
+        run: make build
+      - name: Smoke test
+        run: |
+          ./tcpulse --version
+          ./tcpulse -s 127.0.0.1:9100 &
+          server=$!
+          sleep 1
+          ./tcpulse -c --jsonlines --connections 2 --rate 50 --duration 2s 127.0.0.1:9100
+          ./tcpulse -c --jsonlines --proto udp --rate 50 --duration 2s 127.0.0.1:9100
+          kill -TERM "$server"
+          wait "$server"
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # Same version as GOLANGCI_LINT_VERSION in the Makefile; bump together.
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.15.0
+      - name: go.mod and go.sum are tidy
+        run: go mod tidy -diff
+      - name: Vet for macOS
+        run: GOOS=darwin go vet ./...
+
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ github.event_name == 'schedule' && 30 || 15 }}
+    env:
+      # Per target: a smoke run on every change, a longer one on the schedule.
+      FUZZTIME: ${{ github.event_name == 'schedule' && '5m' || '30s' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # The seed corpora (f.Add and testdata/fuzz) also run with the unit
+      # tests; this explores beyond them for a little while.
+      - name: Fuzz every target
+        run: make test-fuzz FUZZTIME="$FUZZTIME"
+      # A failing input is written to testdata/fuzz/FuzzXxx of its package:
+      # keep it, to reproduce the failure and add it as a regression seed.
+      - name: Keep the failing inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-failures
+          path: "**/testdata/fuzz/**"
+          if-no-files-found: ignore
+          retention-days: 30
+
+  workflows:
+    name: workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # For actionlint, which make runs with go run.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # actionlint (syntax, expressions, shellcheck of the run steps) and
+      # zizmor (template injection, excessive permissions, unpinned actions,
+      # cache poisoning, ...), with the versions of the Makefile. The
+      # read-only token lets zizmor run its online audits.
+      - name: actionlint and zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: make lint-actions ZIZMOR_FLAGS=--format=github
+
+  # Builds the archives and the image exactly like the release workflow,
+  # without publishing them: a broken release configuration or Dockerfile is
+  # otherwise only found when a tag is pushed.
+  snapshot:
+    name: release snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          # Like the release job: the assets do not depend on a cache.
+          cache: false
+      # The image copies in the prebuilt binaries, so no emulation is
+      # needed; buildx is here for multi-platform builds.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          version: v2.20.0
+          args: check
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          version: v2.20.0
+          args: release --snapshot --clean
+      - name: Run the linux/amd64 binary
+        run: dist/tcpulse_linux_amd64_v1/tcpulse --version
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: snapshot
+          path: |
+            dist/*.tar.gz
+            dist/*checksums.txt
+          retention-days: 7
