@@ -128,7 +128,14 @@ func TestMainHelp(t *testing.T) {
 		if r.code != 0 || !strings.HasPrefix(r.stdout, "Usage: tcpulse [OPTIONS] <addresses...>") || r.stderr != "" {
 			t.Fatalf("%s: %+v", arg, r)
 		}
-		for _, want := range []string{"--message-bytes int32", "TCPULSE_MESSAGE_BYTES=1024", "Examples:"} {
+		// The option lines are those of tcpulse 0.8 (pflag 1.1 would print
+		// "--client[=true|false]").
+		for _, want := range []string{
+			"\n  -c, --client                     run in client mode\n",
+			"\n      --message-bytes int32        [client mode] TCP/UDP message size (bytes) (default 64)\n",
+			"TCPULSE_MESSAGE_BYTES=1024",
+			"Examples:",
+		} {
 			if !strings.Contains(r.stdout, want) {
 				t.Errorf("%s: usage lacks %q", arg, want)
 			}

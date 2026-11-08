@@ -82,7 +82,9 @@ func (h *Histogram) Quantile(q float64) time.Duration {
 	for i, c := range h.counts {
 		seen += c
 		if seen >= rank {
-			return min(max(time.Duration(bucketHighest(i)), h.min), h.max)
+			// The highest value of a bucket is at most MaxInt64: the
+			// buckets end with that of the largest Duration.
+			return min(max(time.Duration(bucketHighest(i)), h.min), h.max) //nolint:gosec // see above
 		}
 	}
 	return h.max
@@ -106,13 +108,15 @@ func bucketIndex(v uint64) int {
 		return int(v)
 	}
 	shift := bits.Len64(v) - subBucketBits - 1
-	return (shift+1)*subBucketCount + int(v>>uint(shift)) - subBucketCount
+	// v>>shift keeps the subBucketBits+1 highest bits of v: it is below
+	// 2×subBucketCount.
+	return (shift+1)*subBucketCount + int(v>>uint(shift)) - subBucketCount //nolint:gosec // see above
 }
 
 // bucketLowest returns the smallest value of bucket i.
 func bucketLowest(i int) uint64 {
 	if i < subBucketCount {
-		return uint64(i)
+		return uint64(i) //nolint:gosec // 0 ≤ i < subBucketCount
 	}
 	shift := i/subBucketCount - 1
 	return uint64(i%subBucketCount+subBucketCount) << uint(shift)

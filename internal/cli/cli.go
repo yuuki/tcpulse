@@ -177,7 +177,7 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 	}
 
 	if o.enablePprof {
-		stop, err := startPprof(o.pprofAddr, logger)
+		stop, err := startPprof(ctx, o.pprofAddr, logger)
 		if err != nil {
 			return err
 		}
@@ -267,8 +267,9 @@ func printIntervals(ctx context.Context, p *report.Printer, peer string, rec *st
 
 // startPprof serves the pprof endpoints (/debug/pprof/) on addr until stop
 // is called.
-func startPprof(addr string, logger *slog.Logger) (stop func(), err error) {
-	ln, err := net.Listen("tcp", addr)
+func startPprof(ctx context.Context, addr string, logger *slog.Logger) (stop func(), err error) {
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("starting pprof server: %w", err)
 	}

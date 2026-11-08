@@ -1,0 +1,15 @@
+# Configuration for cccc (https://github.com/moznion/cccc), which measures
+# Cognitive and Cyclomatic Complexity. Read by `make complexity` and by
+# .github/workflows/complexity.yml; the cccc README documents every key.
+
+# Measure hand-written production code only: tests, generated code and vendored
+# sources would skew the distribution.
+exclude = [
+  "*_test.go",       # Go tests
+  "**/testdata/**",  # test fixtures
+  "vendor/**",       # vendored Go modules (go mod vendor)
+]
+
+# No max-cognitive: CI does not fail on a score. It tracks the numbers over
+# time with octocov (.octocov.complexity.yml), so that they point at hotspots
+# and trends instead of being a target.
