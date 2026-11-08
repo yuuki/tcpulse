@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -108,8 +109,9 @@ func (r *run) messages() int64 {
 	return int64(r.cfg.Rate) * int64(r.cfg.Duration.Seconds())
 }
 
-// measure records how long f takes, if it succeeds. A request that the end
-// of the run cuts off is neither recorded nor an error.
+// measure records how long f takes, if it succeeds. The message must be
+// ready before: generating it is not part of the round trip. A request that
+// the end of the run cuts off is neither recorded nor an error.
 func (r *run) measure(ctx context.Context, f func() error) error {
 	start := time.Now()
 	if err := f(); err != nil {
@@ -192,12 +194,14 @@ func (r *run) persistent(ctx context.Context) error {
 				if err := waitLimit(ctx, limiter); err != nil {
 					return nil
 				}
+				fill(msg)
 				if err := r.measure(ctx, func() error {
-					fill(msg)
 					if _, err := conn.Write(msg); err != nil {
 						return fmt.Errorf("writing to connection: %w", err)
 					}
-					if _, err := conn.Read(msg); err != nil {
+					// The echo of a message larger than a segment, or than
+					// the server's buffer, arrives in several reads.
+					if _, err := io.ReadFull(conn, msg); err != nil {
 						return fmt.Errorf("reading from connection: %w", err)
 					}
 					return nil
@@ -223,15 +227,18 @@ func (r *run) ephemeral(ctx context.Context) error {
 			break
 		}
 		eg.Go(func() error {
+			msgp := r.bufPool.Get().(*[]byte)
+			defer r.bufPool.Put(msgp)
+			fill(*msgp)
 			return r.measure(ctx, func() error {
-				return r.ephemeralRequest(ctx, &dialer)
+				return r.ephemeralRequest(ctx, &dialer, *msgp)
 			})
 		})
 	}
 	return eg.Wait()
 }
 
-func (r *run) ephemeralRequest(ctx context.Context, dialer *net.Dialer) error {
+func (r *run) ephemeralRequest(ctx context.Context, dialer *net.Dialer, msg []byte) error {
 	conn, err := dialer.DialContext(ctx, "tcp", r.addr)
 	if err != nil {
 		if errors.Is(err, syscall.ETIMEDOUT) {
@@ -247,11 +254,6 @@ func (r *run) ephemeralRequest(ctx context.Context, dialer *net.Dialer) error {
 		return fmt.Errorf("setting quick ack: %w", err)
 	}
 
-	msgp := r.bufPool.Get().(*[]byte)
-	defer r.bufPool.Put(msgp)
-	msg := *msgp
-	fill(msg)
-
 	if _, err := conn.Write(msg); err != nil {
 		if errors.Is(err, syscall.EINPROGRESS) {
 			r.logger.Warn("write in progress", "addr", r.addr)
@@ -259,7 +261,7 @@ func (r *run) ephemeralRequest(ctx context.Context, dialer *net.Dialer) error {
 		}
 		return fmt.Errorf("writing to connection: %w", err)
 	}
-	if _, err := conn.Read(msg); err != nil {
+	if _, err := io.ReadFull(conn, msg); err != nil {
 		if errors.Is(err, syscall.ECONNRESET) {
 			r.logger.Warn("connection reset", "addr", r.addr)
 			return nil
@@ -281,26 +283,24 @@ func (r *run) udp(ctx context.Context) error {
 			break
 		}
 		eg.Go(func() error {
+			msgp := r.bufPool.Get().(*[]byte)
+			defer r.bufPool.Put(msgp)
+			fill(*msgp)
 			return r.measure(ctx, func() error {
-				return r.udpRequest(ctx, &dialer)
+				return r.udpRequest(ctx, &dialer, *msgp)
 			})
 		})
 	}
 	return eg.Wait()
 }
 
-func (r *run) udpRequest(ctx context.Context, dialer *net.Dialer) error {
+func (r *run) udpRequest(ctx context.Context, dialer *net.Dialer, msg []byte) error {
 	conn, err := dialer.DialContext(ctx, "udp4", r.addr)
 	if err != nil {
 		return fmt.Errorf("dialing UDP %q: %w", r.addr, err)
 	}
 	defer func() { _ = conn.Close() }()
 	setDeadline(ctx, conn)
-
-	msgp := r.bufPool.Get().(*[]byte)
-	defer r.bufPool.Put(msgp)
-	msg := *msgp
-	fill(msg)
 
 	if _, err := conn.Write(msg); err != nil {
 		return fmt.Errorf("writing to UDP connection: %w", err)

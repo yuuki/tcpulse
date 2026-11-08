@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"net"
 	"testing"
@@ -212,5 +213,93 @@ func TestRunLostDatagrams(t *testing.T) {
 	}
 	if got := rec.Total().Count; got != 0 {
 		t.Fatalf("%d round trips without an answer", got)
+	}
+}
+
+// splitEchoServer echoes every message it receives on TCP in two halves,
+// the second one delay after the first, until the test ends.
+func splitEchoServer(t *testing.T, size int, delay time.Duration) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				buf := make([]byte, size)
+				for {
+					if _, err := io.ReadFull(conn, buf); err != nil {
+						return
+					}
+					if _, err := conn.Write(buf[:size/2]); err != nil {
+						return
+					}
+					time.Sleep(delay)
+					if _, err := conn.Write(buf[size/2:]); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func TestRunWaitsForTheWholeEcho(t *testing.T) {
+	const delay = 100 * time.Millisecond
+	for _, flavor := range []string{FlavorPersistent, FlavorEphemeral} {
+		t.Run(flavor, func(t *testing.T) {
+			t.Parallel()
+			cfg := config(ProtocolTCP, flavor)
+			cfg.Connections = 1
+			cfg.Rate = 4
+			cfg.Duration = 2 * time.Second
+			cfg.MessageBytes = 1000
+			addr := splitEchoServer(t, cfg.MessageBytes, delay)
+			rec := stats.NewRecorder()
+			if err := Run(t.Context(), cfg, addr, rec); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			total := rec.Total()
+			if total.Count != 8 {
+				t.Fatalf("%d round trips, want 8", total.Count)
+			}
+			if total.Min < delay {
+				t.Fatalf("fastest round trip took %v, before the whole echo (%v) could arrive", total.Min, delay)
+			}
+		})
+	}
+}
+
+func TestRunLargeMessages(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		protocol  string
+		flavor    string
+		size      int
+		wantCount int64
+	}{
+		{"tcp persistent", ProtocolTCP, FlavorPersistent, 1 << 20, 20},
+		{"tcp ephemeral", ProtocolTCP, FlavorEphemeral, 1 << 20, 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := config(tc.protocol, tc.flavor)
+			cfg.MessageBytes = tc.size
+			rec := stats.NewRecorder()
+			if err := Run(t.Context(), cfg, echoServer(t, tc.protocol), rec); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if got := rec.Total().Count; got != tc.wantCount {
+				t.Fatalf("%d round trips, want %d", got, tc.wantCount)
+			}
+		})
 	}
 }
