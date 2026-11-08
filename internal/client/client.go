@@ -62,6 +62,10 @@ type Config struct {
 	// connection (TCP_INFO) when it is closed, once the clock of its last
 	// round trip has stopped. It needs TCPInfoSupported; UDP ignores it.
 	TCPInfo bool
+	// Events, when not nil, reads the kernel events of every TCP connection
+	// after each of its round trips, once the clock has stopped, and
+	// records them in the Recorder with the round trip. UDP ignores it.
+	Events EventReader
 	// Logger receives the errors the run tolerates; nil means
 	// slog.Default().
 	Logger *slog.Logger
@@ -104,6 +108,18 @@ func Run(ctx context.Context, cfg Config, addr string, rec *stats.Recorder) erro
 // (Linux).
 const TCPInfoSupported = sockopt.TCPInfoSupported
 
+// EventReader reads the kernel events counted on a TCP connection since it
+// was opened (--kernel-events). It may be called concurrently.
+type EventReader interface {
+	// Generation returns a number that changes whenever an event is counted
+	// on any connection, cheaply, and false when there is none. While it
+	// does not change, ReadEvents returns the same events for every
+	// connection; an event counted before it changes is seen by ReadEvents
+	// after it.
+	Generation() (uint64, bool)
+	ReadEvents(conn net.Conn) (stats.Events, error)
+}
+
 // errTolerated is returned by a request that failed in a way the run
 // tolerates: the failure is logged, and the request is not recorded.
 var errTolerated = errors.New("request failed")
@@ -117,6 +133,8 @@ type run struct {
 	// tcpInfoWarning logs once a connection whose TCP_INFO could not be
 	// read.
 	tcpInfoWarning sync.Once
+	// eventWarning logs once a connection whose events could not be read.
+	eventWarning sync.Once
 }
 
 // Messages returns how many messages a sender at rate per second sends
@@ -181,13 +199,85 @@ func cutOff(ctx context.Context, err error) bool {
 }
 
 // closeTCP closes a TCP connection, after recording what the kernel reports
-// of it when the run asks for it. It runs after the clock of the last round
-// trip of the connection has stopped.
-func (r *run) closeTCP(conn net.Conn) {
+// of it when the run asks for it: the events that none of its completed
+// round trips took (events may be nil), and its TCP_INFO. It runs after the
+// clock of the last round trip of the connection has stopped.
+func (r *run) closeTCP(conn net.Conn, events *eventCursor) {
+	r.recordUnmatched(events)
 	if r.cfg.TCPInfo {
 		r.recordTCPInfo(conn)
 	}
 	_ = conn.Close()
+}
+
+// eventCursor attributes the kernel events of a TCP connection to its round
+// trips: take returns the events counted since its previous call.
+type eventCursor struct {
+	run  *run
+	conn net.Conn
+	seen stats.Events
+	// generation is the reader's generation before the latest read, and
+	// read is set once there was one.
+	generation uint64
+	read       bool
+	// broken is set once the events of the connection could not be read.
+	broken bool
+}
+
+// eventCursor returns the cursor of conn, or nil when the run does not read
+// kernel events.
+func (r *run) eventCursor(conn net.Conn) *eventCursor {
+	if r.cfg.Events == nil {
+		return nil
+	}
+	return &eventCursor{run: r, conn: conn}
+}
+
+// take returns the events counted on the connection since the previous
+// call, or false when they cannot be read.
+func (c *eventCursor) take() (stats.Events, bool) {
+	if c == nil || c.broken {
+		return stats.Events{}, false
+	}
+	// The generation is read before the events: an event counted after it
+	// is read changes it, and the next take reads the events again.
+	gen, ok := c.run.cfg.Events.Generation()
+	if ok && c.read && gen == c.generation {
+		return stats.Events{}, true
+	}
+	ev, err := c.run.cfg.Events.ReadEvents(c.conn)
+	if err != nil {
+		c.broken = true
+		c.run.eventWarning.Do(func() {
+			c.run.logger.Warn("could not read the kernel events of a connection", "addr", c.run.addr, "error", err)
+		})
+		return stats.Events{}, false
+	}
+	d := ev.Sub(c.seen)
+	c.seen, c.generation, c.read = ev, gen, true
+	return d, true
+}
+
+// recordEvents records the events of a round trip that took elapsed, once
+// its clock has stopped. A round trip whose events cannot be read is counted
+// as untracked, never as one without events.
+func (r *run) recordEvents(events *eventCursor, elapsed time.Duration) {
+	if events == nil {
+		return
+	}
+	if d, ok := events.take(); ok {
+		r.rec.RecordEvents(elapsed, d)
+	} else {
+		r.rec.RecordUntracked()
+	}
+}
+
+// recordUnmatched records the events of the connection that no completed
+// round trip takes.
+func (r *run) recordUnmatched(events *eventCursor) {
+	if d, ok := events.take(); ok && !d.IsZero() {
+		r.rec.RecordUnmatched(d)
+	}
 }
 
 // recordTCPInfo records the TCP_INFO of conn. A connection whose TCP_INFO
@@ -300,8 +390,14 @@ func (r *run) persistent(ctx context.Context) error {
 				}
 				return fmt.Errorf("dialing %q: %w", r.addr, err)
 			}
-			defer r.closeTCP(conn)
+			events := r.eventCursor(conn)
+			defer r.closeTCP(conn, events)
 			defer bindToRun(ctx, conn)()
+			// The dial is not timed: the events of a handshake it waited
+			// for belong to no round trip. With TCP Fast Open the SYN
+			// leaves with the first message, and its events with the first
+			// round trip.
+			r.recordUnmatched(events)
 
 			msg := make([]byte, r.cfg.MessageBytes)
 			echo := echoBuffer(msg)
@@ -313,7 +409,11 @@ func (r *run) persistent(ctx context.Context) error {
 				fill(msg)
 				start := time.Now()
 				err := exchange(conn, msg, echo)
-				if err := r.finish(ctx, time.Since(start), err); err != nil {
+				elapsed := time.Since(start)
+				if err == nil {
+					r.recordEvents(events, elapsed)
+				}
+				if err := r.finish(ctx, elapsed, err); err != nil {
 					return err
 				}
 				if err != nil {
@@ -368,7 +468,10 @@ func (r *run) ephemeralRequest(ctx context.Context, dialer *net.Dialer, msg, ech
 		}
 		return 0, fmt.Errorf("dialing %q: %w", r.addr, err)
 	}
-	defer r.closeTCP(conn)
+	// The round trip includes the dial: the events of the connection are
+	// all its own.
+	events := r.eventCursor(conn)
+	defer r.closeTCP(conn, events)
 	defer bindToRun(ctx, conn)()
 
 	if err := sockopt.SetQuickAck(conn); err != nil {
@@ -386,7 +489,9 @@ func (r *run) ephemeralRequest(ctx context.Context, dialer *net.Dialer, msg, ech
 		}
 		return 0, err
 	}
-	return time.Since(start), nil
+	elapsed := time.Since(start)
+	r.recordEvents(events, elapsed)
+	return elapsed, nil
 }
 
 func (r *run) udp(ctx context.Context) error {

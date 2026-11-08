@@ -142,3 +142,45 @@ func TestRecorderConnsConcurrent(t *testing.T) {
 		t.Fatalf("connections = %+v, want 800", s)
 	}
 }
+
+func TestRecorderEvents(t *testing.T) {
+	r := NewRecorder()
+	if s := r.Events(); s != (EventSummary{}) {
+		t.Fatalf("no event = %+v, want zero", s)
+	}
+	r.RecordEvents(100*time.Microsecond, Events{})
+	r.RecordEvents(200*time.Microsecond, Events{})
+	r.RecordEvents(time.Second, Events{SYNRetrans: 2})
+	r.RecordEvents(300*time.Millisecond, Events{RTORetrans: 1, FastRetrans: 3})
+	r.RecordEvents(time.Millisecond, Events{FastOpenRetrans: 1})
+	r.RecordEvents(time.Millisecond, Events{ResetsReceived: 1})
+	r.RecordUntracked()
+	r.RecordUnmatched(Events{SYNRetrans: 3, RTORetrans: 1, ResetsReceived: 2})
+
+	want := EventSummary{
+		RoundTrips:        4,
+		RetransRoundTrips: RetransCounts{SYN: 1, FastOpen: 1, RTO: 1, Fast: 1},
+		WithEvents:        LatencySummary{Count: 4, P99: time.Second, Max: time.Second},
+		WithoutEvents:     LatencySummary{Count: 2, P99: 200 * time.Microsecond, Max: 200 * time.Microsecond},
+		ResetsReceived:    3,
+		Unmatched:         RetransCounts{SYN: 3, RTO: 1},
+		Untracked:         1,
+	}
+	if s := r.Events(); s != want {
+		t.Fatalf("events = %+v\nwant %+v", s, want)
+	}
+	if want.Unmatched.Total() != 4 {
+		t.Fatalf("Total() = %d, want 4", want.Unmatched.Total())
+	}
+}
+
+func TestEventsSub(t *testing.T) {
+	before := Events{SYNRetrans: 1, FastRetrans: 2}
+	after := Events{SYNRetrans: 1, FastRetrans: 5, ResetsReceived: 1}
+	if d := after.Sub(before); d != (Events{FastRetrans: 3, ResetsReceived: 1}) {
+		t.Fatalf("Sub = %+v", d)
+	}
+	if !before.Sub(before).IsZero() || after.IsZero() {
+		t.Fatal("IsZero")
+	}
+}

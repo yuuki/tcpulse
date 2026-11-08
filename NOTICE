@@ -1,0 +1,18 @@
+tcpulse
+Copyright 2021-2026 Yuuki Tsubouchi
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE),
+except for the following files in internal/kevents/bpf, which are compiled
+into an eBPF object (internal/kevents/kevents_bpfel.o). The object is embedded
+in the tcpulse binary, and --kernel-events loads it into the Linux kernel.
+
+* kevents.bpf.c and kevents.h (the eBPF programs) are dual-licensed under
+  GPL-2.0-only OR BSD-2-Clause (see LICENSES/). The kernel only accepts
+  tracing programs that declare a GPL-compatible license, so the programs
+  declare "Dual BSD/GPL". The BSD-2-Clause option allows the compiled object
+  to be distributed together with the Apache-2.0 code.
+
+* include/bpf_helpers.h, include/bpf_helper_defs.h, include/bpf_core_read.h
+  and include/bpf_tracing.h are copied from libbpf v1.6.3
+  (https://github.com/libbpf/libbpf) and are licensed under
+  LGPL-2.1 OR BSD-2-Clause; tcpulse uses them under BSD-2-Clause.

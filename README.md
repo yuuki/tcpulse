@@ -77,6 +77,7 @@ Creates new connections for each request, immediately closing them afterward. Th
 - **Platform optimizations**: Leverages Linux-specific optimizations (TCP_FASTOPEN, SO_REUSEPORT) when available
 - **JSON Lines output**: Machine-readable output format for integration with monitoring and analysis tools
 - **Kernel TCP statistics**: Retransmissions, the kernel's smoothed RTT and TCP Fast Open use of the connections, with `--tcp-info` on Linux
+- **Kernel events per round trip**: Which round trips met a SYN retransmission, a retransmission timeout, a fast retransmission or a reset, and how slow they were compared with the others, with `--kernel-events` (eBPF, Linux)
 
 ## Installation
 
@@ -147,6 +148,7 @@ Options:
   -h, --help                       show help information
       --interval duration          [client mode] interval for printing stats (default 5s)
       --jsonlines                  [client mode] output results in JSON Lines format
+      --kernel-events              [client mode] attribute kernel TCP events (retransmissions, resets) to the round trips with eBPF (Linux only, needs root or CAP_BPF and CAP_PERFMON)
       --listen-addrs-file string   [server mode] enable to pass a file including a pair of addresses and ports
       --merge-results-each-host    [client mode] merge results of each host (with --show-only-results)
       --message-bytes int32        [client mode] TCP/UDP message size (bytes) (default 64)
@@ -294,13 +296,58 @@ Retransmissions have two common causes, which these counters alone do not tell a
 - **Lost segments, SYNs in particular:** a lost SYN is retransmitted after a timeout of at least 1s, so in ephemeral mode SYN loss shows as steps of whole seconds in the latencies (`LAT_MAX`, `LAT_99p`). The steps depend on the kernel: 1s, 2s, 3s, 4s with `net.ipv4.tcp_syn_linear_timeouts` (1s between the first retransmissions, 4 of them by default), 1s, 3s, 7s on kernels that double the timeout from the first one.
 - **TCP Fast Open falling back:** when the server does not accept the data sent in a SYN with a cookie (it no longer enables Fast Open, or its queue of pending Fast Open requests is full), the client sends the data again right after the handshake. That counts as one retransmission per connection, without loss and without the delay of a timeout.
 
-The host's kernel counters `TCPSynRetrans` and `TCPFastOpenActiveFail` (`nstat`, or `/proc/net/netstat`) separate the two.
+The host's kernel counters `TCPSynRetrans` and `TCPFastOpenActiveFail` (`nstat`, or `/proc/net/netstat`) separate the two, and `--kernel-events` (below) separates them per round trip.
 
 Interval lines do not include these statistics: a persistent connection is read only when it ends. With `--jsonlines`, each object ends with a `tcp_info` object:
 
 ```json
 {"peer":"127.0.0.1:9100","count":14982,"latency_max_us":20537,"latency_min_us":63,"latency_mean_us":294,"latency_90p_us":380,"latency_95p_us":425,"latency_99p_us":749,"rate_per_sec":998.79,"timestamp":"2026-11-08T08:40:00Z","tcp_info":{"connections":14982,"retrans_connections":0,"retrans_segments":0,"segments_out":59928,"srtt_mean_us":14,"srtt_99p_us":40,"srtt_max_us":1862,"fastopen_connections":0}}
 ```
+
+#### Kernel Events (`--kernel-events`)
+
+On Linux, `--kernel-events` loads eBPF programs that count kernel events on every TCP connection tcpulse opens: retransmissions, by kind, and resets received. tcpulse attributes each event to the round trip during which it happened, and the report tells whether the slow round trips are those that met these events.
+
+**Requirements**
+- Linux 5.12 or later, with BTF (`/sys/kernel/btf/vmlinux`).
+- Root, or `CAP_BPF` and `CAP_PERFMON`. The container image runs as `nobody`: give it `--user 0` and the capabilities, which `--privileged` grants.
+- It is refused with `--proto udp` and on other platforms. If the programs cannot be loaded, tcpulse exits with status 1 and the reason, before sending anything.
+
+```shell-session
+$ sudo tcpulse -c --show-only-results --kernel-events --flavor ephemeral --rate 200 --duration 4s 192.0.2.10:9100
+PEER                 CNT        LAT_MAX(µs)     LAT_MIN(µs)     LAT_MEAN(µs)    LAT_90p(µs)     LAT_95p(µs)     LAT_99p(µs)     RATE(/s)
+--- A result during total execution time ---
+192.0.2.10:9100      792        2049623         171             45133           528             205520          1031798         197.97
+--- Kernel events of the round trips (eBPF) ---
+PEER                 EVENT_RTS  SYN_RTX         TFO_RTX         RTO_RTX         FAST_RTX        EVENT_99p(µs)   CLEAN_99p(µs)   RST_RECV        UNMATCHED
+192.0.2.10:9100      61         26              0               2               37              2049623         692             0               0
+```
+
+In this run, 5% of the packets to the server were dropped. The 99th percentile of the run, 1.03s, belongs to the 61 round trips that met kernel events (2.05s); the other round trips stayed below 692µs.
+
+- `EVENT_RTS`: The completed round trips during which at least one event was counted on their connection
+- `SYN_RTX`, `TFO_RTX`, `RTO_RTX`, `FAST_RTX`: The round trips during which at least one retransmission of that kind happened. A round trip can count under several kinds.
+  - `SYN_RTX`: of the SYN. A lost SYN is retransmitted after at least 1s.
+  - `TFO_RTX`: of data sent in a TCP Fast Open SYN that the server did not acknowledge. The client sends it again right after the handshake, without loss or timeout.
+  - `RTO_RTX`: in the kernel's loss state, which a retransmission timeout enters (200ms at least).
+  - `FAST_RTX`: any other: fast retransmit, RACK, tail loss probes.
+- `EVENT_99p(µs)`, `CLEAN_99p(µs)`: The 99th percentile latency of the round trips with events, and of the others
+- `RST_RECV`: The resets received by the connections
+- `UNMATCHED`: The retransmissions that no completed round trip owns. They belong to requests that failed or were cut off by the end of the run, or, in persistent mode, to a handshake the untimed dial waited for.
+
+How events are attributed:
+- **Persistent mode:** the events of a round trip are those counted on its connection since the end of the previous round trip.
+- **Ephemeral mode:** a round trip includes the dial, so its events are all those counted since the connection was opened.
+- **Cost:** tcpulse checks the counters after each round trip, once the clock has stopped, with a load from memory it shares with the programs. A `bpf()` system call reads a connection's counters only the first time, and after an event was counted on any connection. No program runs for every packet.
+- **Untracked round trips:** a round trip whose events cannot be read is counted as untracked, never as one without events.
+
+With `--jsonlines`, each object ends with a `kernel_events` object (after `tcp_info`, if present). It has these fields:
+- `round_trips_with_events`;
+- `syn_retrans_round_trips`, `fastopen_retrans_round_trips`, `rto_retrans_round_trips`, `fast_retrans_round_trips`;
+- `latency_99p_with_events_us`, `latency_max_with_events_us`, `latency_99p_without_events_us`, `latency_max_without_events_us`;
+- `resets_received`;
+- `unmatched_syn_retrans`, `unmatched_fastopen_retrans`, `unmatched_rto_retrans`, `unmatched_fast_retrans`;
+- `untracked_round_trips`.
 
 ## Use Cases
 
@@ -416,7 +463,7 @@ tcpulse 0.9 keeps the options, the environment variables and the output formats 
 
 ## Development
 
-`make check` runs the linters, the workflow audit, `go vet`, the race-enabled tests and the build; `make help` lists the other targets. See [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md) for the conventions and compatibility contracts, and [SECURITY.md](SECURITY.md) to report a vulnerability.
+`make check` runs the linters, the workflow audit, `go vet`, the race-enabled tests and the build; `make help` lists the other targets. The eBPF programs of `--kernel-events` are in `internal/kevents/bpf`; `make generate` rebuilds their committed object (it needs clang), and `make test-bpf`, run as root, runs the tests that load them (they skip otherwise). See [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md) for the conventions and compatibility contracts, and [SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## License
 

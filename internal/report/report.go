@@ -20,6 +20,9 @@ type Result struct {
 	// Conns describes the TCP connections of the run when it read their
 	// TCP_INFO (--tcp-info), and is nil otherwise.
 	Conns *stats.ConnSummary
+	// Events describes the kernel events of the round trips when the run
+	// counted them (--kernel-events), and is nil otherwise.
+	Events *stats.EventSummary
 }
 
 // MergedPeer is the peer name of the merged result of n peers.
@@ -51,6 +54,12 @@ const (
 	// ConnSeparator precedes the TCP statistics of the connections in text
 	// output.
 	ConnSeparator = "--- TCP statistics of the connections (TCP_INFO) ---"
+
+	eventHeaderFormat = "%-20s %-10s %-15s %-15s %-15s %-15s %-15s %-15s %-15s %-10s\n"
+	eventLineFormat   = "%-20s %-10d %-15d %-15d %-15d %-15d %-15d %-15d %-15d %-10d\n"
+	// EventSeparator precedes the kernel events of the round trips in text
+	// output.
+	EventSeparator = "--- Kernel events of the round trips (eBPF) ---"
 )
 
 // Header writes the column header of the text output.
@@ -89,7 +98,43 @@ func (p *Printer) Report(results []Result) error {
 			return err
 		}
 	}
-	return p.connReport(results)
+	if err := p.connReport(results); err != nil {
+		return err
+	}
+	return p.eventReport(results)
+}
+
+func (p *Printer) eventReport(results []Result) error {
+	header := false
+	for _, r := range results {
+		if r.Events == nil {
+			continue
+		}
+		if !header {
+			if err := p.printf("%s\n"+eventHeaderFormat, EventSeparator,
+				"PEER", "EVENT_RTS", "SYN_RTX", "TFO_RTX", "RTO_RTX", "FAST_RTX",
+				"EVENT_99p(µs)", "CLEAN_99p(µs)", "RST_RECV", "UNMATCHED"); err != nil {
+				return err
+			}
+			header = true
+		}
+		e := r.Events
+		if err := p.printf(eventLineFormat,
+			r.Peer,
+			e.RoundTrips,
+			e.RetransRoundTrips.SYN,
+			e.RetransRoundTrips.FastOpen,
+			e.RetransRoundTrips.RTO,
+			e.RetransRoundTrips.Fast,
+			e.WithEvents.P99.Microseconds(),
+			e.WithoutEvents.P99.Microseconds(),
+			e.ResetsReceived,
+			e.Unmatched.Total(),
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (p *Printer) connReport(results []Result) error {
@@ -139,6 +184,52 @@ type JSONLinesResult struct {
 	// TCPInfo is only there when the run read the TCP_INFO of its
 	// connections (--tcp-info).
 	TCPInfo *JSONLinesTCPInfo `json:"tcp_info,omitempty"`
+	// KernelEvents is only there when the run counted the kernel events of
+	// its round trips (--kernel-events).
+	KernelEvents *JSONLinesKernelEvents `json:"kernel_events,omitempty"`
+}
+
+// JSONLinesKernelEvents is the JSON object of the kernel events of the round
+// trips of a result.
+type JSONLinesKernelEvents struct {
+	RoundTripsWithEvents      int64 `json:"round_trips_with_events"`
+	SYNRetransRoundTrips      int64 `json:"syn_retrans_round_trips"`
+	FastOpenRetransRoundTrips int64 `json:"fastopen_retrans_round_trips"`
+	RTORetransRoundTrips      int64 `json:"rto_retrans_round_trips"`
+	FastRetransRoundTrips     int64 `json:"fast_retrans_round_trips"`
+	Latency99pWithEvents      int64 `json:"latency_99p_with_events_us"`
+	LatencyMaxWithEvents      int64 `json:"latency_max_with_events_us"`
+	Latency99pWithoutEvents   int64 `json:"latency_99p_without_events_us"`
+	LatencyMaxWithoutEvents   int64 `json:"latency_max_without_events_us"`
+	ResetsReceived            int64 `json:"resets_received"`
+	UnmatchedSYNRetrans       int64 `json:"unmatched_syn_retrans"`
+	UnmatchedFastOpenRetrans  int64 `json:"unmatched_fastopen_retrans"`
+	UnmatchedRTORetrans       int64 `json:"unmatched_rto_retrans"`
+	UnmatchedFastRetrans      int64 `json:"unmatched_fast_retrans"`
+	UntrackedRoundTrips       int64 `json:"untracked_round_trips"`
+}
+
+func jsonLinesKernelEvents(e *stats.EventSummary) *JSONLinesKernelEvents {
+	if e == nil {
+		return nil
+	}
+	return &JSONLinesKernelEvents{
+		RoundTripsWithEvents:      e.RoundTrips,
+		SYNRetransRoundTrips:      e.RetransRoundTrips.SYN,
+		FastOpenRetransRoundTrips: e.RetransRoundTrips.FastOpen,
+		RTORetransRoundTrips:      e.RetransRoundTrips.RTO,
+		FastRetransRoundTrips:     e.RetransRoundTrips.Fast,
+		Latency99pWithEvents:      e.WithEvents.P99.Microseconds(),
+		LatencyMaxWithEvents:      e.WithEvents.Max.Microseconds(),
+		Latency99pWithoutEvents:   e.WithoutEvents.P99.Microseconds(),
+		LatencyMaxWithoutEvents:   e.WithoutEvents.Max.Microseconds(),
+		ResetsReceived:            e.ResetsReceived,
+		UnmatchedSYNRetrans:       e.Unmatched.SYN,
+		UnmatchedFastOpenRetrans:  e.Unmatched.FastOpen,
+		UnmatchedRTORetrans:       e.Unmatched.RTO,
+		UnmatchedFastRetrans:      e.Unmatched.Fast,
+		UntrackedRoundTrips:       e.Untracked,
+	}
 }
 
 // JSONLinesTCPInfo is the JSON object of the TCP statistics of the
@@ -180,17 +271,18 @@ func (p *Printer) JSONLines(results []Result) error {
 	for _, r := range results {
 		s := r.Summary
 		if err := enc.Encode(JSONLinesResult{
-			Peer:        r.Peer,
-			Count:       s.Count,
-			LatencyMax:  s.Max.Microseconds(),
-			LatencyMin:  s.Min.Microseconds(),
-			LatencyMean: s.Mean.Microseconds(),
-			Latency90p:  s.P90.Microseconds(),
-			Latency95p:  s.P95.Microseconds(),
-			Latency99p:  s.P99.Microseconds(),
-			Rate:        s.Rate,
-			Timestamp:   timestamp,
-			TCPInfo:     jsonLinesTCPInfo(r.Conns),
+			Peer:         r.Peer,
+			Count:        s.Count,
+			LatencyMax:   s.Max.Microseconds(),
+			LatencyMin:   s.Min.Microseconds(),
+			LatencyMean:  s.Mean.Microseconds(),
+			Latency90p:   s.P90.Microseconds(),
+			Latency95p:   s.P95.Microseconds(),
+			Latency99p:   s.P99.Microseconds(),
+			Rate:         s.Rate,
+			Timestamp:    timestamp,
+			TCPInfo:      jsonLinesTCPInfo(r.Conns),
+			KernelEvents: jsonLinesKernelEvents(r.Events),
 		}); err != nil {
 			return fmt.Errorf("writing JSON Lines: %w", err)
 		}

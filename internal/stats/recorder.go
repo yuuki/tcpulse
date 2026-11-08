@@ -87,6 +87,10 @@ type Recorder struct {
 	connMu sync.Mutex
 	conns  ConnSummary
 	rtts   Histogram
+
+	// eventMu guards events, for the same reason.
+	eventMu sync.Mutex
+	events  eventStats
 }
 
 // NewRecorder returns a Recorder whose first interval starts now.
@@ -156,6 +160,36 @@ func (r *Recorder) Conns() ConnSummary {
 	s.RTTP99 = r.rtts.Quantile(0.99)
 	s.RTTMax = r.rtts.Max()
 	return s
+}
+
+// RecordEvents adds the kernel events of a completed round trip that took d,
+// which Record counts too.
+func (r *Recorder) RecordEvents(d time.Duration, ev Events) {
+	r.eventMu.Lock()
+	defer r.eventMu.Unlock()
+	r.events.roundTrip(d, ev)
+}
+
+// RecordUntracked counts a completed round trip whose events could not be
+// read.
+func (r *Recorder) RecordUntracked() {
+	r.eventMu.Lock()
+	defer r.eventMu.Unlock()
+	r.events.summary.Untracked++
+}
+
+// RecordUnmatched adds events that no completed round trip owns.
+func (r *Recorder) RecordUnmatched(ev Events) {
+	r.eventMu.Lock()
+	defer r.eventMu.Unlock()
+	r.events.unmatched(ev)
+}
+
+// Events summarizes the kernel events recorded during the run.
+func (r *Recorder) Events() EventSummary {
+	r.eventMu.Lock()
+	defer r.eventMu.Unlock()
+	return r.events.summarize()
 }
 
 // Set holds the Recorders of a run: one per target, or a single one that
