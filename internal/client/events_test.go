@@ -1,4 +1,7 @@
-//go:build unix
+//go:build linux
+
+// The kernel events and the socket helpers they use are Linux only
+// (socket_linux.go).
 
 package client
 

@@ -1,4 +1,6 @@
-//go:build unix
+// Kernel events (--kernel-events) are Linux only, and so are the helpers
+// that keep the sockets of a dial: sameSocket relies on sockfs giving every
+// socket an inode of its own, which other systems (macOS: 0) do not.
 
 package client
 

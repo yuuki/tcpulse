@@ -1,4 +1,4 @@
-//go:build !unix
+//go:build !linux
 
 package client
 
@@ -7,7 +7,8 @@ import (
 	"net"
 )
 
-// dupSocket is not supported on this platform, which has no kernel events.
+// dupSocket is not supported on this platform, which has no kernel events
+// (--kernel-events).
 func dupSocket(uintptr) (int, error) { return -1, errors.ErrUnsupported }
 
 // sameSocket is not supported on this platform.
