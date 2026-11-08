@@ -1,0 +1,18 @@
+# Image assembled by GoReleaser (.goreleaser.yaml) from the binaries it
+# cross-compiled, so no Go toolchain runs here. Dockerfile builds the same
+# image from the source tree.
+FROM alpine:3.24
+
+# One build context serves every platform, so the binaries cannot share a
+# path: GoReleaser files each under <os>/<arch>/, and only TARGETPLATFORM says
+# which one this stage is building. Files listed in extra_files stay at the
+# context root.
+ARG TARGETPLATFORM
+COPY $TARGETPLATFORM/tcpulse /usr/local/bin/tcpulse
+COPY LICENSE /usr/share/licenses/tcpulse/LICENSE
+
+# Alpine's unprivileged user: no RUN step, so that the arm64 image builds
+# without emulation.
+USER nobody:nobody
+EXPOSE 9100/tcp 9100/udp
+ENTRYPOINT ["/usr/local/bin/tcpulse"]

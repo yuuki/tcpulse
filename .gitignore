@@ -2,5 +2,7 @@
 .claude/settings.local.json
 
 /tcpulse
-
-coverage.out
+/dist/
+/coverage.out
+# make bench
+/bench.txt

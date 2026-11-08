@@ -1,0 +1,90 @@
+package stats
+
+import (
+	"sync"
+	"testing"
+	"time"
+)
+
+type fakeClock struct{ t time.Time }
+
+func (c *fakeClock) now() time.Time          { return c.t }
+func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+func newFakeClock() *fakeClock               { return &fakeClock{t: time.Unix(1700000000, 0)} }
+func (c *fakeClock) recorder() *Recorder     { return newRecorder(c.now) }
+func recordN(r *Recorder, n int, d time.Duration) {
+	for range n {
+		r.Record(d)
+	}
+}
+
+func TestRecorderIntervalsAndTotal(t *testing.T) {
+	clock := newFakeClock()
+	r := clock.recorder()
+
+	recordN(r, 10, time.Millisecond)
+	clock.advance(2 * time.Second)
+	first := r.TakeInterval()
+	if first.Count != 10 || first.Rate != 5 || first.Max != time.Millisecond {
+		t.Fatalf("first interval = %+v, want 10 round trips of 1ms at 5/s", first)
+	}
+
+	recordN(r, 30, 3*time.Millisecond)
+	clock.advance(time.Second)
+	second := r.TakeInterval()
+	if second.Count != 30 || second.Rate != 30 || second.Min != 3*time.Millisecond {
+		t.Fatalf("second interval = %+v, want 30 round trips of 3ms at 30/s", second)
+	}
+
+	total := r.Total(4 * time.Second)
+	if total.Count != 40 || total.Min != time.Millisecond || total.Max != 3*time.Millisecond {
+		t.Fatalf("total = %+v, want 40 round trips between 1ms and 3ms", total)
+	}
+	if total.Rate != 10 {
+		t.Fatalf("total rate = %v, want 40 over the 4s of the run", total.Rate)
+	}
+	if want := (10*time.Millisecond + 90*time.Millisecond) / 40; total.Mean != want {
+		t.Fatalf("total mean = %v, want %v", total.Mean, want)
+	}
+}
+
+func TestRecorderEmpty(t *testing.T) {
+	clock := newFakeClock()
+	r := clock.recorder()
+	if s := r.TakeInterval(); s != (Summary{}) {
+		t.Fatalf("empty interval without elapsed time = %+v, want zero", s)
+	}
+	if s := r.Total(time.Second); s != (Summary{}) {
+		t.Fatalf("empty total = %+v, want zero", s)
+	}
+}
+
+func TestRecorderConcurrent(t *testing.T) {
+	r := NewRecorder()
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() { recordN(r, 1000, time.Microsecond) })
+	}
+	wg.Go(func() {
+		for range 100 {
+			r.TakeInterval()
+		}
+	})
+	wg.Wait()
+	if got := r.Total(time.Second).Count; got != 8000 {
+		t.Fatalf("total count = %d, want 8000", got)
+	}
+}
+
+func TestSet(t *testing.T) {
+	// The same address given twice is two targets.
+	separate := NewSet(3, false)
+	if separate.For(0) == nil || separate.For(0) == separate.For(1) || separate.For(0) == separate.For(2) {
+		t.Fatal("targets do not have a Recorder each")
+	}
+
+	merged := NewSet(2, true)
+	if merged.For(0) == nil || merged.For(0) != merged.For(1) {
+		t.Fatal("merged targets do not share a Recorder")
+	}
+}
