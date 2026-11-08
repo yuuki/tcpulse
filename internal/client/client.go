@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"syscall"
 	"time"
@@ -62,7 +63,9 @@ type Config struct {
 
 // Run puts load on the echo server at addr for cfg.Duration and records the
 // round trip time of every message in rec. It returns nil when the run ends
-// or ctx is canceled, and an error when a connection fails.
+// or ctx is canceled, and an error when a connection fails. The requests
+// still in flight when the run ends are not recorded: the end of the run cut
+// them off, and the echoes of lost UDP datagrams are waited for until then.
 func Run(ctx context.Context, cfg Config, addr string, rec *stats.Recorder) error {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -105,14 +108,34 @@ func (r *run) messages() int64 {
 	return int64(r.cfg.Rate) * int64(r.cfg.Duration.Seconds())
 }
 
-// measure records how long f takes, if it succeeds.
-func (r *run) measure(f func() error) error {
+// measure records how long f takes, if it succeeds. A request that the end
+// of the run cuts off is neither recorded nor an error.
+func (r *run) measure(ctx context.Context, f func() error) error {
 	start := time.Now()
 	if err := f(); err != nil {
+		if cutOff(ctx, err) {
+			return nil
+		}
 		return err
 	}
 	r.rec.Record(time.Since(start))
 	return nil
+}
+
+// cutOff reports whether err comes from the end of the run, ctx, rather than
+// from the connection: either ctx is done, or err is the I/O timeout of the
+// connection deadline, which is the deadline of ctx (see setDeadline), and
+// that deadline has passed. The I/O can time out a moment before ctx
+// reports it.
+func cutOff(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		deadline, ok := ctx.Deadline()
+		return ok && !time.Now().Before(deadline)
+	}
+	return false
 }
 
 // fill puts random bytes in a message.
@@ -155,6 +178,9 @@ func (r *run) persistent(ctx context.Context) error {
 		eg.Go(func() error {
 			conn, err := dialer.DialContext(ctx, "tcp", r.addr)
 			if err != nil {
+				if cutOff(ctx, err) {
+					return nil
+				}
 				return fmt.Errorf("dialing %q: %w", r.addr, err)
 			}
 			defer func() { _ = conn.Close() }()
@@ -166,7 +192,7 @@ func (r *run) persistent(ctx context.Context) error {
 				if err := waitLimit(ctx, limiter); err != nil {
 					return nil
 				}
-				if err := r.measure(func() error {
+				if err := r.measure(ctx, func() error {
 					fill(msg)
 					if _, err := conn.Write(msg); err != nil {
 						return fmt.Errorf("writing to connection: %w", err)
@@ -197,7 +223,7 @@ func (r *run) ephemeral(ctx context.Context) error {
 			break
 		}
 		eg.Go(func() error {
-			return r.measure(func() error {
+			return r.measure(ctx, func() error {
 				return r.ephemeralRequest(ctx, &dialer)
 			})
 		})
@@ -255,7 +281,7 @@ func (r *run) udp(ctx context.Context) error {
 			break
 		}
 		eg.Go(func() error {
-			return r.measure(func() error {
+			return r.measure(ctx, func() error {
 				return r.udpRequest(ctx, &dialer)
 			})
 		})

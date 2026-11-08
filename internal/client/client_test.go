@@ -140,3 +140,77 @@ func TestRunInvalidConfig(t *testing.T) {
 		t.Fatal("Run accepted an unknown flavor")
 	}
 }
+
+// slowEchoServer echoes every message it receives on TCP delay after it
+// arrives, until the test ends.
+func slowEchoServer(t *testing.T, size int, delay time.Duration) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				buf := make([]byte, size)
+				for {
+					if _, err := conn.Read(buf); err != nil {
+						return
+					}
+					time.Sleep(delay)
+					if _, err := conn.Write(buf); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func TestRunEndsDuringARequest(t *testing.T) {
+	for _, flavor := range []string{FlavorPersistent, FlavorEphemeral} {
+		t.Run(flavor, func(t *testing.T) {
+			t.Parallel()
+			cfg := config(ProtocolTCP, flavor)
+			cfg.Connections = 1
+			cfg.Rate = 4
+			cfg.MessageBytes = 16
+			// Messages at 0, 250, 500 and 750ms (persistent: as soon as the
+			// previous echo is back); the last echo would arrive after the
+			// end of the run at 1s.
+			addr := slowEchoServer(t, cfg.MessageBytes, 300*time.Millisecond)
+			rec := stats.NewRecorder()
+			if err := Run(t.Context(), cfg, addr, rec); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if got := rec.Total().Count; got != 3 {
+				t.Fatalf("%d round trips, want 3: the last request was cut off", got)
+			}
+		})
+	}
+}
+
+func TestRunLostDatagrams(t *testing.T) {
+	// A UDP socket that never answers.
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+
+	cfg := config(ProtocolUDP, FlavorPersistent)
+	rec := stats.NewRecorder()
+	if err := Run(t.Context(), cfg, pc.LocalAddr().String(), rec); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := rec.Total().Count; got != 0 {
+		t.Fatalf("%d round trips without an answer", got)
+	}
+}
