@@ -1,0 +1,195 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"io"
+	"log/slog"
+	"net"
+	"testing"
+	"time"
+)
+
+var discard = slog.New(slog.DiscardHandler)
+
+// start serves protocol on a free loopback port until the test ends.
+func start(t *testing.T, protocol string) *Server {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	srv, err := Listen(ctx, Config{Addrs: []string{"127.0.0.1:0"}, Protocol: protocol, Logger: discard})
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("Serve: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("Serve did not return after its context was canceled")
+		}
+	})
+	return srv
+}
+
+func randomBytes(n int) []byte {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return b
+}
+
+func roundTrip(t *testing.T, conn net.Conn, msg []byte) {
+	t.Helper()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := make([]byte, len(msg))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, msg) {
+		t.Fatalf("echo of %d bytes differs from the message", len(msg))
+	}
+}
+
+func TestTCPEcho(t *testing.T) {
+	srv := start(t, ProtocolTCP)
+	conn, err := net.Dial("tcp", srv.TCPAddrs()[0].String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	for _, size := range []int{1, 64, tcpBufferSize, tcpBufferSize + 1, 1 << 20} {
+		roundTrip(t, conn, randomBytes(size))
+	}
+}
+
+func TestTCPEchoManyConnections(t *testing.T) {
+	srv := start(t, ProtocolTCP)
+	addr := srv.TCPAddrs()[0].String()
+	conns := make([]net.Conn, 20)
+	for i := range conns {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		conns[i] = conn
+	}
+	for range 3 {
+		for _, conn := range conns {
+			roundTrip(t, conn, randomBytes(128))
+		}
+	}
+}
+
+func TestUDPEcho(t *testing.T) {
+	srv := start(t, ProtocolUDP)
+	conn, err := net.Dial("udp4", srv.UDPAddrs()[0].String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	for _, size := range []int{1, 64, 1400, udpBufferSize} {
+		msg := randomBytes(size)
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := conn.Write(msg); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, size+1)
+		n, err := conn.Read(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got[:n], msg) {
+			t.Fatalf("echo of a %d-byte datagram is %d bytes and differs", size, n)
+		}
+	}
+}
+
+func TestListenProtocols(t *testing.T) {
+	for _, tc := range []struct {
+		protocol string
+		tcp, udp int
+	}{
+		{ProtocolTCP, 1, 0},
+		{ProtocolUDP, 0, 1},
+		{ProtocolAll, 1, 1},
+	} {
+		t.Run(tc.protocol, func(t *testing.T) {
+			srv := start(t, tc.protocol)
+			if got := len(srv.TCPAddrs()); got != tc.tcp {
+				t.Errorf("%d TCP listeners, want %d", got, tc.tcp)
+			}
+			if got := len(srv.UDPAddrs()); got != tc.udp {
+				t.Errorf("%d UDP sockets, want %d", got, tc.udp)
+			}
+		})
+	}
+}
+
+func TestListenMultipleAddresses(t *testing.T) {
+	srv, err := Listen(t.Context(), Config{
+		Addrs:    []string{"127.0.0.1:0", "127.0.0.1:0"},
+		Protocol: ProtocolAll,
+		Logger:   discard,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.close()
+	if len(srv.TCPAddrs()) != 2 || len(srv.UDPAddrs()) != 2 {
+		t.Fatalf("listening on %v and %v, want two addresses each", srv.TCPAddrs(), srv.UDPAddrs())
+	}
+}
+
+func TestListenError(t *testing.T) {
+	_, err := Listen(t.Context(), Config{
+		Addrs:    []string{"127.0.0.1:0", "256.0.0.1:0"},
+		Protocol: ProtocolTCP,
+		Logger:   discard,
+	})
+	if err == nil {
+		t.Fatal("listening on an invalid address succeeded")
+	}
+}
+
+func TestServeClosesConnectionsOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	srv, err := Listen(ctx, Config{Addrs: []string{"127.0.0.1:0"}, Protocol: ProtocolAll, Logger: discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx) }()
+
+	conn, err := net.Dial("tcp", srv.TCPAddrs()[0].String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	roundTrip(t, conn, []byte("hello"))
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after its context was canceled")
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("connection still open after the server stopped")
+	}
+}
