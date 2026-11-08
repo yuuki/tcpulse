@@ -30,7 +30,7 @@ internal/client  load generators: TCP persistent, TCP ephemeral, UDP
 internal/server  echo server
 internal/stats   latency histogram, per-peer recorders
 internal/report  text and JSON Lines output
-internal/sockopt Linux socket options and TCP_INFO (no-ops elsewhere)
+internal/sockopt Linux socket options and TCP_INFO (no-ops or unsupported elsewhere)
 ```
 
 `main.go` stays at the root of the module so that
@@ -131,11 +131,12 @@ computed.
   `Recorder` counts:
   - the connections, and those that retransmitted;
   - the segments retransmitted (`tcpi_total_retrans`, SYNs included) and
-    sent (`tcpi_segs_out`);
+    sent (`tcpi_segs_out`, Linux 4.2+: an older kernel returns a shorter
+    struct and it reads 0);
   - the connections whose SYN data was acknowledged (`TCPI_OPT_SYN_DATA`);
   - the kernel's smoothed RTTs (`tcpi_rtt`), in a `Histogram`. A connection
-    without an RTT sample (a SYN never answered) has no RTT, not an RTT of
-    0, so it is left out.
+    without an RTT sample (with Fast Open, a SYN never answered) has no RTT,
+    not an RTT of 0, so it is left out.
 - **Whole run only:** the statistics cover the whole run, not each interval.
   A persistent connection is read when it ends, so an interval would see
   none of it.
@@ -143,17 +144,22 @@ computed.
 The kernel's RTT runs from a segment to its acknowledgement. It leaves out
 the time spent in the client's process (system calls, the Go runtime), which
 `LAT_*` includes; in ephemeral mode a round trip also includes the
-handshake.
+handshake, unless the message travels in the SYN with Fast Open.
 
 The client sets `TCP_FASTOPEN_CONNECT`, so it sends its first message in the
 SYN when it holds a cookie for the server. When the server does not accept
-that data, the client sends it again after the handshake, and it counts as a
-retransmission. `RETRANS_CONNS` close to `CONNS` with `TFO_CONNS` at 0 means
-exactly that, not packet loss.
+that data (it no longer enables Fast Open, or its queue of pending Fast Open
+requests is full: the tcpulse server keeps a queue of one, see §6), the
+client sends the data again right after the handshake, and it counts as a
+retransmission. So do lost SYNs, which are retransmitted after a timeout of
+1s: the counters alone do not tell the two apart. The latencies do (steps of
+1s or 3s for SYN loss), and so do the host's counters `TCPSynRetrans` and
+`TCPFastOpenActiveFail`.
 
 `tcpi_fastopen_client_fail`, which says why Fast Open failed, is left out:
-`golang.org/x/sys/unix.TCPInfo` hides it in a bit field, and it needs Linux
-5.5+.
+`golang.org/x/sys/unix.TCPInfo` leaves its byte out as padding, and it needs
+Linux 5.5+. The kernel's counters are 32 bits per connection: a persistent
+connection that sends more than 2³² segments wraps them.
 
 ## 4. Statistics
 
@@ -234,10 +240,9 @@ Validation rejects any option set the run cannot work with: a rate below 1
 rate × duration below one message or beyond an int64, an interval that is
 not positive when interval lines are printed, an empty message, no
 connection in persistent mode, a UDP message above 65507 bytes, an empty
-addresses file, an unknown protocol or flavor, `--tcp-info` with UDP or on
-a platform other than Linux. `FuzzParse` checks the
-options validation accepts against an independent computation of the
-message count.
+addresses file, an unknown protocol or flavor, `--tcp-info` with UDP or on a
+platform other than Linux. `FuzzParse` checks the options validation accepts
+against an independent computation of the message count.
 
 Exit statuses: 0 on success (also after Ctrl-C, which interrupts the
 requests in flight and prints the report), 1 for invalid options, run
@@ -258,9 +263,9 @@ separator and a line per peer (or a single merged line) for the whole run.
 are whole microseconds, truncated. With `--tcp-info`, the text report ends
 with a section of its own: a separator, a header, and a line per peer (or a
 single merged line) of TCP statistics. Each JSON object ends with a
-`tcp_info` object. Without the option, the output is unchanged. The column layout and the JSON field
-names and order are a public format, pinned by golden tests in
-`internal/report`.
+`tcp_info` object. Without the option, the output is unchanged. The column
+layout and the JSON field names and order are a public format, pinned by
+golden tests in `internal/report`.
 
 ## 9. Release
 

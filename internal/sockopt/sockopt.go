@@ -12,10 +12,12 @@ type TCPInfo struct {
 	// SYN included (tcpi_total_retrans).
 	RetransSegs uint32
 	// SegsOut is the number of segments the connection sent,
-	// retransmissions included (tcpi_segs_out).
+	// retransmissions included (tcpi_segs_out). It is 0 before Linux 4.2,
+	// whose TCP_INFO is shorter.
 	SegsOut uint32
 	// RTT is the kernel's smoothed round-trip time (tcpi_rtt), or 0 when it
-	// has no RTT sample yet (an unanswered SYN).
+	// has no RTT sample yet (for instance a SYN sent with Fast Open and
+	// never answered).
 	RTT time.Duration
 	// FastOpen reports that the data sent in the SYN was acknowledged (TCP
 	// Fast Open, TCPI_OPT_SYN_DATA).

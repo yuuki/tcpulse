@@ -283,13 +283,18 @@ PEER                 CONNS      RETRANS_CONNS   RETRANS_SEGS    SEGS_OUT        
 - `CONNS`: The connections whose TCP_INFO was read: every connection that was opened, including those whose request failed or was cut off by the end of the run. A connection that could not be dialed has no socket to read and is not counted.
 - `RETRANS_CONNS`: The connections that retransmitted at least one segment
 - `RETRANS_SEGS`: The segments retransmitted, SYNs included (`tcpi_total_retrans`)
-- `SEGS_OUT`: The segments sent, retransmissions included (`tcpi_segs_out`). `RETRANS_SEGS / SEGS_OUT` is the retransmission rate.
-- `SRTT_*`: The kernel's smoothed round-trip time (`tcpi_rtt`), in microseconds: the mean, the 99th percentile (within 0.8%) and the maximum over the connections that have one. A connection whose SYN was never answered has none. They are 0 when no connection has an RTT.
-- `TFO_CONNS`: The connections whose data in the SYN was acknowledged by TCP Fast Open (`TCPI_OPT_SYN_DATA`). The server side needs `net.ipv4.tcp_fastopen` with its server bit, for instance `3`.
+- `SEGS_OUT`: The segments sent, retransmissions included (`tcpi_segs_out`, Linux 4.2+; it reads 0 on older kernels). SYNs and pure ACKs count too, as in the kernel's `OutSegs`, so `RETRANS_SEGS / SEGS_OUT` is lower than a rate over data segments.
+- `SRTT_*`: The kernel's smoothed round-trip time (`tcpi_rtt`), in microseconds: the mean, the 99th percentile (within 0.8%) and the maximum over the connections that have an RTT sample. A connection may have none, for instance when its SYN, sent with Fast Open, was never answered. They are 0 when no connection has one.
+- `TFO_CONNS`: The connections whose data in the SYN was acknowledged by TCP Fast Open (`TCPI_OPT_SYN_DATA`). The client side is on by default (`net.ipv4.tcp_fastopen=1`); the server side also needs the server bit (`3`). The tcpulse server accepts one pending Fast Open request per listener at a time, so concurrent handshakes beyond it fall back to a plain handshake.
 
-The kernel's RTT leaves out the time spent in the client's process (system calls, the Go runtime), which `LAT_*` includes. In ephemeral mode, a round trip also includes the handshake, about one more RTT.
+The kernel's RTT leaves out the time spent in the client's process (system calls, the Go runtime), which `LAT_*` includes. In ephemeral mode, a round trip also includes the handshake, about one more RTT, unless the message travels in the SYN with Fast Open.
 
-When data sent in a SYN with a Fast Open cookie is not accepted, for instance because the server no longer enables Fast Open, the client sends it again after the handshake, and that counts as a retransmission. `RETRANS_CONNS` close to `CONNS` with `TFO_CONNS` at 0 means exactly that, not packet loss.
+Retransmissions have two common causes, which these counters alone do not tell apart:
+
+- **Lost segments, SYNs in particular:** a SYN is retransmitted after the initial timeout of 1s, then 2s more, so in ephemeral mode SYN loss shows as steps of 1s or 3s in the latencies (`LAT_MAX`, `LAT_99p`).
+- **TCP Fast Open falling back:** when the server does not accept the data sent in a SYN with a cookie (it no longer enables Fast Open, or its queue of pending Fast Open requests is full), the client sends the data again right after the handshake. That counts as one retransmission per connection, without loss and without the delay of a timeout.
+
+The host's kernel counters `TCPSynRetrans` and `TCPFastOpenActiveFail` (`nstat`, or `/proc/net/netstat`) separate the two.
 
 Interval lines do not include these statistics: a persistent connection is read only when it ends. With `--jsonlines`, each object ends with a `tcp_info` object:
 

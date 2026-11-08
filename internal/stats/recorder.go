@@ -140,8 +140,8 @@ func (r *Recorder) RecordConn(c Conn) {
 	if c.FastOpen {
 		r.conns.FastOpenConns++
 	}
-	// A connection without an RTT sample (its SYN was never answered) has
-	// no RTT, not an RTT of 0.
+	// A connection without an RTT sample (for instance a SYN sent with
+	// Fast Open and never answered) has no RTT, not an RTT of 0.
 	if c.RTT > 0 {
 		r.rtts.Record(c.RTT)
 	}
