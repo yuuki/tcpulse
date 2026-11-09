@@ -143,9 +143,9 @@ type run struct {
 	tcpInfoWarning sync.Once
 	// eventWarning logs once a connection whose events could not be read.
 	eventWarning sync.Once
-	// breakdownWarning logs once a connection whose timestamps could not be
-	// turned on or read.
-	breakdownWarning sync.Once
+	// breakdownWarnings log once each kind of failure of the timestamps of
+	// a connection (splitter.warn).
+	breakdownWarnings [warnings]sync.Once
 }
 
 // Messages returns how many messages a sender at rate per second sends
@@ -510,7 +510,7 @@ func (r *run) persistent(ctx context.Context) error {
 				timed := split.timed()
 				start := time.Now()
 				if timed {
-					received, err = exchangeTimestamped(conn, split.ts, msg, echo)
+					received, err = exchangeTimestamped(ctx, conn, split.ts, msg, echo)
 				} else {
 					err = exchange(conn, msg, echo)
 				}

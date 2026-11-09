@@ -3,10 +3,12 @@
 package tstamp
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -63,6 +65,24 @@ type Conn struct {
 	payload [1]byte
 	// tx holds the first transmit timestamp of each key not yet forgotten.
 	tx map[uint32]time.Time
+
+	// The arguments and results of the recvmsg(2) calls, and the functions
+	// that make them, built once: a read allocates nothing (unix.Recvmsg
+	// would allocate the address of the peer).
+	hdr        unix.Msghdr
+	iov        unix.Iovec
+	buf        []byte
+	n, oobn    int
+	err        error
+	read       func(fd uintptr) bool // raw.Read: recvmsg of buf
+	recv       func(fd uintptr)      // raw.Control: recvmsg of buf, without waiting
+	errOOBN    int
+	errFlags   int
+	errErr     error
+	recvErrors func(fd uintptr) // raw.Control: recvmsg of the error queue
+
+	// fallbacks counts the reads that waited without Go's poller.
+	fallbacks int
 }
 
 // Enable turns on the timestamps of the TCP connection c. The key of a
@@ -88,7 +108,36 @@ func Enable(c syscall.Conn) (*Conn, error) {
 	// Room for a timestamp, and the error with its offender address.
 	oob := make([]byte, unix.CmsgSpace(int(unsafe.Sizeof(timestamps{})))+
 		unix.CmsgSpace(sizeofSockExtendedErr+unix.SizeofSockaddrInet6))
-	return &Conn{raw: raw, typ: int32(typ), oob: oob, tx: map[uint32]time.Time{}}, nil //nolint:gosec // a socket option
+	tc := &Conn{raw: raw, typ: int32(typ), oob: oob, tx: map[uint32]time.Time{}} //nolint:gosec // a socket option
+	tc.read = func(fd uintptr) bool {
+		tc.n, tc.oobn, _, tc.err = tc.recvmsg(fd, tc.buf, 0)
+		return !errors.Is(tc.err, unix.EAGAIN)
+	}
+	tc.recv = func(fd uintptr) {
+		tc.n, tc.oobn, _, tc.err = tc.recvmsg(fd, tc.buf, unix.MSG_DONTWAIT)
+	}
+	tc.recvErrors = func(fd uintptr) {
+		_, tc.errOOBN, tc.errFlags, tc.errErr = tc.recvmsg(fd, tc.payload[:], unix.MSG_ERRQUEUE|unix.MSG_DONTWAIT)
+	}
+	return tc, nil
+}
+
+// recvmsg calls recvmsg(2) on fd, into p and c.oob, without the address of
+// the peer, with the header kept in c.
+func (c *Conn) recvmsg(fd uintptr, p []byte, flags int) (n, oobn, rflags int, err error) {
+	c.iov.Base = unsafe.SliceData(p)
+	c.iov.SetLen(len(p))
+	c.hdr.Iov = &c.iov
+	c.hdr.SetIovlen(1)
+	c.hdr.Control = unsafe.SliceData(c.oob)
+	c.hdr.SetControllen(len(c.oob))
+	c.hdr.Flags = 0
+	r, _, errno := unix.Syscall(unix.SYS_RECVMSG, fd, uintptr(unsafe.Pointer(&c.hdr)), uintptr(flags))
+	if errno != 0 {
+		return 0, 0, 0, errno
+	}
+	// The kernel's lengths are at most those of the buffers.
+	return int(r), int(c.hdr.Controllen), int(c.hdr.Flags), nil //nolint:gosec // see above
 }
 
 func enable(fd int) (int, error) {
@@ -121,49 +170,68 @@ type timestamps [3]struct{ sec, nsec int64 }
 // ReadFull reads exactly len(buf) bytes from the connection with recvmsg(2),
 // as io.ReadFull reads them, and returns the receive timestamp of the last
 // call: that of the packet that held the last byte. It is the zero Time when
-// the kernel gave none.
-func (c *Conn) ReadFull(buf []byte) (time.Time, error) {
+// the kernel gave none. The deadline of the socket ends it, as it ends a
+// read; so does ctx, at once, when the read waits without Go's poller.
+func (c *Conn) ReadFull(ctx context.Context, buf []byte) (time.Time, error) {
 	var (
 		got int
 		rx  time.Time
 	)
+	defer func() { c.buf = nil }()
 	for got < len(buf) {
-		var (
-			n, oobn int
-			rerr    error
-		)
-		err := c.raw.Read(func(fd uintptr) bool {
-			n, oobn, _, _, rerr = unix.Recvmsg(int(fd), buf[got:], c.oob, 0)
-			return rerr != unix.EAGAIN
-		})
-		if notPollable(err) {
+		c.buf = buf[got:]
+		err := c.raw.Read(c.read)
+		switch {
+		case notPollable(err):
 			// Until the poller sees the socket readable or writable, it
-			// refuses to wait: read without it.
-			n, oobn, err = c.recvWithoutPoller(buf[got:])
-			if errors.Is(err, unix.EAGAIN) {
+			// refuses to wait: wait and read without it.
+			if err = c.recvWithoutPoller(ctx); errors.Is(err, unix.EAGAIN) {
 				continue
 			}
-		} else if err == nil {
-			err = rerr
+			// Data that came after the deadline of the socket belongs to no
+			// round trip: the poller, which checks the deadline before its
+			// error event, tells whether it passed.
+			if err == nil {
+				if derr := c.raw.Read(done); derr != nil && !notPollable(derr) {
+					err = derr
+				}
+			}
+		case err == nil:
+			err = c.err
 		}
 		if err != nil {
 			return time.Time{}, err
 		}
-		if n == 0 {
+		if c.n == 0 {
 			if got == 0 {
 				return time.Time{}, io.EOF
 			}
 			return time.Time{}, io.ErrUnexpectedEOF
 		}
-		got += n
-		rx = time.Time{}
-		eachMessage(c.oob[:oobn], func(level, typ int32, data []byte) {
-			if level == unix.SOL_SOCKET && typ == c.typ {
-				rx = software(data)
-			}
-		})
+		got += c.n
+		rx = c.received(c.oob[:c.oobn])
 	}
 	return rx, nil
+}
+
+// done is a function for raw.Read that reads nothing: raw.Read then only
+// checks the socket's deadline.
+func done(uintptr) bool { return true }
+
+// received returns the receive timestamp of the control messages oob, or
+// the zero Time.
+func (c *Conn) received(oob []byte) time.Time {
+	var rx time.Time
+	for {
+		level, typ, data, rest, ok := nextMessage(oob)
+		if !ok {
+			return rx
+		}
+		if level == unix.SOL_SOCKET && typ == c.typ {
+			rx = software(data)
+		}
+		oob = rest
+	}
 }
 
 // notPollable reports whether err is the poller's "not pollable"
@@ -183,30 +251,122 @@ func notPollable(err error) bool {
 	return false
 }
 
-// pollWait is how long recvWithoutPoller waits for data, so that the
-// deadline of the socket, which the poller checks, ends the read soon after
-// it passes.
-const pollWait = 10 // milliseconds
+// pollWait is how long recvWithoutPoller waits for data before it lets the
+// poller check the deadline of the socket: a deadline set otherwise than by
+// the ctx of ReadFull ends the read at most that late.
+const pollWait = 100 * time.Millisecond
 
 // recvWithoutPoller reads the transmit timestamps queued, whose error event
-// stops poll(2) from waiting too, waits up to pollWait for data, and reads
-// it. It returns EAGAIN when none came.
-func (c *Conn) recvWithoutPoller(buf []byte) (n, oobn int, err error) {
-	if err := c.Drain(); err != nil {
-		return 0, 0, err
+// would wake the wait at once, waits up to pollWait for the socket, with the
+// waiter of the process, or until ctx is done, and reads what it can without
+// waiting. It returns EAGAIN when nothing came.
+func (c *Conn) recvWithoutPoller(ctx context.Context) error {
+	c.fallbacks++
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	var rerr error
-	err = c.raw.Control(func(fd uintptr) {
-		fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}} //nolint:gosec // a file descriptor
-		if _, rerr = unix.Poll(fds, pollWait); rerr != nil && !errors.Is(rerr, unix.EINTR) {
+	if err := c.Drain(); err != nil {
+		return err
+	}
+	w, err := processWaiter()
+	if err != nil {
+		return err
+	}
+	if err := w.wait(ctx, c.raw, pollWait); err != nil {
+		return err
+	}
+	if err := c.raw.Control(c.recv); err != nil {
+		return err
+	}
+	return c.err
+}
+
+// waiter waits for sockets to be readable, for the readers that Go's poller
+// refuses to wait for (notPollable), with an epoll instance of its own: one
+// goroutine, and so one thread, waits for them all, where poll(2) would
+// block a thread per reader. The instance is level-triggered, so that data
+// already there, or an error, wakes a wait at once.
+type waiter struct {
+	epfd  int
+	mu    sync.Mutex
+	woken map[int32]chan struct{}
+}
+
+// processWaiter returns the waiter of the process, started the first time
+// a read needs it.
+var processWaiter = sync.OnceValues(func() (*waiter, error) {
+	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
+	if err != nil {
+		return nil, fmt.Errorf("creating an epoll instance: %w", err)
+	}
+	w := &waiter{epfd: epfd, woken: map[int32]chan struct{}{}}
+	go w.run()
+	return w, nil
+})
+
+func (w *waiter) run() {
+	events := make([]unix.EpollEvent, 128)
+	for {
+		n, err := unix.EpollWait(w.epfd, events, -1)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			// The waits then end at their timeout, and the reads retry.
 			return
 		}
-		n, oobn, _, _, rerr = unix.Recvmsg(int(fd), buf, c.oob, unix.MSG_DONTWAIT)
+		w.mu.Lock()
+		for _, ev := range events[:n] {
+			if ch, ok := w.woken[ev.Fd]; ok {
+				select {
+				case ch <- struct{}{}:
+				default:
+				}
+			}
+		}
+		w.mu.Unlock()
+	}
+}
+
+// wait waits up to timeout, or until ctx is done, for the socket of raw to
+// be readable, or to have an error or a hangup.
+func (w *waiter) wait(ctx context.Context, raw syscall.RawConn, timeout time.Duration) error {
+	ch := make(chan struct{}, 1)
+	var (
+		key  int32
+		cerr error
+	)
+	err := raw.Control(func(fd uintptr) {
+		key = int32(fd) //nolint:gosec // a file descriptor
+		w.mu.Lock()
+		w.woken[key] = ch
+		w.mu.Unlock()
+		ev := unix.EpollEvent{Events: unix.EPOLLIN | unix.EPOLLONESHOT, Fd: key}
+		cerr = unix.EpollCtl(w.epfd, unix.EPOLL_CTL_ADD, int(fd), &ev)
+		if errors.Is(cerr, unix.EEXIST) {
+			cerr = unix.EpollCtl(w.epfd, unix.EPOLL_CTL_MOD, int(fd), &ev)
+		}
 	})
 	if err == nil {
-		err = rerr
+		err = cerr
 	}
-	return n, oobn, err
+	defer func() {
+		_ = raw.Control(func(fd uintptr) { _ = unix.EpollCtl(w.epfd, unix.EPOLL_CTL_DEL, int(fd), nil) })
+		w.mu.Lock()
+		delete(w.woken, key)
+		w.mu.Unlock()
+	}()
+	if err != nil {
+		return fmt.Errorf("waiting for the socket: %w", err)
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ch:
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+	return nil
 }
 
 // OutOfOrder returns the number of packets that the connection received out
@@ -242,16 +402,9 @@ func (c *Conn) OutOfOrder() (uint32, bool, error) {
 // stacked, retransmissions), the first counts.
 func (c *Conn) Drain() error {
 	for {
-		var (
-			oobn  int
-			rflag int
-			rerr  error
-		)
-		err := c.raw.Control(func(fd uintptr) {
-			_, oobn, rflag, _, rerr = unix.Recvmsg(int(fd), c.payload[:], c.oob, unix.MSG_ERRQUEUE|unix.MSG_DONTWAIT)
-		})
+		err := c.raw.Control(c.recvErrors)
 		if err == nil {
-			err = rerr
+			err = c.errErr
 		}
 		if errors.Is(err, unix.EAGAIN) {
 			return nil
@@ -259,7 +412,7 @@ func (c *Conn) Drain() error {
 		if err != nil {
 			return fmt.Errorf("reading the transmit timestamps: %w", err)
 		}
-		if rflag&unix.MSG_CTRUNC != 0 {
+		if c.errFlags&unix.MSG_CTRUNC != 0 {
 			return errors.New("reading the transmit timestamps: control messages truncated")
 		}
 		var (
@@ -267,20 +420,25 @@ func (c *Conn) Drain() error {
 			key     uint32
 			stamped bool
 		)
-		eachMessage(c.oob[:oobn], func(level, typ int32, data []byte) {
+		for oob := c.oob[:c.errOOBN]; ; {
+			level, typ, data, rest, ok := nextMessage(oob)
+			if !ok {
+				break
+			}
+			oob = rest
 			switch {
 			case level == unix.SOL_SOCKET && typ == c.typ:
 				ts = software(data)
 			case level == unix.SOL_IP && typ == unix.IP_RECVERR, level == unix.SOL_IPV6 && typ == unix.IPV6_RECVERR:
 				if len(data) < sizeofSockExtendedErr {
-					return
+					continue
 				}
 				e := (*unix.SockExtendedErr)(unsafe.Pointer(&data[0]))
 				if e.Errno == uint32(unix.ENOMSG) && e.Origin == unix.SO_EE_ORIGIN_TIMESTAMPING && e.Info == unix.SCM_TSTAMP_SND {
 					key, stamped = e.Data, true
 				}
 			}
-		})
+		}
 		if !stamped || ts.IsZero() {
 			continue
 		}
@@ -307,21 +465,31 @@ func (c *Conn) Forget(key uint32) {
 	}
 }
 
+// nextMessage returns the first control message of oob, and the messages
+// after it, or false when oob holds none, or one cut short.
+func nextMessage(oob []byte) (level, typ int32, data, rest []byte, ok bool) {
+	if len(oob) < unix.SizeofCmsghdr {
+		return 0, 0, nil, nil, false
+	}
+	h := (*unix.Cmsghdr)(unsafe.Pointer(&oob[0]))
+	// A length above the int range becomes negative, and is refused.
+	l := int(h.Len) //nolint:gosec // see above
+	if l < unix.CmsgLen(0) || l > len(oob) {
+		return 0, 0, nil, nil, false
+	}
+	next := min(unix.CmsgSpace(l-unix.CmsgLen(0)), len(oob))
+	return h.Level, h.Type, oob[unix.CmsgLen(0):l], oob[next:], true
+}
+
 // eachMessage calls f with every control message of oob.
 func eachMessage(oob []byte, f func(level, typ int32, data []byte)) {
-	for len(oob) >= unix.SizeofCmsghdr {
-		h := (*unix.Cmsghdr)(unsafe.Pointer(&oob[0]))
-		// A length above the int range becomes negative, and is refused.
-		l := int(h.Len) //nolint:gosec // see above
-		if l < unix.CmsgLen(0) || l > len(oob) {
+	for {
+		level, typ, data, rest, ok := nextMessage(oob)
+		if !ok {
 			return
 		}
-		f(h.Level, h.Type, oob[unix.CmsgLen(0):l])
-		next := unix.CmsgSpace(l - unix.CmsgLen(0))
-		if next > len(oob) {
-			return
-		}
-		oob = oob[next:]
+		f(level, typ, data)
+		oob = rest
 	}
 }
 

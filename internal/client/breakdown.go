@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -38,9 +39,11 @@ func PrepareBreakdown() (release func(), err error) {
 type splitter struct {
 	run  *run
 	conn net.Conn
-	// ts reads the timestamps once they are on; broken is set when they
-	// cannot be.
+	// ts reads the echoes and their timestamps once the timestamps are on,
+	// and stamps the transmit timestamps (ts, or a fake in tests); broken is
+	// set when they cannot be.
 	ts     *tstamp.Conn
+	stamps stamps
 	broken bool
 	// written counts the bytes written since the timestamps were turned on.
 	written uint32
@@ -53,6 +56,23 @@ type splitter struct {
 	// read or given up.
 	pending *timedRoundTrip
 }
+
+// stamps is what a splitter reads of the timestamps of a connection after
+// its round trips.
+type stamps interface {
+	Drain() error
+	Transmitted(key uint32) (time.Time, bool)
+	Forget(key uint32)
+	OutOfOrder() (count uint32, ok bool, err error)
+}
+
+// The warnings of a splitter, each logged once per target.
+const (
+	warnEnable = iota
+	warnTimestamps
+	warnTCPInfo
+	warnings
+)
 
 // timedRoundTrip is a completed round trip: when it started and ended, when
 // the last byte of its echo was received (zero without a timestamp), the
@@ -75,27 +95,27 @@ func (s *splitter) enable() {
 	ts, err := tstamp.Enable(s.conn.(syscall.Conn))
 	switch {
 	case err == nil:
-		s.ts = ts
+		s.ts, s.stamps = ts, ts
 		s.outOfOrder, s.ooo = s.readOutOfOrder()
 	case errors.Is(err, tstamp.ErrNotReady):
 		// Tried again after the next round trip.
 	default:
 		s.broken = true
-		s.warn("could not turn on the timestamps of a connection", err)
+		s.warn(warnEnable, "could not turn on the timestamps of a connection", err)
 	}
 }
 
-func (s *splitter) warn(msg string, err error) {
-	s.run.breakdownWarning.Do(func() {
+func (s *splitter) warn(kind int, msg string, err error) {
+	s.run.breakdownWarnings[kind].Do(func() {
 		s.run.logger.Warn(msg, "addr", s.run.addr, "error", err)
 	})
 }
 
 // readOutOfOrder reads the count of packets received out of order.
 func (s *splitter) readOutOfOrder() (uint32, bool) {
-	count, ok, err := s.ts.OutOfOrder()
+	count, ok, err := s.stamps.OutOfOrder()
 	if err != nil {
-		s.warn("could not read TCP_INFO of a connection", err)
+		s.warn(warnTCPInfo, "could not read TCP_INFO of a connection", err)
 	}
 	return count, ok && err == nil
 }
@@ -128,7 +148,7 @@ func (s *splitter) roundTrip(start, end, received time.Time, n int) {
 	if s == nil {
 		return
 	}
-	if s.ts == nil {
+	if s.stamps == nil {
 		s.run.rec.RecordMissingBreakdown()
 		if !s.broken {
 			s.enable()
@@ -151,14 +171,14 @@ func (s *splitter) roundTrip(start, end, received time.Time, n int) {
 	// The keys wrap around at 2^32, as the kernel's do (OPT_ID).
 	s.written += uint32(n) //nolint:gosec // see above
 	s.pending = &timedRoundTrip{start: start, end: end, received: received, last: s.written - 1, outOfOrder: outOfOrder}
-	if _, ok := s.ts.Transmitted(s.pending.last); ok || received.IsZero() {
+	if _, ok := s.stamps.Transmitted(s.pending.last); ok || received.IsZero() {
 		s.settle()
 	}
 }
 
 // close settles the last round trip, when the connection ends.
 func (s *splitter) close() {
-	if s == nil || s.ts == nil {
+	if s == nil || s.stamps == nil {
 		return
 	}
 	s.drain()
@@ -166,8 +186,8 @@ func (s *splitter) close() {
 }
 
 func (s *splitter) drain() {
-	if err := s.ts.Drain(); err != nil {
-		s.warn("could not read the transmit timestamps of a connection", err)
+	if err := s.stamps.Drain(); err != nil {
+		s.warn(warnTimestamps, "could not read the transmit timestamps of a connection", err)
 	}
 }
 
@@ -180,8 +200,8 @@ func (s *splitter) settle() {
 		return
 	}
 	s.pending = nil
-	sent, ok := s.ts.Transmitted(p.last)
-	s.ts.Forget(p.last)
+	sent, ok := s.stamps.Transmitted(p.last)
+	s.stamps.Forget(p.last)
 	if !ok || p.received.IsZero() {
 		s.run.rec.RecordMissingBreakdown()
 		return
@@ -200,12 +220,12 @@ func (s *splitter) settle() {
 
 // exchangeTimestamped is exchange, reading the echo with ts, and returns
 // the receive timestamp of its last byte (zero when the kernel gave none).
-func exchangeTimestamped(conn net.Conn, ts *tstamp.Conn, msg, echo []byte) (time.Time, error) {
+func exchangeTimestamped(ctx context.Context, conn net.Conn, ts *tstamp.Conn, msg, echo []byte) (time.Time, error) {
 	if len(msg) <= concurrentEchoBytes {
 		if _, err := conn.Write(msg); err != nil {
 			return time.Time{}, fmt.Errorf("writing to connection: %w", err)
 		}
-		received, err := ts.ReadFull(echo)
+		received, err := ts.ReadFull(ctx, echo)
 		if err != nil {
 			return time.Time{}, fmt.Errorf("reading from connection: %w", err)
 		}
@@ -217,7 +237,7 @@ func exchangeTimestamped(conn net.Conn, ts *tstamp.Conn, msg, echo []byte) (time
 		_, err := conn.Write(msg)
 		written <- err
 	}()
-	received, readErr := ts.ReadFull(echo)
+	received, readErr := ts.ReadFull(ctx, echo)
 	if readErr != nil {
 		// Unblock the write: the connection is done. The write then fails
 		// because of the deadline: the read's error is the one to report.

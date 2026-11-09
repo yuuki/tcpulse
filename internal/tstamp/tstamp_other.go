@@ -3,6 +3,7 @@
 package tstamp
 
 import (
+	"context"
 	"errors"
 	"syscall"
 	"time"
@@ -18,7 +19,9 @@ type Conn struct{}
 func Enable(syscall.Conn) (*Conn, error) { return nil, errors.ErrUnsupported }
 
 // ReadFull is not supported on this platform.
-func (*Conn) ReadFull([]byte) (time.Time, error) { return time.Time{}, errors.ErrUnsupported }
+func (*Conn) ReadFull(context.Context, []byte) (time.Time, error) {
+	return time.Time{}, errors.ErrUnsupported
+}
 
 // Drain is not supported on this platform.
 func (*Conn) Drain() error { return errors.ErrUnsupported }

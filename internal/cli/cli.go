@@ -254,15 +254,8 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 		events = tracer
 	}
 
-	printer := report.NewPrinter(stdout)
-	if !o.jsonlines {
-		if err := printer.Header(); err != nil {
-			return err
-		}
-	}
-
-	// Before the clock of the run: the first round trips would have no
-	// receive timestamp otherwise.
+	// Before printing, and before the clock of the run: the first round
+	// trips would have no receive timestamp otherwise.
 	if o.latencyBreakdown {
 		release, err := client.PrepareBreakdown()
 		switch {
@@ -272,6 +265,13 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 			logger.Warn("the first round trips may have no receive timestamp", "error", err)
 		default:
 			defer release()
+		}
+	}
+
+	printer := report.NewPrinter(stdout)
+	if !o.jsonlines {
+		if err := printer.Header(); err != nil {
+			return err
 		}
 	}
 

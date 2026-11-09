@@ -317,10 +317,18 @@ through `internal/tstamp`. Issue #50 records the analysis.
   (the echo not back, the send buffer full, as with messages larger than
   it), epoll reports the error alone, and Go's poller refuses to wait on the
   socket ("not pollable") until it sees it readable or writable. `ReadFull`
-  then reads the timestamps queued, which clears the error, waits with
-  `poll(2)` for up to 10ms, and reads; the poller still checks the deadline
-  at every turn. Without it, messages of 50 KB on a path of 1500 bytes
+  then reads the timestamps queued, which clears the error, waits for the
+  socket with an epoll instance of its own, level-triggered, where one
+  goroutine, and so one thread, waits for all such readers (`poll(2)` would
+  block a thread each: 200 slow connections took 131 threads, and enough of
+  them exhaust Go's), and reads. A wait ends when the socket is readable, at
+  the end of the run (the context of the read), or after 100ms, when the
+  poller checks the deadline of the socket; data read after the deadline is
+  not a round trip. Without this, messages of 50 KB on a path of 1500 bytes
   failed the run.
+- **Allocations:** the reads keep their `recvmsg(2)` header and functions in
+  the connection, and call the system call directly (`unix.Recvmsg`
+  allocates the peer's address): a read allocates nothing.
 - **Clock:** the kernel's timestamps are in the system's time
   (`CLOCK_REALTIME`). `time.Now` reads it just before the monotonic time
   that times the round trip; the end is read right after the clock stops.

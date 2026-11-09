@@ -3,10 +3,15 @@
 package tstamp
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
 	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -74,7 +79,7 @@ func TestTimestamps(t *testing.T) {
 			t.Fatal(err)
 		}
 		echo := make([]byte, len(msg))
-		rx, err := ts.ReadFull(echo)
+		rx, err := ts.ReadFull(t.Context(), echo)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -124,10 +129,10 @@ func TestReadFullEOF(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = server.Close()
-	if _, err := ts.ReadFull(make([]byte, 3)); !errors.Is(err, io.ErrUnexpectedEOF) {
+	if _, err := ts.ReadFull(t.Context(), make([]byte, 3)); !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("ReadFull of 3 bytes when 2 come: %v, want io.ErrUnexpectedEOF", err)
 	}
-	if _, err := ts.ReadFull(make([]byte, 1)); !errors.Is(err, io.EOF) {
+	if _, err := ts.ReadFull(t.Context(), make([]byte, 1)); !errors.Is(err, io.EOF) {
 		t.Fatalf("ReadFull at the end: %v, want io.EOF", err)
 	}
 }
@@ -139,7 +144,7 @@ func TestReadFullDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = client.SetDeadline(time.Now().Add(100 * time.Millisecond))
-	if _, err := ts.ReadFull(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
+	if _, err := ts.ReadFull(t.Context(), make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("ReadFull past the deadline: %v, want os.ErrDeadlineExceeded", err)
 	}
 }
@@ -242,7 +247,7 @@ func TestReadFullErrorEvent(t *testing.T) {
 			_, err := client.Write(msg)
 			written <- err
 		}()
-		if _, err := ts.ReadFull(echo); err != nil {
+		if _, err := ts.ReadFull(t.Context(), echo); err != nil {
 			t.Fatalf("round trip %d: %v", i, err)
 		}
 		if err := <-written; err != nil {
@@ -255,6 +260,204 @@ func TestReadFullErrorEvent(t *testing.T) {
 			t.Logf("round trip %d: no transmit timestamp of its last byte", i)
 		}
 	}
+	if ts.fallbacks == 0 {
+		t.Skip("the poller never refused to wait: the fallback did not run")
+	}
+}
+
+// slowEchoes accepts connections on a loopback listener and, for each,
+// reads a message of size bytes slowly through a small receive buffer, waits
+// for wait, and echoes it: the client's reader waits while its send buffer
+// is full, which makes the poller refuse to wait.
+func slowEchoes(t *testing.T, size int, wait time.Duration) string {
+	t.Helper()
+	prepare(t)
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			server, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer server.Close()
+				_ = server.(*net.TCPConn).SetReadBuffer(4096)
+				buf := make([]byte, size)
+				for got := 0; got < len(buf); {
+					n, err := server.Read(buf[got:min(got+2048, len(buf))])
+					if err != nil {
+						return
+					}
+					got += n
+					time.Sleep(2 * time.Millisecond)
+				}
+				time.Sleep(wait)
+				_, _ = server.Write(buf)
+				_, _ = io.Copy(io.Discard, server)
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// slowClient dials addr with a small send buffer and turns its timestamps on.
+func slowClient(t *testing.T, addr string) (net.Conn, *Conn, error) {
+	conn, err := net.Dial("tcp4", addr)
+	if err != nil {
+		return nil, nil, err
+	}
+	_ = conn.(*net.TCPConn).SetWriteBuffer(4096)
+	ts, err := Enable(conn.(*net.TCPConn))
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	return conn, ts, nil
+}
+
+// TestReadFullFallbackDeadline checks that the deadline of the socket ends
+// a read that waits without the poller.
+func TestReadFullFallbackDeadline(t *testing.T) {
+	addr := slowEchoes(t, 256*1024, 10*time.Second)
+	conn, ts, err := slowClient(t, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	start := time.Now()
+	_ = conn.SetDeadline(start.Add(time.Second))
+	go func() { _, _ = conn.Write(make([]byte, 256*1024)) }()
+	_, err = ts.ReadFull(t.Context(), make([]byte, 256*1024))
+	took := time.Since(start)
+	if !errors.Is(err, os.ErrDeadlineExceeded) || took < time.Second || took > 2*time.Second {
+		t.Fatalf("ReadFull: %v after %v, want the deadline's error after 1s", err, took)
+	}
+	if ts.fallbacks == 0 {
+		t.Skip("the poller never refused to wait: the fallback did not run")
+	}
+}
+
+// TestReadFullFallbackContext checks that the end of ctx ends a read at
+// once, wherever it waits. As the client does, the end of ctx also sets the
+// deadline of the socket, which interrupts a wait in the poller; ctx itself
+// interrupts a wait without it.
+func TestReadFullFallbackContext(t *testing.T) {
+	addr := slowEchoes(t, 256*1024, 10*time.Second)
+	conn, ts, err := slowClient(t, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	go func() { _, _ = conn.Write(make([]byte, 256*1024)) }()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	defer context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })()
+	start := time.Now()
+	_, err = ts.ReadFull(ctx, make([]byte, 256*1024))
+	took := time.Since(start)
+	if ts.fallbacks == 0 {
+		t.Skip("the poller never refused to wait: the fallback did not run")
+	}
+	// Within the time of a turn, far less than pollWait.
+	ended := errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded)
+	if !ended || took < time.Second || took > time.Second+pollWait/2 {
+		t.Fatalf("ReadFull: %v after %v, want the end of the context after 1s", err, took)
+	}
+}
+
+// threads returns the number of threads of the process.
+func threads(t *testing.T) int {
+	b, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(line, "Threads:"); ok {
+			n, err := strconv.Atoi(strings.TrimSpace(v))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return n
+		}
+	}
+	t.Fatal("no thread count")
+	return 0
+}
+
+// TestFallbackThreads checks that many readers waiting without the poller
+// do not block a thread each.
+func TestFallbackThreads(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits for 200 slow echoes")
+	}
+	const readers = 200
+	addr := slowEchoes(t, 256*1024, time.Second)
+	var (
+		wg        sync.WaitGroup
+		fallbacks atomic.Int64
+	)
+	for range readers {
+		wg.Go(func() {
+			conn, ts, err := slowClient(t, addr)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+			go func() { _, _ = conn.Write(make([]byte, 256*1024)) }()
+			if _, err := ts.ReadFull(t.Context(), make([]byte, 256*1024)); err != nil {
+				t.Error(err)
+			}
+			fallbacks.Add(int64(ts.fallbacks))
+		})
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	peak := 0
+	for tick := time.NewTicker(50 * time.Millisecond); ; {
+		select {
+		case <-tick.C:
+			peak = max(peak, threads(t))
+			continue
+		case <-done:
+			tick.Stop()
+		}
+		break
+	}
+	if fallbacks.Load() == 0 {
+		t.Skip("the poller never refused to wait: the fallback did not run")
+	}
+	if peak > readers/4 {
+		t.Fatalf("%d threads at most for %d readers waiting without the poller (%d turns)", peak, readers, fallbacks.Load())
+	}
+	t.Logf("%d threads at most, %d turns without the poller", peak, fallbacks.Load())
+}
+
+func TestReadFullAllocations(t *testing.T) {
+	client, server := echoPair(t)
+	ts, err := Enable(client.(*net.TCPConn))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Write(make([]byte, 1000)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1)
+	if _, err := ts.ReadFull(t.Context(), buf); err != nil {
+		t.Fatal(err)
+	}
+	if n := testing.AllocsPerRun(100, func() {
+		if _, err := ts.ReadFull(t.Context(), buf); err != nil {
+			t.Fatal(err)
+		}
+	}); n != 0 {
+		t.Fatalf("ReadFull allocates %v times per call", n)
+	}
 }
 
 func TestOutOfOrder(t *testing.T) {
@@ -266,7 +469,7 @@ func TestOutOfOrder(t *testing.T) {
 	if _, err := server.Write([]byte("in order")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ts.ReadFull(make([]byte, 8)); err != nil {
+	if _, err := ts.ReadFull(t.Context(), make([]byte, 8)); err != nil {
 		t.Fatal(err)
 	}
 	n, ok, err := ts.OutOfOrder()
