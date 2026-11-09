@@ -53,7 +53,16 @@ struct sock {
 	struct sock_common __sk_common;
 } __attribute__((preserve_access_index));
 
-struct sk_buff;
+/*
+ * Before Linux 6.9, sk shares a union with ip_defrag_offset, which a
+ * fragment queued for reassembly sets: its sk is then not a socket. Such a
+ * fragment has no destructor, while every packet that belongs to a socket
+ * has one (count_drop). CO-RE finds the fields by name, in a union or not.
+ */
+struct sk_buff {
+	struct sock *sk;
+	void (*destructor)(struct sk_buff *skb);
+} __attribute__((preserve_access_index));
 
 /* Bit fields: read with BPF_CORE_READ_BITFIELD_PROBED, which relocates
  * their offset, size and shifts. */
@@ -66,9 +75,20 @@ struct tcp_sock {
 	__u8 syn_data_acked : 1;
 } __attribute__((preserve_access_index));
 
+/* The drop reasons a connection keeps apart (count_drop). */
+#define KEVENTS_DROP_SLOTS 4
+
+/* The drops of one reason. */
+struct kevents_drop_count {
+	/* The reason (enum skb_drop_reason) plus one: 0 marks a free slot. On
+	 * Linux 5.17, reason 0 is a reason (SKB_DROP_REASON_NOT_SPECIFIED). */
+	__u32 reason;
+	__u32 count;
+};
+
 /*
  * The events counted on a connection, kept in its socket storage. User space
- * reads it by socket file descriptor (internal/kevents: counts).
+ * reads it by socket file descriptor (internal/kevents: ReadEvents).
  */
 struct kevents_counts {
 	__u32 syn_retrans;
@@ -77,6 +97,11 @@ struct kevents_counts {
 	__u32 other_retrans;
 	__u32 resets_received;
 	__u32 flags;
+	/* The drops of the first reasons met, in the order they were met; a
+	 * slot keeps its reason once it has one. */
+	struct kevents_drop_count drops[KEVENTS_DROP_SLOTS];
+	/* The drops of the reasons met after the slots were all taken. */
+	__u32 other_drops;
 };
 
 /* flags */

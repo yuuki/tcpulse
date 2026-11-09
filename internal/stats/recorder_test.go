@@ -1,6 +1,7 @@
 package stats
 
 import (
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -145,7 +146,7 @@ func TestRecorderConnsConcurrent(t *testing.T) {
 
 func TestRecorderEvents(t *testing.T) {
 	r := NewRecorder()
-	if s := r.Events(); s != (EventSummary{}) {
+	if s := r.Events(); !reflect.DeepEqual(s, EventSummary{}) {
 		t.Fatalf("no event = %+v, want zero", s)
 	}
 	r.RecordEvents(100*time.Microsecond, Events{})
@@ -154,20 +155,32 @@ func TestRecorderEvents(t *testing.T) {
 	r.RecordEvents(300*time.Millisecond, Events{RTORetrans: 1, OtherRetrans: 3})
 	r.RecordEvents(time.Millisecond, Events{FastOpenRetrans: 1})
 	r.RecordEvents(time.Millisecond, Events{ResetsReceived: 1})
+	r.RecordEvents(2*time.Second, Events{RTORetrans: 1, Drops: [DropSlots]DropCount{{Reason: 15, Count: 2}, {Reason: 6, Count: 1}}})
+	// A slot that has a reason but no drop is not an event.
+	r.RecordEvents(time.Millisecond, Events{Drops: [DropSlots]DropCount{{Reason: 15}}})
 	r.RecordUntracked()
-	r.RecordUnmatched(Events{SYNRetrans: 3, RTORetrans: 1, ResetsReceived: 2})
+	r.RecordUnmatched(Events{SYNRetrans: 3, RTORetrans: 1, ResetsReceived: 2, Drops: [DropSlots]DropCount{{Reason: 15, Count: 1}}, OtherDrops: 4})
 
 	want := EventSummary{
-		RoundTrips:        4,
-		RetransRoundTrips: RetransCounts{SYN: 1, FastOpen: 1, RTO: 1, Other: 1},
-		WithEvents:        LatencySummary{Count: 4, P99: time.Second, Max: time.Second},
-		WithoutEvents:     LatencySummary{Count: 2, P99: 200 * time.Microsecond, Max: 200 * time.Microsecond},
+		RoundTrips:        5,
+		RetransRoundTrips: RetransCounts{SYN: 1, FastOpen: 1, RTO: 2, Other: 1},
+		WithEvents:        LatencySummary{Count: 5, P99: 2 * time.Second, Max: 2 * time.Second},
+		WithoutEvents:     LatencySummary{Count: 3, P99: time.Millisecond, Max: time.Millisecond},
 		ResetsReceived:    3,
+		DropRoundTrips:    1,
+		Drops:             map[uint32]int64{15: 3, 6: 1},
+		OtherDrops:        4,
 		Unmatched:         RetransCounts{SYN: 3, RTO: 1},
 		Untracked:         1,
 	}
-	if s := r.Events(); s != want {
+	s := r.Events()
+	if !reflect.DeepEqual(s, want) {
 		t.Fatalf("events = %+v\nwant %+v", s, want)
+	}
+	// The summary is a copy.
+	s.Drops[15] = 0
+	if r.Events().Drops[15] != 3 {
+		t.Fatal("the summary shares the drops of the Recorder")
 	}
 	if want.Unmatched.Total() != 4 {
 		t.Fatalf("Total() = %d, want 4", want.Unmatched.Total())
@@ -182,5 +195,29 @@ func TestEventsSub(t *testing.T) {
 	}
 	if !before.Sub(before).IsZero() || after.IsZero() {
 		t.Fatal("IsZero")
+	}
+}
+
+func TestEventsSubDrops(t *testing.T) {
+	// Between the readings, a second slot was taken and the first counted
+	// again; the third was taken but not yet counted.
+	before := Events{Drops: [DropSlots]DropCount{{Reason: 15, Count: 2}}}
+	after := Events{
+		Drops:      [DropSlots]DropCount{{Reason: 15, Count: 3}, {Reason: 6, Count: 1}, {Reason: 77}},
+		OtherDrops: 2,
+	}
+	want := Events{Drops: [DropSlots]DropCount{{Reason: 15, Count: 1}, {Reason: 6, Count: 1}}, OtherDrops: 2}
+	if d := after.Sub(before); d != want {
+		t.Fatalf("Sub = %+v\nwant %+v", d, want)
+	}
+	if n := after.DroppedPackets(); n != 6 {
+		t.Fatalf("DroppedPackets = %d, want 6", n)
+	}
+	// Unchanged drops: no slot keeps its reason, and nothing happened.
+	if d := after.Sub(after); d != (Events{}) || !d.IsZero() {
+		t.Fatalf("Sub of the same reading = %+v, want zero", d)
+	}
+	if (Events{Drops: [DropSlots]DropCount{{Reason: 77}}}).IsZero() != true {
+		t.Fatal("a slot without drops is an event")
 	}
 }

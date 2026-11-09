@@ -263,6 +263,7 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 	// The programs count the connections the process opens from now on,
 	// for every target.
 	var events client.EventReader
+	printer := report.NewPrinter(stdout)
 	if o.kernelEvents {
 		tracer, err := kevents.Start()
 		if err != nil {
@@ -272,10 +273,16 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 		if err := tracer.GenerationError(); err != nil {
 			logger.Warn("kernel events are read with a system call after every round trip", "reason", err)
 		}
+		if err := tracer.DropsError(); err != nil {
+			logger.Warn("kernel events do not count dropped packets", "reason", err)
+		}
+		if err := tracer.DropsLimitation(); err != nil {
+			logger.Warn("kernel events do not count every dropped packet", "reason", err)
+		}
+		printer.DropReasons = tracer.DropReasons()
 		events = tracer
 	}
 
-	printer := report.NewPrinter(stdout)
 	if !o.jsonlines {
 		if err := printer.Header(); err != nil {
 			return err

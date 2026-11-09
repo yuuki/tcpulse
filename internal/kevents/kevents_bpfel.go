@@ -21,6 +21,14 @@ type keventsKeventsCounts struct {
 	OtherRetrans    uint32
 	ResetsReceived  uint32
 	Flags           uint32
+	Drops           [4]keventsKeventsDropCount
+	OtherDrops      uint32
+}
+
+type keventsKeventsDropCount struct {
+	_      structs.HostLayout
+	Reason uint32
+	Count  uint32
 }
 
 // Names of all BPF objects in the ELF.
@@ -29,6 +37,8 @@ type keventsKeventsCounts struct {
 const (
 	keventsMapConns                 = "conns"
 	keventsProgKeventsConnect       = "kevents_connect"
+	keventsProgKeventsDrop          = "kevents_drop"
+	keventsProgKeventsDropRx        = "kevents_drop_rx"
 	keventsProgKeventsReset         = "kevents_reset"
 	keventsProgKeventsRetransmit    = "kevents_retransmit"
 	keventsProgKeventsRetransmitErr = "kevents_retransmit_err"
@@ -81,6 +91,8 @@ type keventsSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type keventsProgramSpecs struct {
 	KeventsConnect       *ebpf.ProgramSpec `ebpf:"kevents_connect"`
+	KeventsDrop          *ebpf.ProgramSpec `ebpf:"kevents_drop"`
+	KeventsDropRx        *ebpf.ProgramSpec `ebpf:"kevents_drop_rx"`
 	KeventsReset         *ebpf.ProgramSpec `ebpf:"kevents_reset"`
 	KeventsRetransmit    *ebpf.ProgramSpec `ebpf:"kevents_retransmit"`
 	KeventsRetransmitErr *ebpf.ProgramSpec `ebpf:"kevents_retransmit_err"`
@@ -147,6 +159,8 @@ type keventsVariables struct {
 // It can be passed to loadKeventsObjects or ebpf.CollectionSpec.LoadAndAssign.
 type keventsPrograms struct {
 	KeventsConnect       *ebpf.Program `ebpf:"kevents_connect"`
+	KeventsDrop          *ebpf.Program `ebpf:"kevents_drop"`
+	KeventsDropRx        *ebpf.Program `ebpf:"kevents_drop_rx"`
 	KeventsReset         *ebpf.Program `ebpf:"kevents_reset"`
 	KeventsRetransmit    *ebpf.Program `ebpf:"kevents_retransmit"`
 	KeventsRetransmitErr *ebpf.Program `ebpf:"kevents_retransmit_err"`
@@ -155,6 +169,8 @@ type keventsPrograms struct {
 func (p *keventsPrograms) Close() error {
 	return _KeventsClose(
 		p.KeventsConnect,
+		p.KeventsDrop,
+		p.KeventsDropRx,
 		p.KeventsReset,
 		p.KeventsRetransmit,
 		p.KeventsRetransmitErr,

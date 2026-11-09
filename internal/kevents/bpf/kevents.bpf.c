@@ -12,6 +12,8 @@
  *                         the target process gets its storage here.
  *   tcp_retransmit_skb    a retransmission, classified (count_retransmit).
  *   tcp_receive_reset     a reset that the connection accepted.
+ *   kfree_skb             a packet of the connection that the kernel
+ *                         dropped, by reason (count_drop).
  *
  * Only sockets with storage are counted: other processes and passively
  * opened sockets cost one storage lookup.
@@ -157,5 +159,94 @@ int BPF_PROG(kevents_reset, struct sock *sk)
 		__sync_fetch_and_add(&c->resets_received, 1);
 		bump_generation();
 	}
+	return 0;
+}
+
+/*
+ * skb_counts returns the counts of the connection that skb belongs to by
+ * skb->sk, or NULL. A packet whose sk is set without a destructor is a
+ * fragment queued for reassembly (struct sk_buff in kevents.h): its sk is an
+ * offset.
+ */
+static __always_inline struct kevents_counts *skb_counts(const struct sk_buff *skb)
+{
+	if (!skb->destructor)
+		return 0;
+	return bpf_sk_storage_get(&conns, skb->sk, 0, 0);
+}
+
+/*
+ * count_drop counts a dropped packet under its reason: in the slot that has
+ * the reason, or else in the first free slot, which an atomic
+ * compare-and-exchange takes (two CPUs may drop packets of the connection at
+ * once), or else in other_drops. A slot holds the reason plus one, so that 0
+ * marks it free.
+ */
+static __always_inline void count_drop(struct kevents_counts *c, __u32 reason)
+{
+	__u32 *counter = &c->other_drops;
+	int i;
+
+	reason++;
+	/* A reason of 0xffffffff, which no kernel has, cannot be kept. */
+	if (reason == 0)
+		goto count;
+	for (i = 0; i < KEVENTS_DROP_SLOTS; i++) {
+		struct kevents_drop_count *d = &c->drops[i];
+		__u32 r = *(volatile __u32 *)&d->reason;
+
+		if (r == 0) {
+			r = __sync_val_compare_and_swap(&d->reason, 0, reason);
+			if (r == 0)
+				r = reason;
+		}
+		if (r == reason) {
+			counter = &d->count;
+			break;
+		}
+	}
+count:
+	__sync_fetch_and_add(counter, 1);
+	bump_generation();
+}
+
+/*
+ * kfree_skb fires for every packet that the kernel drops, with the reason
+ * (Linux 5.17), and not for those it consumes (consume_skb). A dropped
+ * packet belongs to a connection
+ *   - that sent it: skb->sk, until the packet leaves the host (or loops back
+ *     to it: loopback_xmit orphans it);
+ *   - that it was received for: rx_sk, which the TCP receive path passes
+ *     once it found the socket (Linux 6.11), or skb->sk, which early demux
+ *     sets to the socket of an established connection before routing, e.g.
+ *     for a drop in netfilter's INPUT hook.
+ * The loader keeps the program that matches the kernel's prototype.
+ */
+SEC("tp_btf/kfree_skb")
+int BPF_PROG(kevents_drop, struct sk_buff *skb, void *location, int reason)
+{
+	struct kevents_counts *c = skb_counts(skb);
+
+	if (c)
+		count_drop(c, reason);
+	return 0;
+}
+
+/*
+ * rx_sk is NULL for most drops, but some verifiers (Linux 6.11 to 6.13)
+ * take the arguments of tracepoints for pointers that are never NULL, and
+ * would remove a test of it with its other branch. The helper takes NULL,
+ * and its result may be NULL: two lookups cannot be pruned.
+ */
+SEC("tp_btf/kfree_skb")
+int BPF_PROG(kevents_drop_rx, struct sk_buff *skb, void *location, int reason,
+	     struct sock *rx_sk)
+{
+	struct kevents_counts *c = bpf_sk_storage_get(&conns, rx_sk, 0, 0);
+
+	if (!c)
+		c = skb_counts(skb);
+	if (c)
+		count_drop(c, reason);
 	return 0;
 }

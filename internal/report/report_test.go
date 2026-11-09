@@ -174,10 +174,59 @@ func TestReportKernelEvents(t *testing.T) {
 	if !ok || !strings.Contains(buf.String(), ConnSeparator) {
 		t.Fatalf("report:\n%s", buf.String())
 	}
-	want := "PEER                 EVENT_RTS  SYN_RTX         TFO_RTX         RTO_RTX         OTHER_RTX       EVENT_99p(µs)   CLEAN_99p(µs)   RST_RECV        UNMATCHED       UNTRACKED \n" +
-		"10.0.150.2:9200      41         30              2               6               4               1023456         812             3               9               5         \n"
+	// Without DropReasons, the drops are not counted: "-", and no section
+	// of drops.
+	want := "PEER                 EVENT_RTS  SYN_RTX         TFO_RTX         RTO_RTX         OTHER_RTX       DROP_RTS        EVENT_99p(µs)   CLEAN_99p(µs)   RST_RECV        UNMATCHED       UNTRACKED \n" +
+		"10.0.150.2:9200      41         30              2               6               4               -               1023456         812             3               9               5         \n"
 	if events != want {
 		t.Fatalf("kernel events:\n got %q\nwant %q", events, want)
+	}
+}
+
+var sampleReasons = map[uint32]string{2: "NOT_SPECIFIED", 6: "SOCKET_RCVBUFF", 15: "NETFILTER_DROP", 77: "QDISC_DROP"}
+
+func TestReportDrops(t *testing.T) {
+	withDrops := sampleEvents
+	withDrops.DropRoundTrips = 12
+	// 65539 has no name; the counts tie between QDISC_DROP and 65539.
+	withDrops.Drops = map[uint32]int64{15: 40, 77: 3, 65539: 3}
+	withDrops.OtherDrops = 1
+	var buf bytes.Buffer
+	p := NewPrinter(&buf)
+	p.DropReasons = sampleReasons
+	err := p.Report([]Result{
+		{Peer: "10.0.150.2:9200", Summary: sample, Events: &withDrops},
+		{Peer: "10.0.150.3:9200", Summary: sample, Events: &sampleEvents},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, events, ok := strings.Cut(buf.String(), EventSeparator+"\n")
+	if !ok {
+		t.Fatalf("report:\n%s", buf.String())
+	}
+	// The drops follow the kernel events, with their own header; a peer
+	// without drops has no row.
+	want := "PEER                 EVENT_RTS  SYN_RTX         TFO_RTX         RTO_RTX         OTHER_RTX       DROP_RTS        EVENT_99p(µs)   CLEAN_99p(µs)   RST_RECV        UNMATCHED       UNTRACKED \n" +
+		"10.0.150.2:9200      41         30              2               6               4               12              1023456         812             3               9               5         \n" +
+		"10.0.150.3:9200      41         30              2               6               4               0               1023456         812             3               9               5         \n" +
+		DropSeparator + "\n" +
+		"PEER                 REASON                         DROPS     \n" +
+		"10.0.150.2:9200      NETFILTER_DROP                 40        \n" +
+		"10.0.150.2:9200      65539                          3         \n" +
+		"10.0.150.2:9200      QDISC_DROP                     3         \n" +
+		"10.0.150.2:9200      other                          1         \n"
+	if events != want {
+		t.Fatalf("kernel events:\n got %q\nwant %q", events, want)
+	}
+
+	// Counted, but none: no section.
+	buf.Reset()
+	if err := p.Report([]Result{{Peer: "10.0.150.3:9200", Summary: sample, Events: &sampleEvents}}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), DropSeparator) {
+		t.Fatalf("report without drops:\n%s", buf.String())
 	}
 }
 
@@ -196,6 +245,35 @@ func TestJSONLinesKernelEvents(t *testing.T) {
 		`"resets_received":3,"unmatched_syn_retrans":7,"unmatched_fastopen_retrans":0,"unmatched_rto_retrans":2,"unmatched_other_retrans":0,"untracked_round_trips":5}}` + "\n"
 	if buf.String() != want {
 		t.Fatalf("JSON Lines:\n got %s\nwant %s", buf.String(), want)
+	}
+}
+
+func TestJSONLinesDrops(t *testing.T) {
+	withDrops := sampleEvents
+	withDrops.DropRoundTrips = 12
+	withDrops.Drops = map[uint32]int64{15: 40, 65539: 3}
+	withDrops.OtherDrops = 1
+	for _, tt := range []struct {
+		name   string
+		events *stats.EventSummary
+		want   string
+	}{
+		{"drops", &withDrops, `"drops":{"round_trips":12,"by_reason":{"65539":3,"NETFILTER_DROP":40,"other":1}}`},
+		// Counted, none: an empty object, not an absent one.
+		{"none", &sampleEvents, `"drops":{"round_trips":0,"by_reason":{}}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			p := NewPrinter(&buf)
+			p.DropReasons = sampleReasons
+			if err := p.JSONLines([]Result{{Peer: "10.0.150.2:9200", Summary: sample, Events: tt.events}}); err != nil {
+				t.Fatal(err)
+			}
+			// drops ends kernel_events.
+			if !strings.HasSuffix(buf.String(), `"untracked_round_trips":5,`+tt.want+"}}\n") {
+				t.Fatalf("JSON Lines: %s\nwant it to end with %s", buf.String(), tt.want)
+			}
+		})
 	}
 }
 
@@ -231,8 +309,11 @@ func TestWriteErrors(t *testing.T) {
 		"Report":      p.Report([]Result{{Peer: "a:1"}}),
 		"connReport":  NewPrinter(failingWriter{}).connReport([]Result{{Peer: "a:1", Conns: &stats.ConnSummary{}}}),
 		"eventReport": NewPrinter(failingWriter{}).eventReport([]Result{{Peer: "a:1", Events: &stats.EventSummary{}}}),
-		"JSONLines":   p.JSONLines([]Result{{Peer: "a:1"}}),
-		"Listeners":   p.Listeners(nil),
+		"dropReport": (&Printer{w: failingWriter{}, DropReasons: map[uint32]string{}}).dropReport([]Result{
+			{Peer: "a:1", Events: &stats.EventSummary{Drops: map[uint32]int64{2: 1}}},
+		}),
+		"JSONLines": p.JSONLines([]Result{{Peer: "a:1"}}),
+		"Listeners": p.Listeners(nil),
 	} {
 		if err == nil {
 			t.Errorf("%s returned no error on a failing writer", name)

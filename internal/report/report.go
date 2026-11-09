@@ -3,9 +3,11 @@
 package report
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -34,6 +36,12 @@ func MergedPeer(n int) string {
 // Printer writes results to an io.Writer. Its methods may be called
 // concurrently: each line is written whole.
 type Printer struct {
+	// DropReasons names the reasons for which the kernel drops packets, by
+	// value, for the kernel events (--kernel-events); a reason without a
+	// name is printed as its number. It is nil when the kernel events do not
+	// count dropped packets. Set it before printing.
+	DropReasons map[uint32]string
+
 	now func() time.Time
 
 	mu sync.Mutex
@@ -56,11 +64,20 @@ const (
 	// output.
 	ConnSeparator = "--- TCP statistics of the connections (TCP_INFO) ---"
 
-	eventHeaderFormat = "%-20s %-10s %-15s %-15s %-15s %-15s %-15s %-15s %-15s %-15s %-10s\n"
-	eventLineFormat   = "%-20s %-10d %-15d %-15d %-15d %-15d %-15d %-15d %-15d %-15d %-10d\n"
+	eventHeaderFormat = "%-20s %-10s %-15s %-15s %-15s %-15s %-15s %-15s %-15s %-15s %-15s %-10s\n"
+	eventLineFormat   = "%-20s %-10d %-15d %-15d %-15d %-15d %-15s %-15d %-15d %-15d %-15d %-10d\n"
 	// EventSeparator precedes the kernel events of the round trips in text
 	// output.
 	EventSeparator = "--- Kernel events of the round trips (eBPF) ---"
+
+	dropHeaderFormat = "%-20s %-30s %-10s\n"
+	dropLineFormat   = "%-20s %-30s %-10d\n"
+	// DropSeparator precedes the dropped packets of the connections, by
+	// reason, in text output.
+	DropSeparator = "--- Packets of the connections dropped by the kernel (eBPF) ---"
+	// OtherDropReason names the drops whose reason was not kept
+	// (stats.EventSummary.OtherDrops). The kernel's names are upper case.
+	OtherDropReason = "other"
 )
 
 // Header writes the column header of the text output.
@@ -102,7 +119,10 @@ func (p *Printer) Report(results []Result) error {
 	if err := p.connReport(results); err != nil {
 		return err
 	}
-	return p.eventReport(results)
+	if err := p.eventReport(results); err != nil {
+		return err
+	}
+	return p.dropReport(results)
 }
 
 func (p *Printer) eventReport(results []Result) error {
@@ -113,7 +133,7 @@ func (p *Printer) eventReport(results []Result) error {
 		}
 		if !header {
 			if err := p.printf("%s\n"+eventHeaderFormat, EventSeparator,
-				"PEER", "EVENT_RTS", "SYN_RTX", "TFO_RTX", "RTO_RTX", "OTHER_RTX",
+				"PEER", "EVENT_RTS", "SYN_RTX", "TFO_RTX", "RTO_RTX", "OTHER_RTX", "DROP_RTS",
 				"EVENT_99p(µs)", "CLEAN_99p(µs)", "RST_RECV", "UNMATCHED", "UNTRACKED"); err != nil {
 				return err
 			}
@@ -127,6 +147,7 @@ func (p *Printer) eventReport(results []Result) error {
 			e.RetransRoundTrips.FastOpen,
 			e.RetransRoundTrips.RTO,
 			e.RetransRoundTrips.Other,
+			p.dropRoundTrips(e),
 			e.WithEvents.P99.Microseconds(),
 			e.WithoutEvents.P99.Microseconds(),
 			e.ResetsReceived,
@@ -134,6 +155,67 @@ func (p *Printer) eventReport(results []Result) error {
 			e.Untracked,
 		); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// dropRoundTrips returns the DROP_RTS column: "-" when drops are not
+// counted.
+func (p *Printer) dropRoundTrips(e *stats.EventSummary) string {
+	if p.DropReasons == nil {
+		return "-"
+	}
+	return strconv.FormatInt(e.DropRoundTrips, 10)
+}
+
+// drop is the number of dropped packets of one reason.
+type drop struct {
+	Reason string
+	Count  int64
+}
+
+// drops returns the dropped packets of e by reason, named, the most frequent
+// first, and those whose reason was not kept last.
+func (p *Printer) drops(e *stats.EventSummary) []drop {
+	drops := make([]drop, 0, len(e.Drops)+1)
+	for reason, n := range e.Drops {
+		name, ok := p.DropReasons[reason]
+		if !ok {
+			name = strconv.FormatUint(uint64(reason), 10)
+		}
+		drops = append(drops, drop{Reason: name, Count: n})
+	}
+	slices.SortFunc(drops, func(a, b drop) int {
+		return cmp.Or(cmp.Compare(b.Count, a.Count), cmp.Compare(a.Reason, b.Reason))
+	})
+	if e.OtherDrops > 0 {
+		drops = append(drops, drop{Reason: OtherDropReason, Count: e.OtherDrops})
+	}
+	return drops
+}
+
+// dropReport writes the dropped packets of the results by reason, when
+// there are some.
+func (p *Printer) dropReport(results []Result) error {
+	if p.DropReasons == nil {
+		return nil
+	}
+	header := false
+	for _, r := range results {
+		if r.Events == nil {
+			continue
+		}
+		for _, d := range p.drops(r.Events) {
+			if !header {
+				if err := p.printf("%s\n"+dropHeaderFormat, DropSeparator, "PEER", "REASON", "DROPS"); err != nil {
+					return err
+				}
+				header = true
+			}
+			if err := p.printf(dropLineFormat, r.Peer, d.Reason, d.Count); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -210,11 +292,29 @@ type JSONLinesKernelEvents struct {
 	UnmatchedRTORetrans       int64 `json:"unmatched_rto_retrans"`
 	UnmatchedOtherRetrans     int64 `json:"unmatched_other_retrans"`
 	UntrackedRoundTrips       int64 `json:"untracked_round_trips"`
+	// Drops is only there when the kernel events count dropped packets.
+	Drops *JSONLinesDrops `json:"drops,omitempty"`
 }
 
-func jsonLinesKernelEvents(e *stats.EventSummary) *JSONLinesKernelEvents {
+// JSONLinesDrops is the JSON object of the dropped packets of the
+// connections of a result.
+type JSONLinesDrops struct {
+	RoundTrips int64 `json:"round_trips"`
+	// ByReason counts the dropped packets by the name of their reason; it
+	// is empty, not absent, when none was dropped.
+	ByReason map[string]int64 `json:"by_reason"`
+}
+
+func (p *Printer) jsonLinesKernelEvents(e *stats.EventSummary) *JSONLinesKernelEvents {
 	if e == nil {
 		return nil
+	}
+	var drops *JSONLinesDrops
+	if p.DropReasons != nil {
+		drops = &JSONLinesDrops{RoundTrips: e.DropRoundTrips, ByReason: map[string]int64{}}
+		for _, d := range p.drops(e) {
+			drops.ByReason[d.Reason] += d.Count
+		}
 	}
 	return &JSONLinesKernelEvents{
 		RoundTripsWithEvents:      e.RoundTrips,
@@ -233,6 +333,7 @@ func jsonLinesKernelEvents(e *stats.EventSummary) *JSONLinesKernelEvents {
 		UnmatchedRTORetrans:       e.Unmatched.RTO,
 		UnmatchedOtherRetrans:     e.Unmatched.Other,
 		UntrackedRoundTrips:       e.Untracked,
+		Drops:                     drops,
 	}
 }
 
@@ -286,7 +387,7 @@ func (p *Printer) JSONLines(results []Result) error {
 			Rate:         s.Rate,
 			Timestamp:    timestamp,
 			TCPInfo:      jsonLinesTCPInfo(r.Conns),
-			KernelEvents: jsonLinesKernelEvents(r.Events),
+			KernelEvents: p.jsonLinesKernelEvents(r.Events),
 		}); err != nil {
 			return fmt.Errorf("writing JSON Lines: %w", err)
 		}

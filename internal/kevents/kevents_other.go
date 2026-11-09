@@ -23,6 +23,15 @@ func (*Tracer) Generation() (uint64, bool) { return 0, false }
 // GenerationError reports that Generation is not supported.
 func (*Tracer) GenerationError() error { return errors.ErrUnsupported }
 
+// DropsError reports that drops are not supported.
+func (*Tracer) DropsError() error { return errors.ErrUnsupported }
+
+// DropsLimitation returns nil.
+func (*Tracer) DropsLimitation() error { return nil }
+
+// DropReasons returns nil.
+func (*Tracer) DropReasons() map[uint32]string { return nil }
+
 // ReadEvents is not supported on this platform.
 func (*Tracer) ReadEvents(int) (stats.Events, error) {
 	return stats.Events{}, errors.ErrUnsupported

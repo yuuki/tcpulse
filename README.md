@@ -78,7 +78,7 @@ Creates new connections for each request, immediately closing them afterward. Th
 - **Platform optimizations**: Leverages Linux-specific optimizations (TCP_FASTOPEN, SO_REUSEPORT) when available
 - **JSON Lines output**: Machine-readable output format for integration with monitoring and analysis tools
 - **Kernel TCP statistics**: Retransmissions, the kernel's smoothed RTT and TCP Fast Open use of the connections, with `--tcp-info` on Linux
-- **Kernel events per round trip**: Which round trips met a SYN retransmission, a retransmission timeout, another retransmission or a reset, and how slow they were compared with the others, with `--kernel-events` (eBPF, Linux)
+- **Kernel events per round trip**: Which round trips met a SYN retransmission, a retransmission timeout, another retransmission, a reset or a packet dropped by the host (and why), and how slow they were compared with the others, with `--kernel-events` (eBPF, Linux)
 
 ## Installation
 
@@ -149,7 +149,7 @@ Options:
   -h, --help                       show help information
       --interval duration          [client mode] interval for printing stats (default 5s)
       --jsonlines                  [client mode] output results in JSON Lines format
-      --kernel-events              [client mode] attribute kernel TCP events (retransmissions, resets) to the round trips with eBPF (Linux only, needs root or CAP_BPF and CAP_PERFMON)
+      --kernel-events              [client mode] attribute kernel TCP events (retransmissions, resets, drops) to the round trips with eBPF (Linux only, needs root or CAP_BPF and CAP_PERFMON)
       --listen-addrs-file string   [server mode] enable to pass a file including a pair of addresses and ports
       --listener-stats             [server mode] print the statistics of the listening sockets (connections, drops, accept queue) when the server stops (Linux only)
       --merge-results-each-host    [client mode] merge results of each host (with --show-only-results)
@@ -308,12 +308,13 @@ Interval lines do not include these statistics: a persistent connection is read 
 
 #### Kernel Events (`--kernel-events`)
 
-On Linux, `--kernel-events` loads eBPF programs that count kernel events on every TCP connection tcpulse opens: retransmissions, by kind, and resets received. tcpulse attributes each event to the round trip during which it happened, and the report tells whether the slow round trips are those that met these events.
+On Linux, `--kernel-events` loads eBPF programs that count kernel events on every TCP connection tcpulse opens: retransmissions, by kind, resets received, and packets that the kernel of the host dropped, by reason. tcpulse attributes each event to the round trip during which it happened, and the report tells whether the slow round trips are those that met these events.
 
 **Requirements**
 - Linux 5.12 or later, with BTF (`/sys/kernel/btf/vmlinux`), on a little-endian architecture.
 - Root, or `CAP_BPF` and `CAP_PERFMON`. The container image runs as `nobody`: give it `--user 0` and the capabilities, which `--privileged` grants.
 - It is refused with `--proto udp` and on other platforms. If the programs cannot be loaded, tcpulse exits with status 1 and the reason, before sending anything.
+- Drops need Linux 5.17 or later, which gives their reason. The drops of TCP's own receive path need Linux 6.11 (see below); before, tcpulse says at the start that they are not counted. When drops are not counted at all, `DROP_RTS` is `-`, and tcpulse says why at the start.
 
 ```shell-session
 $ sudo tcpulse -c --show-only-results --kernel-events --flavor ephemeral --rate 200 --duration 4s 192.0.2.10:9100
@@ -321,11 +322,11 @@ PEER                 CNT        LAT_MAX(µs)     LAT_MIN(µs)     LAT_MEAN(µs) 
 --- A result during total execution time ---
 192.0.2.10:9100      795        2047918         164             50962           647             206569          1023410         198.60
 --- Kernel events of the round trips (eBPF) ---
-PEER                 EVENT_RTS  SYN_RTX         TFO_RTX         RTO_RTX         OTHER_RTX       EVENT_99p(µs)   CLEAN_99p(µs)   RST_RECV        UNMATCHED       UNTRACKED
-192.0.2.10:9100      65         30              0               2               36              2047918         827             0               0               0
+PEER                 EVENT_RTS  SYN_RTX         TFO_RTX         RTO_RTX         OTHER_RTX       DROP_RTS        EVENT_99p(µs)   CLEAN_99p(µs)   RST_RECV        UNMATCHED       UNTRACKED
+192.0.2.10:9100      65         30              0               2               36              0               2047918         827             0               0               0
 ```
 
-In this run, 5% of the packets to the server were dropped. The 99th percentile of the run, 1.02s, comes from the 65 round trips that met kernel events: their own 99th percentile is 2.05s, while that of the other round trips is 827µs.
+In this run, 5% of the packets to the server were dropped on their way. The 99th percentile of the run, 1.02s, comes from the 65 round trips that met kernel events: their own 99th percentile is 2.05s, while that of the other round trips is 827µs.
 
 - `EVENT_RTS`: The completed round trips during which at least one event was counted on their connection
 - `SYN_RTX`, `TFO_RTX`, `RTO_RTX`, `OTHER_RTX`: The round trips during which at least one retransmission of that kind happened. A round trip can count under several kinds.
@@ -333,16 +334,44 @@ In this run, 5% of the packets to the server were dropped. The 99th percentile o
   - `TFO_RTX`: of data sent in a TCP Fast Open SYN that the server did not acknowledge although the SYN arrived: the server no longer accepts Fast Open, or its queue of pending Fast Open requests is full. The client sends the data again right after the handshake, without loss or timeout.
   - `RTO_RTX`: in the kernel's loss state, which a retransmission timeout enters (200ms at least).
   - `OTHER_RTX`: any other: fast retransmit, RACK, tail loss probes. These are not fast for tcpulse's messages either: when a single segment is in flight, the tail loss probe waits for two RTTs plus the minimum RTO (200ms).
+- `DROP_RTS`: The round trips during which the kernel of this host dropped at least one packet of their connection, or `-` when drops are not counted. A packet dropped before it left the host was never sent, so TCP does not retransmit it: it sends it again from its probe timer, after 200ms at least, as new data. These round trips can be slow without counting under any `_RTX` column. (A packet sent through a veth pair to another network namespace of the host, such as a container's, keeps its socket until IP input there: its drops on the way count, and it is retransmitted.)
 - `EVENT_99p(µs)`, `CLEAN_99p(µs)`: The 99th percentile latency of the round trips with events, and of the others
 - `RST_RECV`: The resets received by the connections
 - `UNMATCHED`: The retransmissions that no completed round trip owns. They come from dials that failed or were cut off by the end of the run (SYNs never answered), from requests that failed or were cut off, and, in persistent mode, from a handshake that the untimed dial waited for.
 - `UNTRACKED`: The completed round trips whose events could not be read. They count neither as round trips with events nor as round trips without.
 
+When the host dropped packets of the connections, a last section lists them, by peer and reason, the most frequent first:
+- `REASON`: The kernel's reason for the drop (`enum skb_drop_reason`, without its `SKB_DROP_REASON_` prefix: `NETFILTER_DROP` for a firewall rule, `QDISC_DROP` for a full queue, `TCP_OLD_DATA` for a duplicate of data already received...), or a number for a reason the kernel does not name in its BTF. `other` counts the drops of a connection after it met four reasons.
+- `DROPS`: The dropped packets, during round trips or not.
+
+```shell-session
+$ sudo tcpulse -c --show-only-results --kernel-events --flavor ephemeral --rate 200 --duration 4s 192.0.2.10:9100
+PEER                 CNT        LAT_MAX(µs)     LAT_MIN(µs)     LAT_MEAN(µs)    LAT_90p(µs)     LAT_95p(µs)     LAT_99p(µs)     RATE(/s)
+--- A result during total execution time ---
+192.0.2.10:9100      788        2039601         151             46885           770             206569          1027604         196.95
+--- Kernel events of the round trips (eBPF) ---
+PEER                 EVENT_RTS  SYN_RTX         TFO_RTX         RTO_RTX         OTHER_RTX       DROP_RTS        EVENT_99p(µs)   CLEAN_99p(µs)   RST_RECV        UNMATCHED       UNTRACKED
+192.0.2.10:9100      133        28              0               0               0               133             1224736         1990            0               0               0
+--- Packets of the connections dropped by the kernel (eBPF) ---
+PEER                 REASON                         DROPS
+192.0.2.10:9100      NETFILTER_DROP                 157
+```
+
+In this run, a firewall rule of the client's host dropped 5% of its packets to the server. The 133 round trips that met a drop have a 99th percentile of 1.22s, but only 28 of them met a retransmission, of their SYN: the other dropped packets were sent again as new data.
+
+Which drops are counted:
+- **Sent:** a packet of the connection dropped before it left the host: by a firewall rule (netfilter's OUTPUT hook), a queueing discipline, a neighbour that does not resolve.
+- **Received, by TCP:** a packet that TCP dropped after it found the connection: a full receive buffer, data out of the window, a duplicate. This needs Linux 6.11, which passes the socket to the tracepoint.
+- **Received, before TCP:** a packet dropped before TCP looked the connection up, e.g. by netfilter's INPUT hook, only if early demux had found the connection first (`net.ipv4.ip_early_demux` and `net.ipv4.tcp_early_demux`, on by default). Over loopback, packets keep their route and skip early demux: these drops are not counted.
+- **Not seen:** drops in the network and on the server's host (unless it is another network namespace of this one, reached through a veth pair). They show up as retransmissions.
+- **Not drops:** since Linux 6.11, an ACK that a connection receives after the server half-closed it counts as a `NOT_SPECIFIED` drop. The tcpulse server never half-closes.
+- **Too many:** some network drivers free the packets they sent as drops rather than as consumed. Then every packet sent counts, as `NOT_SPECIFIED`, and `DROP_RTS` approaches the count of round trips.
+
 How events are attributed:
 - **Persistent mode:** the events of a round trip are those counted on its connection since the end of the previous round trip.
 - **Ephemeral mode:** a round trip includes the dial, so its events are all those counted since the connection was opened.
 - **Failed dials:** tcpulse keeps a duplicate of the descriptor of each socket it dials, so that it can read the events of a socket after the dial failed and closed it.
-- **Cost:** tcpulse checks the counters after each round trip, once the clock has stopped. On amd64 and arm64, it does so with a load from memory it shares with the programs; a `bpf()` system call reads a connection's counters only the first time, and after an event was counted on any connection. On other architectures, every check is a system call. Inside the clock, the only addition is the `dup(2)` of the socket in the dial (in ephemeral mode, the dial is timed). No program runs for every packet.
+- **Cost:** tcpulse checks the counters after each round trip, once the clock has stopped. On amd64 and arm64, it does so with a load from memory it shares with the programs; a `bpf()` system call reads a connection's counters only the first time, and after an event was counted on any connection. On other architectures, every check is a system call. Inside the clock, the only addition is the `dup(2)` of the socket in the dial (in ephemeral mode, the dial is timed). No program runs for every packet: the one of drops runs for each packet the host drops, whatever its socket.
 
 With `--jsonlines`, each object ends with a `kernel_events` object (after `tcp_info`, if present). It has these fields:
 - `round_trips_with_events`, `round_trips_without_events`;
@@ -350,7 +379,8 @@ With `--jsonlines`, each object ends with a `kernel_events` object (after `tcp_i
 - `latency_99p_with_events_us`, `latency_max_with_events_us`, `latency_99p_without_events_us`, `latency_max_without_events_us`;
 - `resets_received`;
 - `unmatched_syn_retrans`, `unmatched_fastopen_retrans`, `unmatched_rto_retrans`, `unmatched_other_retrans`;
-- `untracked_round_trips`.
+- `untracked_round_trips`;
+- `drops`, only when drops are counted: `round_trips`, as `DROP_RTS`, and `by_reason`, the dropped packets by `REASON` (an empty object when there were none).
 
 The round trips with and without events, plus the untracked ones, add up to `count`.
 

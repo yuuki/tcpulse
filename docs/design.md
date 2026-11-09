@@ -172,13 +172,15 @@ events of its TCP connections to their round trips. A failure to load them
 is an error (exit 1) with its reason, not a report without events.
 
 The programs are tracepoints through BTF (`tp_btf`), at state changes,
-retransmissions and resets; none runs for every packet or message.
+retransmissions, resets and drops; none runs for every packet or message
+(`kfree_skb` runs for every packet the host drops, whatever its socket).
 
 | Tracepoint | What it does |
 | --- | --- |
 | `inet_sock_set_state` | CLOSE → SYN_SENT of a socket of the tcpulse process: gives the socket its storage (`BPF_MAP_TYPE_SK_STORAGE`). It runs inside `connect(2)`, even when TCP Fast Open defers the SYN to the first write (tcp_v4_connect and tcp_v6_connect set SYN_SENT first). The process is matched in its PID namespace (`bpf_get_ns_current_pid_tgid`), so that it works in a container. |
 | `tcp_retransmit_skb` | Counts a retransmission of a socket with storage, by kind (below). Before Linux 6.17 the tracepoint fires for retransmissions that were sent; since then it also fires for failed attempts, with their error, and only `err == 0` counts. The loader reads the tracepoint's prototype in the kernel's BTF and loads the matching program. |
 | `tcp_receive_reset` | Counts a reset the connection accepted. |
+| `kfree_skb` | Counts a dropped packet of a socket with storage, by reason (below). Linux 5.17 added the reason, and Linux 6.11 the socket a received packet was for (`rx_sk`). The loader reads the prototype and loads the matching program, or none before Linux 5.17. |
 
 The kind of a retransmission, decided in this order:
 
@@ -197,6 +199,70 @@ The kind of a retransmission, decided in this order:
   single segment in flight, as for most of tcpulse's messages, a tail loss
   probe waits for two RTTs plus the minimum RTO (`tcp_schedule_loss_probe`),
   so these are not fast.
+
+A dropped packet belongs to the socket that sent it (`skb->sk`, which the
+packet keeps until it leaves the host, or loops back: `loopback_xmit`
+orphans it), or to the socket it was received for: `rx_sk`, which the
+receive path of TCP passes once it found the socket (`sk_skb_reason_drop`),
+or `skb->sk`, which early demux sets for an established connection before
+routing (with `net.ipv4.ip_early_demux` and `tcp_early_demux`). Over
+loopback, a packet keeps the route of its sender and skips early demux
+(`ip_rcv_finish_core`), so drops before TCP, such as in netfilter's INPUT
+hook, are not attributed there; across a veth pair they are. A veth pair
+does not orphan the packet either (`__dev_forward_skb`): a packet sent to
+another network namespace of the host keeps the sender's socket until IP
+input there (`ip_rcv_core`), so its drops on the way (tc, a bridge, the
+backlog of the receiving CPU, an ingress hook) count too, although the
+packet was sent, and is retransmitted.
+
+`kfree_skb` does not fire for the packets the kernel consumes
+(`consume_skb`, `SKB_CONSUMED`): a clean run counts no drop, unless the
+network driver frees the packets it sent as drops (`dev_kfree_skb_any`
+rather than `dev_consume_skb_any`), which then all count, as
+`NOT_SPECIFIED`. Since Linux 6.11, a connection that receives an ACK in
+CLOSE_WAIT, CLOSING or LAST_ACK (after the server half-closed it) also
+counts a `NOT_SPECIFIED` drop (`tcp_rcv_state_process` frees the segment
+without queueing it); the tcpulse server never half-closes. Before Linux
+6.11, the drops of TCP's own receive path are not counted, and tcpulse says
+so at the start.
+
+Two guards keep the programs from reading what is not a socket:
+
+- Before Linux 6.9, `skb->sk` shares a union with `ip_defrag_offset`, which a
+  fragment queued for reassembly sets, and such fragments are dropped when
+  their queue expires. Every packet that belongs to a socket has a
+  destructor (`tcp_wfree`, `sock_edemux`, `sock_rfree`), and a queued
+  fragment has none: `skb->sk` is only used when `skb->destructor` is set.
+- `rx_sk` is NULL for most drops, but the verifiers of Linux 6.11 to 6.13
+  take the arguments of tracepoints for pointers that are never NULL, and
+  would remove a test of it along with its other branch. The program looks
+  `rx_sk` up first, then `skb->sk` when that found nothing: the helper takes
+  NULL, and its result may be NULL, so neither lookup can be pruned.
+
+The storage of a socket keeps four slots of a reason and its count, and the
+drops of further reasons in `other_drops`. A drop goes to the slot of its
+reason, or takes the first free slot with a compare-and-exchange
+(`BPF_CMPXCHG`, also `-mcpu=v3`), since two CPUs can drop packets of a
+connection at once. A slot keeps its reason, so the client subtracts two
+readings slot by slot. A slot holds the reason plus one, so that 0 marks it
+free: on Linux 5.17, reason 0 is `NOT_SPECIFIED`. The copy of a lookup can
+race with the program taking a slot, and see its count without its reason:
+the client ignores that count, which the next reading sees whole (the
+program changes the generation after the count). The loader names the
+reasons from the values of `enum skb_drop_reason` in the kernel's BTF, so
+that tcpulse need not know them; a reason that is not there (a subsystem's,
+in the high 16 bits) is printed as its number.
+
+A packet that the host drops before it leaves was never sent: TCP sends it
+again from its probe timer, as new data, not as a retransmission. Round
+trips with drops can thus be slow without any retransmission of their own.
+
+Drops are an addition to the other events. The drop program loads in a
+collection of its own, which shares the maps of the others
+(`MapReplacements`), so that its failure is told apart from theirs. When the
+kernel's tracepoint has no reason, or the drop program does not load or
+attach, tcpulse counts the other events, logs why, and reports drops as
+unknown (`-`, and no `drops` object), not as none.
 
 The programs only count; the client attributes. After each completed round
 trip, once the clock has stopped, it reads the counters of the connection's
@@ -263,7 +329,9 @@ instead of a generated `vmlinux.h`. The programs declare the license "Dual
 BSD/GPL", which the kernel requires of tracing programs (see `NOTICE`).
 
 The tests that load the programs skip without the privileges, as in CI;
-`make test-bpf` runs them as root. The attribution itself is tested with a
+`make test-bpf` runs them as root. The test of a drop on the send path adds
+an nftables rule in a network namespace of its own, so that the host's
+firewall is left alone. The attribution itself is tested with a
 fake reader.
 
 ## 4. Statistics
@@ -409,7 +477,9 @@ are whole microseconds, truncated. With `--tcp-info`, the text report ends
 with a section of its own: a separator, a header, and a line per peer (or a
 single merged line) of TCP statistics. Each JSON object ends with a
 `tcp_info` object. `--kernel-events` adds a section of the same form after
-it, and a `kernel_events` object. Without these options, the output is
+it, and a `kernel_events` object; when the host dropped packets of the
+connections, a last section lists them by peer and reason. Without these
+options, the output is
 unchanged. The column layout and the JSON field names and order are a public
 format, pinned by golden tests in `internal/report`. The server prints
 `Listening at ...`, and with `--listener-stats`, when it stops, a separator,
