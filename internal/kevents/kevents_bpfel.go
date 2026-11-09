@@ -31,20 +31,35 @@ type keventsKeventsDropCount struct {
 	Count  uint32
 }
 
+type keventsKeventsRunq struct {
+	_         structs.HostLayout
+	Waits     uint64
+	TotalNs   uint64
+	MaxNs     uint64
+	Preempted uint64
+	Buckets   [496]uint64
+}
+
 // Names of all BPF objects in the ELF.
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
 	keventsMapConns                 = "conns"
+	keventsMapRunq                  = "runq"
+	keventsMapRunqStart             = "runq_start"
 	keventsProgKeventsConnect       = "kevents_connect"
 	keventsProgKeventsDrop          = "kevents_drop"
 	keventsProgKeventsDropRx        = "kevents_drop_rx"
 	keventsProgKeventsReset         = "kevents_reset"
 	keventsProgKeventsRetransmit    = "kevents_retransmit"
 	keventsProgKeventsRetransmitErr = "kevents_retransmit_err"
+	keventsProgKeventsSwitch        = "kevents_switch"
+	keventsProgKeventsWakeup        = "kevents_wakeup"
+	keventsProgKeventsWakeupNew     = "kevents_wakeup_new"
 	keventsVarEventsGeneration      = "events_generation"
 	keventsVarPidnsDev              = "pidns_dev"
 	keventsVarPidnsIno              = "pidns_ino"
+	keventsVarRunqTgid              = "runq_tgid"
 	keventsVarTargetTgid            = "target_tgid"
 )
 
@@ -96,13 +111,18 @@ type keventsProgramSpecs struct {
 	KeventsReset         *ebpf.ProgramSpec `ebpf:"kevents_reset"`
 	KeventsRetransmit    *ebpf.ProgramSpec `ebpf:"kevents_retransmit"`
 	KeventsRetransmitErr *ebpf.ProgramSpec `ebpf:"kevents_retransmit_err"`
+	KeventsSwitch        *ebpf.ProgramSpec `ebpf:"kevents_switch"`
+	KeventsWakeup        *ebpf.ProgramSpec `ebpf:"kevents_wakeup"`
+	KeventsWakeupNew     *ebpf.ProgramSpec `ebpf:"kevents_wakeup_new"`
 }
 
 // keventsMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type keventsMapSpecs struct {
-	Conns *ebpf.MapSpec `ebpf:"conns"`
+	Conns     *ebpf.MapSpec `ebpf:"conns"`
+	Runq      *ebpf.MapSpec `ebpf:"runq"`
+	RunqStart *ebpf.MapSpec `ebpf:"runq_start"`
 }
 
 // keventsVariableSpecs contains global variables before they are loaded into the kernel.
@@ -112,6 +132,7 @@ type keventsVariableSpecs struct {
 	EventsGeneration *ebpf.VariableSpec `ebpf:"events_generation"`
 	PidnsDev         *ebpf.VariableSpec `ebpf:"pidns_dev"`
 	PidnsIno         *ebpf.VariableSpec `ebpf:"pidns_ino"`
+	RunqTgid         *ebpf.VariableSpec `ebpf:"runq_tgid"`
 	TargetTgid       *ebpf.VariableSpec `ebpf:"target_tgid"`
 }
 
@@ -135,12 +156,16 @@ func (o *keventsObjects) Close() error {
 //
 // It can be passed to loadKeventsObjects or ebpf.CollectionSpec.LoadAndAssign.
 type keventsMaps struct {
-	Conns *ebpf.Map `ebpf:"conns"`
+	Conns     *ebpf.Map `ebpf:"conns"`
+	Runq      *ebpf.Map `ebpf:"runq"`
+	RunqStart *ebpf.Map `ebpf:"runq_start"`
 }
 
 func (m *keventsMaps) Close() error {
 	return _KeventsClose(
 		m.Conns,
+		m.Runq,
+		m.RunqStart,
 	)
 }
 
@@ -151,6 +176,7 @@ type keventsVariables struct {
 	EventsGeneration *ebpf.Variable `ebpf:"events_generation"`
 	PidnsDev         *ebpf.Variable `ebpf:"pidns_dev"`
 	PidnsIno         *ebpf.Variable `ebpf:"pidns_ino"`
+	RunqTgid         *ebpf.Variable `ebpf:"runq_tgid"`
 	TargetTgid       *ebpf.Variable `ebpf:"target_tgid"`
 }
 
@@ -164,6 +190,9 @@ type keventsPrograms struct {
 	KeventsReset         *ebpf.Program `ebpf:"kevents_reset"`
 	KeventsRetransmit    *ebpf.Program `ebpf:"kevents_retransmit"`
 	KeventsRetransmitErr *ebpf.Program `ebpf:"kevents_retransmit_err"`
+	KeventsSwitch        *ebpf.Program `ebpf:"kevents_switch"`
+	KeventsWakeup        *ebpf.Program `ebpf:"kevents_wakeup"`
+	KeventsWakeupNew     *ebpf.Program `ebpf:"kevents_wakeup_new"`
 }
 
 func (p *keventsPrograms) Close() error {
@@ -174,6 +203,9 @@ func (p *keventsPrograms) Close() error {
 		p.KeventsReset,
 		p.KeventsRetransmit,
 		p.KeventsRetransmitErr,
+		p.KeventsSwitch,
+		p.KeventsWakeup,
+		p.KeventsWakeupNew,
 	)
 }
 

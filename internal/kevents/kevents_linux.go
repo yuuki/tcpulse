@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
@@ -29,11 +30,13 @@ const Supported = true
 var _ [stats.DropSlots]keventsKeventsDropCount = keventsKeventsCounts{}.Drops
 
 // Tracer counts kernel TCP events on the connections that this process opens
-// while it runs. ReadEvents and Generation may be called concurrently, but
-// not concurrently with Close.
+// while it runs, and how long its threads wait for a CPU. ReadEvents and
+// Generation may be called concurrently, but not concurrently with Close.
 type Tracer struct {
 	coll  *ebpf.Collection
 	conns *ebpf.Map
+	// runq holds the waits for a CPU, or is nil when they are not measured.
+	runq  *ebpf.Map
 	links []link.Link
 	// generation points to events_generation in genMem, the memory the
 	// programs share with the process; it is nil, and genErr says why, when
@@ -52,15 +55,18 @@ type Tracer struct {
 	dropColl    *ebpf.Collection
 }
 
-// Start loads and attaches the programs. It needs a kernel with BTF (Linux
-// 5.12 or later: socket storage in tracing programs, fetching atomics), and
-// root or CAP_BPF and CAP_PERFMON.
-func Start() (*Tracer, error) { return start("") }
+// Start loads and attaches the programs of what opts asks for. It needs a
+// kernel with BTF (Linux 5.12 or later: socket storage in tracing programs,
+// fetching atomics), and root or CAP_BPF and CAP_PERFMON.
+func Start(opts Options) (*Tracer, error) { return start(opts, "") }
 
 // start is Start, with the drop program drop instead of the one that matches
 // the kernel's tracepoint, when drop is not empty and drops can be counted:
 // the tests load the variant of older kernels too.
-func start(drop string) (*Tracer, error) {
+func start(opts Options, drop string) (*Tracer, error) {
+	if !opts.Events && !opts.RunQueue {
+		return nil, errors.New("nothing to trace")
+	}
 	if err := checkPrivileges(); err != nil {
 		return nil, err
 	}
@@ -75,24 +81,41 @@ func start(drop string) (*Tracer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading the kernel's BTF (CONFIG_DEBUG_INFO_BTF): %w", err)
 	}
-	retransmit, err := retransmitProgram(kernel)
-	if err != nil {
-		return nil, err
-	}
 	t := &Tracer{}
-	t.drop, t.dropReasons, t.dropErr = dropProgram(kernel)
-	if drop != "" && t.drop != "" {
-		t.drop = drop
-	}
-	// The drop program loads apart (loadDrops); of the others, keep the
-	// variants that match the kernel's tracepoints: the others would not
-	// load.
+	// The programs to attach: the variants that match the kernel's
+	// tracepoints, as the others would not load. The drop program loads
+	// apart (loadDrops).
 	dropSpec := spec.Copy()
-	progs := []string{keventsProgKeventsConnect, retransmit, keventsProgKeventsReset}
+	var progs []string
+	if opts.Events {
+		retransmit, err := retransmitProgram(kernel)
+		if err != nil {
+			return nil, err
+		}
+		progs = append(progs, keventsProgKeventsConnect, retransmit, keventsProgKeventsReset)
+		t.drop, t.dropReasons, t.dropErr = dropProgram(kernel)
+		if drop != "" && t.drop != "" {
+			t.drop = drop
+		}
+	} else {
+		t.dropErr = errors.New("kernel events are not counted")
+	}
+	if opts.RunQueue {
+		progs = append(progs, keventsProgKeventsWakeup, keventsProgKeventsWakeupNew, keventsProgKeventsSwitch)
+	}
 	for name := range spec.Programs {
 		if !slices.Contains(progs, name) {
 			delete(spec.Programs, name)
 		}
+	}
+	// The library creates every map of the spec: leave out those of what is
+	// not asked for.
+	if !opts.Events {
+		delete(spec.Maps, keventsMapConns)
+	}
+	if !opts.RunQueue {
+		delete(spec.Maps, keventsMapRunq)
+		delete(spec.Maps, keventsMapRunqStart)
 	}
 
 	coll, err := ebpf.NewCollection(spec)
@@ -100,8 +123,15 @@ func start(drop string) (*Tracer, error) {
 		return nil, loadError(err)
 	}
 	t.coll, t.conns = coll, coll.Maps[keventsMapConns]
-	// Without the mapping, every reading is a system call.
-	t.generation, t.genMem, t.genErr = mapGeneration(spec, coll)
+	if opts.Events {
+		// Without the mapping, every reading is a system call.
+		t.generation, t.genMem, t.genErr = mapGeneration(spec, coll)
+	} else {
+		t.genErr = errors.New("kernel events are not counted")
+	}
+	if opts.RunQueue {
+		t.runq = coll.Maps[keventsMapRunq]
+	}
 	for _, name := range progs {
 		if err := t.attach(coll.Programs[name], name); err != nil {
 			_ = t.Close()
@@ -382,6 +412,9 @@ func (t *Tracer) DropReasons() map[uint32]string { return t.dropReasons }
 // works, a duplicate included: it keeps the socket, and its counters, after
 // the connection's own descriptor is closed.
 func (t *Tracer) ReadEvents(fd int) (stats.Events, error) {
+	if t.conns == nil {
+		return stats.Events{}, errors.New("the kernel events are not counted")
+	}
 	// The key of socket storage is the socket's file descriptor, a C int.
 	if fd < 0 || fd > math.MaxInt32 {
 		return stats.Events{}, fmt.Errorf("file descriptor %d out of range", fd)
@@ -412,6 +445,96 @@ func (t *Tracer) ReadEvents(fd int) (stats.Events, error) {
 		}
 	}
 	return ev, nil
+}
+
+// The buckets of the waits for a CPU (kevents.h).
+const (
+	runqSubBits = 3
+	runqSub     = 1 << runqSubBits
+)
+
+// The buckets of the programs are those runqBucketMax decodes.
+var _ [(63 - runqSubBits + 2) * runqSub]uint64 = keventsKeventsRunq{}.Buckets
+
+// runqBucketMax returns the largest wait, in nanoseconds, of bucket b
+// (runq_bucket in kevents.bpf.c).
+func runqBucketMax(b int) uint64 {
+	if b < 0 {
+		return 0
+	}
+	if b < runqSub {
+		return uint64(b)
+	}
+	e := b>>runqSubBits + runqSubBits - 1
+	sub := uint64(b & (runqSub - 1))
+	return (runqSub+sub+1)<<(e-runqSubBits) - 1
+}
+
+// RunQueue returns how long the threads of the process waited for a CPU
+// since Start, or an error when Start was not asked for it.
+func (t *Tracer) RunQueue() (stats.RunQueueSummary, error) {
+	if t.runq == nil {
+		return stats.RunQueueSummary{}, errors.New("the run queue latency is not measured")
+	}
+	// Until a thread of the process was switched out, nothing was measured:
+	// that is not a process that never waited.
+	var tgid uint32
+	if err := t.coll.Variables[keventsVarRunqTgid].Get(&tgid); err != nil {
+		return stats.RunQueueSummary{}, fmt.Errorf("reading the run queue latency: %w", err)
+	}
+	if tgid == 0 {
+		return stats.RunQueueSummary{}, errors.New("no thread of the process was switched out while the programs ran")
+	}
+	var perCPU []keventsKeventsRunq
+	if err := t.runq.Lookup(uint32(0), &perCPU); err != nil {
+		return stats.RunQueueSummary{}, fmt.Errorf("reading the run queue latency: %w", err)
+	}
+	var sum keventsKeventsRunq
+	for _, c := range perCPU {
+		sum.Waits += c.Waits
+		sum.TotalNs += c.TotalNs
+		sum.MaxNs = max(sum.MaxNs, c.MaxNs)
+		sum.Preempted += c.Preempted
+		for i, n := range c.Buckets {
+			sum.Buckets[i] += n
+		}
+	}
+	return summarizeRunQueue(&sum), nil
+}
+
+// summarizeRunQueue computes the summary of the waits of r; its percentiles
+// are nearest-rank, as the largest wait of their bucket, up to the longest
+// wait.
+func summarizeRunQueue(r *keventsKeventsRunq) stats.RunQueueSummary {
+	ns := func(v uint64) time.Duration { return time.Duration(min(v, math.MaxInt64)) }
+	s := stats.RunQueueSummary{
+		Waits:     int64(min(r.Waits, math.MaxInt64)),
+		Preempted: int64(min(r.Preempted, math.MaxInt64)),
+		Total:     ns(r.TotalNs),
+		Max:       ns(r.MaxNs),
+	}
+	// The waits of the buckets: a wait may end between the reading of
+	// waits and of its bucket.
+	var count uint64
+	for _, n := range r.Buckets {
+		count += n
+	}
+	quantile := func(q float64) time.Duration {
+		if count == 0 {
+			return 0
+		}
+		rank := uint64(math.Ceil(q * float64(count)))
+		var seen uint64
+		for b, n := range r.Buckets {
+			seen += n
+			if seen >= rank {
+				return ns(min(runqBucketMax(b), r.MaxNs))
+			}
+		}
+		return s.Max
+	}
+	s.P50, s.P99 = quantile(0.50), quantile(0.99)
+	return s
 }
 
 // Close detaches and unloads the programs.

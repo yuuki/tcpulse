@@ -78,6 +78,7 @@ Creates new connections for each request, immediately closing them afterward. Th
 - **Platform optimizations**: Leverages Linux-specific optimizations (TCP_FASTOPEN, SO_REUSEPORT) when available
 - **JSON Lines output**: Machine-readable output format for integration with monitoring and analysis tools
 - **Kernel TCP statistics**: Retransmissions, the kernel's smoothed RTT and TCP Fast Open use of the connections, with `--tcp-info` on Linux
+- **Load generator self-check**: How long tcpulse's own threads waited for a CPU, to tell whether the latencies are those of the network or of a busy client host, with `--runqueue-latency` (eBPF, Linux)
 - **Kernel events per round trip**: Which round trips met a SYN retransmission, a retransmission timeout, another retransmission, a reset or a packet dropped by the host (and why), and how slow they were compared with the others, with `--kernel-events` (eBPF, Linux)
 
 ## Installation
@@ -158,6 +159,7 @@ Options:
       --proto string               [client mode] protocol (tcp or udp) (default "tcp")
       --protocol string            [server mode] listening protocol ('tcp', 'udp' or 'all') (default "all")
       --rate int32                 [client mode] Message throughput per connection (/s) (for 'persistent' and UDP) or new connections throughput (/s) (for 'ephemeral'). Total messages (CNT) = rate * duration * connections (for 'persistent') or rate * duration (for 'ephemeral') (default 100)
+      --runqueue-latency           [client mode] measure how long the threads of tcpulse wait for a CPU with eBPF, to tell its own delays from those of the network (Linux only, needs root or CAP_BPF and CAP_PERFMON)
   -s, --server                     run in server mode
       --show-only-results          [client mode] print only results of measurement stats
       --tcp-info                   [client mode] report TCP statistics of the connections read from the kernel (TCP_INFO, Linux only)
@@ -384,6 +386,36 @@ With `--jsonlines`, each object ends with a `kernel_events` object (after `tcp_i
 
 The round trips with and without events, plus the untracked ones, add up to `count`.
 
+#### Run Queue Latency (`--runqueue-latency`)
+
+A load generator that waits for a CPU delays its own round trips. On Linux, `--runqueue-latency` loads eBPF programs that measure how long the threads of tcpulse wait for one: from when a thread becomes runnable (woken up, or preempted while it could still run) to when it runs. Compare these waits with the latencies of the run before blaming the network or the server.
+
+**Requirements:** those of `--kernel-events` (Linux 5.12 or later with BTF, a little-endian architecture, root or `CAP_BPF` and `CAP_PERFMON`), with TCP or UDP. If the programs cannot be loaded, tcpulse exits with status 1 and the reason, before sending anything.
+
+```shell-session
+$ sudo tcpulse -c --show-only-results --runqueue-latency --connections 10 --rate 1000 --duration 4s 192.0.2.10:9100
+PEER                 CNT        LAT_MAX(µs)     LAT_MIN(µs)     LAT_MEAN(µs)    LAT_90p(µs)     LAT_95p(µs)     LAT_99p(µs)     RATE(/s)
+--- A result during total execution time ---
+192.0.2.10:9100      32934      11092           7               700             3997            4014            4882            8226.77
+--- Run queue latency of the tcpulse threads (eBPF) ---
+WAITS      PREEMPTED  WAIT_TOTAL(µs)  WAIT_50p(µs)    WAIT_99p(µs)    WAIT_MAX(µs)
+16147      786        4434186         6               4194            11293
+```
+
+In this run, two busy loops per CPU shared the CPUs of the client. Its 99th percentile, 4.88ms, is that of its waits for a CPU, 4.19ms, and its slowest round trip, 11.09ms, its longest wait, 11.29ms: the latency was the client's own. On an idle host, the same run had a 99th percentile of 348µs, and its waits one of 73µs.
+
+- `WAITS`: The waits for a CPU that ended, of all the threads of tcpulse, from the start of the programs (before the first connection) to the end of the run
+- `PREEMPTED`: The involuntary context switches of the threads: the CPU was taken from a thread that could still run, because its time slice ended, a more urgent task woke up, or it yielded. The kernel counts them for the process too (`ru_nivcsw` of `getrusage(2)`), but counts as voluntary a sleep that a pending signal cut short, which this counts as involuntary, since the thread stays runnable.
+- `WAIT_TOTAL(µs)`: The sum of the waits. With several threads, it can exceed the duration of the run.
+- `WAIT_50p(µs)`, `WAIT_99p(µs)`: Percentiles of the waits, rounded up by at most 1/8 (the programs keep the waits in buckets of their own, coarser than those of the round trips)
+- `WAIT_MAX(µs)`: The longest wait
+
+The waits are those of the process, not of the round trips: a thread runs the goroutines of many connections, and its wait delays every round trip it was about to resume. Waits close to the slow round trips point to the client; waits far shorter rule it out.
+
+**Cost:** the programs run at every context switch and wakeup of the host, whatever the process: once they know the process's ID, at the first switch of one of its threads, those of the others cost a few loads and comparisons. They run inside the clock for tcpulse's own threads: the wakeup that ends most round trips updates a hash map, and the switch to the woken thread looks it up and updates the histogram. Against the same server, 50 persistent connections at 1,000 messages per second each had a mean latency 5 to 24µs higher than without the option (about 190µs), which is the size of the differences between runs; 2,000 ephemeral connections per second, 1 to 3µs higher.
+
+With `--jsonlines`, each object ends with a `runqueue_latency` object (after `kernel_events`, if present), the same in every object of a run: `waits`, `preempted`, `wait_total_us`, `wait_50p_us`, `wait_99p_us`, `wait_max_us`. It is absent when the waits could not be read (tcpulse logs why).
+
 #### Listener Statistics (`--listener-stats`)
 
 On Linux, a server started with `--listener-stats` prints the statistics of its listening sockets when it stops (Ctrl-C, SIGTERM). They are read from what the kernel already counts for each socket, so no privileges are needed.
@@ -524,7 +556,7 @@ tcpulse 0.9 keeps the options, the environment variables and the output formats 
 
 ## Development
 
-`make check` runs the linters, the workflow audit, `go vet`, the race-enabled tests and the build; `make help` lists the other targets. The eBPF programs of `--kernel-events` are in `internal/kevents/bpf`; `make generate` rebuilds their committed object (it needs clang), and `make test-bpf`, run as root, runs the tests that load them (they skip otherwise). See [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md) for the conventions and compatibility contracts, and [SECURITY.md](SECURITY.md) to report a vulnerability.
+`make check` runs the linters, the workflow audit, `go vet`, the race-enabled tests and the build; `make help` lists the other targets. The eBPF programs of `--kernel-events` and `--runqueue-latency` are in `internal/kevents/bpf`; `make generate` rebuilds their committed object (it needs clang), and `make test-bpf`, run as root, runs the tests that load them (they skip otherwise). See [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md) for the conventions and compatibility contracts, and [SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## License
 

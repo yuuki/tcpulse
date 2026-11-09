@@ -18,6 +18,11 @@
  * Only sockets with storage are counted: other processes and passively
  * opened sockets cost one storage lookup.
  *
+ * With --runqueue-latency, the scheduler's tracepoints measure how long the
+ * threads of the process wait for a CPU (see runq_switch). They run at every
+ * context switch and wakeup of the host; once the process's ID is learnt,
+ * those of other processes cost a few loads and comparisons.
+ *
  * Every count also bumps events_generation, which user space reads from
  * shared memory: while it does not change, no connection's counters can
  * have changed, and reading them (a system call) can be skipped.
@@ -248,5 +253,214 @@ int BPF_PROG(kevents_drop_rx, struct sk_buff *skb, void *location, int reason,
 		c = skb_counts(skb);
 	if (c)
 		count_drop(c, reason);
+	return 0;
+}
+
+/*
+ * Run queue latency: the time from when a thread of the target process
+ * becomes runnable (woken up, or preempted while runnable) to when it runs.
+ */
+
+/* The ID of the target process in the initial PID namespace, which the
+ * tasks of the scheduler's tracepoints carry. It is learnt at the first
+ * context switch of one of its threads (runq_switch). */
+__u32 runq_tgid = 0;
+
+/* When each thread of the target process became runnable; 0 once it ran,
+ * or blocked. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, __u32);
+	__type(value, __u64);
+} runq_start SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct kevents_runq);
+} runq SEC(".maps");
+
+static __always_inline int runq_target(const struct task_struct *t, __u32 tgid)
+{
+	return tgid && (__u32)t->tgid == tgid;
+}
+
+static __always_inline void runq_enqueue(const struct task_struct *t)
+{
+	__u32 tid = t->pid;
+	__u64 now = bpf_ktime_get_ns();
+
+	bpf_map_update_elem(&runq_start, &tid, &now, BPF_ANY);
+}
+
+static __always_inline __u32 log2_u64(__u64 v)
+{
+	__u32 r, shift;
+
+	r = (v > 0xFFFFFFFF) << 5;
+	v >>= r;
+	shift = (v > 0xFFFF) << 4;
+	v >>= shift;
+	r |= shift;
+	shift = (v > 0xFF) << 3;
+	v >>= shift;
+	r |= shift;
+	shift = (v > 0xF) << 2;
+	v >>= shift;
+	r |= shift;
+	shift = (v > 0x3) << 1;
+	v >>= shift;
+	r |= shift;
+	r |= (v >> 1);
+	return r;
+}
+
+/* runq_bucket returns the bucket of a wait of ns nanoseconds. */
+static __always_inline __u32 runq_bucket(__u64 ns)
+{
+	__u32 e;
+
+	if (ns < KEVENTS_RUNQ_SUB)
+		return ns;
+	e = log2_u64(ns);
+	return ((e - KEVENTS_RUNQ_SUB_BITS + 1) << KEVENTS_RUNQ_SUB_BITS) |
+	       ((ns >> (e - KEVENTS_RUNQ_SUB_BITS)) & (KEVENTS_RUNQ_SUB - 1));
+}
+
+/* runq_forget clears the start of a thread that blocks: a wakeup of a
+ * running thread (ttwu_runnable) set it while it ran. */
+static __always_inline void runq_forget(const struct task_struct *t)
+{
+	__u32 tid = t->pid;
+	__u64 *start = bpf_map_lookup_elem(&runq_start, &tid);
+
+	if (start)
+		*start = 0;
+}
+
+static __always_inline void runq_dequeue(const struct task_struct *t)
+{
+	struct kevents_runq *s;
+	__u32 tid = t->pid, zero = 0, b;
+	__u64 *start, ns;
+
+	start = bpf_map_lookup_elem(&runq_start, &tid);
+	if (!start || !*start)
+		return;
+	ns = bpf_ktime_get_ns() - *start;
+	*start = 0;
+	/* A start later than the end (the clock is monotonic: it should not
+	 * happen) would be a wait of 2^64 ns: not counted. */
+	if ((__s64)ns < 0)
+		return;
+	s = bpf_map_lookup_elem(&runq, &zero);
+	if (!s)
+		return;
+	/* Per CPU, with preemption disabled: plain increments. */
+	s->waits++;
+	s->total_ns += ns;
+	if (ns > s->max_ns)
+		s->max_ns = ns;
+	b = runq_bucket(ns);
+	if (b < KEVENTS_RUNQ_BUCKETS)
+		s->buckets[b]++;
+}
+
+/* task_state returns the state of t: __state since Linux 5.14, state
+ * before. */
+static __always_inline long task_state(const struct task_struct *t)
+{
+	if (bpf_core_field_exists(t->__state))
+		return t->__state;
+	return ((const struct task_struct___pre514 *)t)->state;
+}
+
+/*
+ * runq_switch handles a context switch from prev to next. prev is the
+ * current task, which tells the target process's ID the first time one of
+ * its threads is switched out.
+ *
+ * prev stays runnable, and waits for a CPU again, when it was preempted in
+ * the kernel, or when its state, read here, is TASK_RUNNING: its time slice
+ * ended, it yielded, or a pending signal kept it from sleeping. The state is
+ * read rather than the prev_state of the tracepoint (Linux 5.18), which until
+ * Linux 6.16 is the state of a sleep that a signal cut short. A wakeup racing
+ * with the switch sets TASK_WAKING, not TASK_RUNNING, and its own tracepoint
+ * comes after. The switch is then involuntary, as the kernel counts it
+ * (nivcsw) but for those sleeps, which it counts as voluntary.
+ * Otherwise prev blocks, and its start is cleared. next stops waiting.
+ */
+static __always_inline void runq_switch(bool preempt, const struct task_struct *prev,
+					const struct task_struct *next)
+{
+	__u32 tgid = runq_tgid;
+
+	if (!tgid) {
+		if (!in_target())
+			return;
+		tgid = bpf_get_current_pid_tgid() >> 32;
+		runq_tgid = tgid;
+	}
+	if (runq_target(prev, tgid)) {
+		if (preempt || task_state(prev) == TASK_RUNNING) {
+			__u32 zero = 0;
+			struct kevents_runq *s = bpf_map_lookup_elem(&runq, &zero);
+
+			if (s)
+				s->preempted++;
+			runq_enqueue(prev);
+		} else {
+			runq_forget(prev);
+		}
+	}
+	if (runq_target(next, tgid))
+		runq_dequeue(next);
+}
+
+/*
+ * runq_wakeup starts the wait of a thread that is woken up, unless it waits
+ * already: preempted in the kernel before it slept, it stayed runnable, and
+ * its wait began then, as the kernel's sched_info counts it. Every switch
+ * that takes the CPU from the thread sets or clears its start, so a start
+ * kept here is never one from before the thread last ran.
+ */
+static __always_inline void runq_wakeup(const struct task_struct *t)
+{
+	__u32 tid = t->pid;
+	__u64 *start = bpf_map_lookup_elem(&runq_start, &tid);
+
+	if (!start) {
+		runq_enqueue(t);
+		return;
+	}
+	if (!*start)
+		*start = bpf_ktime_get_ns();
+}
+
+SEC("tp_btf/sched_wakeup")
+int BPF_PROG(kevents_wakeup, struct task_struct *p)
+{
+	if (runq_target(p, runq_tgid))
+		runq_wakeup(p);
+	return 0;
+}
+
+SEC("tp_btf/sched_wakeup_new")
+int BPF_PROG(kevents_wakeup_new, struct task_struct *p)
+{
+	if (runq_target(p, runq_tgid))
+		runq_wakeup(p);
+	return 0;
+}
+
+/* sched_switch passes prev_state too since Linux 5.18: it is not read
+ * (runq_switch). */
+SEC("tp_btf/sched_switch")
+int BPF_PROG(kevents_switch, bool preempt, struct task_struct *prev,
+	     struct task_struct *next)
+{
+	runq_switch(preempt, prev, next);
 	return 0;
 }

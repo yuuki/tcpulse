@@ -31,7 +31,7 @@ internal/server  echo server
 internal/stats   latency histogram, per-peer recorders
 internal/report  text and JSON Lines output
 internal/sockopt Linux socket options and TCP_INFO (no-ops or unsupported elsewhere)
-internal/kevents eBPF counters of kernel TCP events per connection (Linux)
+internal/kevents eBPF counters of kernel TCP events per connection, run queue latency (Linux)
 ```
 
 `main.go` stays at the root of the module so that
@@ -334,6 +334,67 @@ an nftables rule in a network namespace of its own, so that the host's
 firewall is left alone. The attribution itself is tested with a
 fake reader.
 
+### 3.6 Run queue latency
+
+A load generator that waits for a CPU delays its own round trips, and its
+report then blames the network. With `--runqueue-latency` (the requirements
+of §3.5, TCP or UDP), the programs of `internal/kevents` measure how long the
+threads of the process wait for a CPU: from when a thread becomes runnable
+to when it runs, as `runqlat` does. It is a separate option because its
+tracepoints run at every context switch and wakeup of the host, more often
+than those of §3.5; it loads only its own programs.
+
+| Tracepoint | What it does |
+| --- | --- |
+| `sched_wakeup`, `sched_wakeup_new` | A thread of the process becomes runnable: remembers when, by thread ID, in a hash map. |
+| `sched_switch` | prev stays runnable when it was preempted in the kernel, or when its state is `TASK_RUNNING`: its time slice ended (preemption in user mode goes through `schedule()`, with `preempt` false), it yielded, or a pending signal kept it from sleeping. The switch is then involuntary, and prev waits again, from now; otherwise prev blocks, and its start is cleared. next stops waiting: its wait is recorded. |
+
+The tasks of these tracepoints carry the IDs of the initial PID namespace,
+while tcpulse may run in a container. The process's ID there is learnt at
+the first context switch of one of its threads, when it is the current task,
+by the namespace check of §3.5 (a helper call at every switch of the host
+until then); then a switch or wakeup of another process costs a few loads
+and comparisons.
+
+The state of prev is read in the tracepoint, not taken from its `prev_state`
+argument (Linux 5.18): until Linux 6.16, that is the state of a sleep that a
+pending signal cut short, while the task stays runnable, and a Go thread
+with a pending SIGURG (asynchronous preemption) would lose its wait. Read in
+the tracepoint, the state is `TASK_RUNNING` exactly when prev stays
+runnable: a wakeup racing with the switch sets `TASK_WAKING`, and its own
+tracepoint comes after. The kernel counts the switches the same way
+(`nivcsw`), but for those cut-short sleeps, which it counts as voluntary on
+every version (`!preempt && prev_state`).
+
+`sched_wakeup` also fires for a thread that is still running (a wakeup
+before it slept, `ttwu_runnable`), and sets a start then. A switch that
+blocks the thread clears it, so that a later switch to it cannot count the
+time it ran as a wait. A wakeup of a thread that already waits (preempted
+in the kernel before it slept, then woken) keeps its start, as the kernel's
+`sched_info` does, rather than lose the wait before the wakeup. A start
+later than the end (`bpf_ktime_get_ns` is monotonic, so this should not
+happen), which would be a wait of 2^64 nanoseconds, is not counted.
+
+The waits go to a per-CPU array (the CPU where they end, with preemption
+disabled, so plain increments): their count, total, longest, and a
+histogram whose buckets are at most 1/8 of their values wide (each power of
+two of nanoseconds in eight). After the run, the client adds the CPUs up;
+the percentiles are nearest-rank, as the largest value of their bucket, and
+the longest wait is exact. The report prints one section for the process,
+and every JSON object carries the same `runqueue_latency`. Until a thread of
+the process was switched out, the programs did not know it, and measured
+nothing: reading the waits is then an error, logged, and the report leaves
+the section out rather than show a process that never waited.
+
+A Tracer creates the maps of what it is asked for only: the library would
+otherwise create those of the run queue (a hash map of 4096 threads, and a
+histogram per CPU) for `--kernel-events` alone.
+
+The waits are those of the process: a Go thread runs the goroutines of
+many connections, so a wait cannot be given to one round trip. The report
+compares percentiles, which is what tells the client's delays from the
+network's.
+
 ## 4. Statistics
 
 `internal/stats.Histogram` counts durations in log-linear buckets: every
@@ -453,9 +514,9 @@ not positive when interval lines are printed, an empty message, no
 connection in persistent mode, a UDP message above 65507 bytes, an empty
 addresses file, an unknown protocol or flavor, `--tcp-info` or
 `--kernel-events` with UDP or on a platform other than Linux, and
-`--listener-stats` on a platform other than Linux. `FuzzParse` checks the
-options validation accepts against an independent computation of the message
-count.
+`--runqueue-latency` or `--listener-stats` on a platform other than Linux.
+`FuzzParse` checks the options validation accepts against an independent
+computation of the message count.
 
 Exit statuses: 0 on success (also after Ctrl-C, which interrupts the
 requests in flight and prints the report), 1 for invalid options, run
@@ -478,7 +539,9 @@ with a section of its own: a separator, a header, and a line per peer (or a
 single merged line) of TCP statistics. Each JSON object ends with a
 `tcp_info` object. `--kernel-events` adds a section of the same form after
 it, and a `kernel_events` object; when the host dropped packets of the
-connections, a last section lists them by peer and reason. Without these
+connections, a section lists them by peer and reason. `--runqueue-latency`
+ends the text report with a section for the process, and each object with a
+`runqueue_latency` object. Without these
 options, the output is
 unchanged. The column layout and the JSON field names and order are a public
 format, pinned by golden tests in `internal/report`. The server prints
