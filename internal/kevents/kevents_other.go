@@ -26,6 +26,9 @@ func (*Tracer) GenerationError() error { return errors.ErrUnsupported }
 // DropsError reports that drops are not supported.
 func (*Tracer) DropsError() error { return errors.ErrUnsupported }
 
+// DropsLimitation returns nil.
+func (*Tracer) DropsLimitation() error { return nil }
+
 // DropReasons returns nil.
 func (*Tracer) DropReasons() map[uint32]string { return nil }
 

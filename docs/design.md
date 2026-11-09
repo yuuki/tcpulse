@@ -201,17 +201,30 @@ The kind of a retransmission, decided in this order:
   so these are not fast.
 
 A dropped packet belongs to the socket that sent it (`skb->sk`, which the
-packet keeps until it leaves the host: `loopback_xmit` orphans it), or to
-the socket it was received for: `rx_sk`, which the receive path of TCP
-passes once it found the socket (`sk_skb_reason_drop`), or `skb->sk`, which
-early demux sets for an established connection before routing. Over
+packet keeps until it leaves the host, or loops back: `loopback_xmit`
+orphans it), or to the socket it was received for: `rx_sk`, which the
+receive path of TCP passes once it found the socket (`sk_skb_reason_drop`),
+or `skb->sk`, which early demux sets for an established connection before
+routing (with `net.ipv4.ip_early_demux` and `tcp_early_demux`). Over
 loopback, a packet keeps the route of its sender and skips early demux
 (`ip_rcv_finish_core`), so drops before TCP, such as in netfilter's INPUT
-hook, are not attributed there; across a veth pair they are. `kfree_skb`
-does not fire for the packets the kernel consumes (`consume_skb`,
-`SKB_CONSUMED`): a clean run counts no drop, unless the network driver frees
-the packets it sent as drops (`dev_kfree_skb_any` rather than
-`dev_consume_skb_any`), which then all count, as `NOT_SPECIFIED`.
+hook, are not attributed there; across a veth pair they are. A veth pair
+does not orphan the packet either (`__dev_forward_skb`): a packet sent to
+another network namespace of the host keeps the sender's socket until IP
+input there (`ip_rcv_core`), so its drops on the way (tc, a bridge, the
+backlog of the receiving CPU, an ingress hook) count too, although the
+packet was sent, and is retransmitted.
+
+`kfree_skb` does not fire for the packets the kernel consumes
+(`consume_skb`, `SKB_CONSUMED`): a clean run counts no drop, unless the
+network driver frees the packets it sent as drops (`dev_kfree_skb_any`
+rather than `dev_consume_skb_any`), which then all count, as
+`NOT_SPECIFIED`. Since Linux 6.11, a connection that receives an ACK in
+CLOSE_WAIT, CLOSING or LAST_ACK (after the server half-closed it) also
+counts a `NOT_SPECIFIED` drop (`tcp_rcv_state_process` frees the segment
+without queueing it); the tcpulse server never half-closes. Before Linux
+6.11, the drops of TCP's own receive path are not counted, and tcpulse says
+so at the start.
 
 Two guards keep the programs from reading what is not a socket:
 
@@ -220,7 +233,7 @@ Two guards keep the programs from reading what is not a socket:
   their queue expires. Every packet that belongs to a socket has a
   destructor (`tcp_wfree`, `sock_edemux`, `sock_rfree`), and a queued
   fragment has none: `skb->sk` is only used when `skb->destructor` is set.
-- `rx_sk` is NULL for most drops, but the verifiers of Linux 6.11 and 6.12
+- `rx_sk` is NULL for most drops, but the verifiers of Linux 6.11 to 6.13
   take the arguments of tracepoints for pointers that are never NULL, and
   would remove a test of it along with its other branch. The program looks
   `rx_sk` up first, then `skb->sk` when that found nothing: the helper takes

@@ -25,7 +25,14 @@ import (
 // this process may not load eBPF programs (tests normally run unprivileged).
 func startTracer(t *testing.T) *Tracer {
 	t.Helper()
-	tr, err := Start()
+	return startTracerWithDrop(t, "")
+}
+
+// startTracerWithDrop starts a Tracer with the drop program drop (start),
+// as startTracer.
+func startTracerWithDrop(t *testing.T, drop string) *Tracer {
+	t.Helper()
+	tr, err := start(drop)
 	if errors.Is(err, os.ErrPermission) {
 		t.Skipf("loading eBPF programs needs root, or CAP_BPF and CAP_PERFMON: %v", err)
 	}
@@ -293,7 +300,13 @@ func TestDropProgram(t *testing.T) {
 // program must load.
 func startDropTracer(t *testing.T) *Tracer {
 	t.Helper()
-	tr := startTracer(t)
+	return startDropTracerWith(t, "")
+}
+
+// startDropTracerWith is startDropTracer, with the drop program drop.
+func startDropTracerWith(t *testing.T, drop string) *Tracer {
+	t.Helper()
+	tr := startTracerWithDrop(t, drop)
 	if err := tr.DropsError(); err != nil {
 		if _, _, perr := dropProgram(kernelSpec(t)); perr != nil {
 			t.Skip(err)
@@ -380,8 +393,10 @@ func TestTracerDrops(t *testing.T) {
 
 // inNetns runs f on a thread of its own, in a new network namespace whose
 // loopback device is up: the sockets f opens, and the programs f runs, are
-// there. It reports failures with t.Error, as f must.
-func inNetns(t *testing.T, f func()) {
+// there. It reports failures with t.Error, as f must, and returns why the
+// test should be skipped instead: creating the namespace needs
+// CAP_SYS_ADMIN, which loading the programs does not, and f may say why.
+func inNetns(t *testing.T, f func() (skip string)) (skip string) {
 	t.Helper()
 	done := make(chan struct{})
 	go func() {
@@ -390,6 +405,10 @@ func inNetns(t *testing.T, f func()) {
 		// serves another in the host's namespace.
 		runtime.LockOSThread()
 		if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
+			if errors.Is(err, unix.EPERM) {
+				skip = fmt.Sprintf("creating a network namespace needs CAP_SYS_ADMIN: %v", err)
+				return
+			}
 			t.Errorf("unshare: %v", err)
 			return
 		}
@@ -409,31 +428,52 @@ func inNetns(t *testing.T, f func()) {
 			t.Errorf("bringing lo up: %v", err)
 			return
 		}
-		f()
+		skip = f()
 	}()
 	<-done
+	return skip
 }
 
 // TestTracerSentDrops counts a packet of the client that netfilter's OUTPUT
-// hook drops: rx_sk is NULL, and the drop is the socket's by skb->sk.
+// hook drops: rx_sk is NULL, and the drop is the socket's by skb->sk. Where
+// the kernel passes rx_sk, the program of older kernels runs too.
 func TestTracerSentDrops(t *testing.T) {
-	tr := startDropTracer(t)
+	progs := []string{""}
+	if prog, _, err := dropProgram(kernelSpec(t)); err == nil && prog == keventsProgKeventsDropRx {
+		progs = []string{keventsProgKeventsDropRx, keventsProgKeventsDrop}
+	}
+	for _, prog := range progs {
+		t.Run(prog, func(t *testing.T) {
+			if skip := sentDrop(t, prog); skip != "" {
+				t.Skip(skip)
+			}
+		})
+	}
+}
+
+// sentDrop runs TestTracerSentDrops with the drop program prog, and returns
+// why the test should be skipped.
+func sentDrop(t *testing.T, prog string) (skip string) {
+	tr := startDropTracerWith(t, prog)
+	if prog != "" && tr.drop != prog {
+		t.Fatalf("drop program %q, want %q", tr.drop, prog)
+	}
 	nft, err := exec.LookPath("nft")
 	if err != nil {
-		t.Skip("no nft")
+		return "no nft"
 	}
 	netfilterDrop := dropReason(t, tr, "NETFILTER_DROP")
-	inNetns(t, func() {
+	return inNetns(t, func() string {
 		ln, err := net.Listen("tcp4", "127.0.0.1:0")
 		if err != nil {
 			t.Error(err)
-			return
+			return ""
 		}
 		defer ln.Close()
 		conn, err := net.Dial("tcp4", ln.Addr().String())
 		if err != nil {
 			t.Error(err)
-			return
+			return ""
 		}
 		defer conn.Close()
 		// Drop the client's packets that carry data, once connected.
@@ -442,30 +482,54 @@ func TestTracerSentDrops(t *testing.T) {
 		cmd := exec.Command(nft, "-f", "-")
 		cmd.Stdin = strings.NewReader(rules)
 		if out, err := cmd.CombinedOutput(); err != nil {
+			// A kernel without nf_tables refuses the table.
+			if strings.Contains(string(out), "not supported") {
+				return fmt.Sprintf("nft: %v: %s", err, out)
+			}
 			t.Errorf("nft: %v: %s", err, out)
-			return
+			return ""
 		}
 		if _, err := conn.Write(make([]byte, 200)); err != nil {
 			t.Error(err)
-			return
+			return ""
 		}
 		for deadline := time.Now().Add(3 * time.Second); ; {
 			ev, err := readConn(tr, conn)
 			if err != nil {
 				t.Error(err)
-				return
+				return ""
 			}
 			if ev.DroppedPackets() > 0 {
 				if ev.Drops[0].Reason != netfilterDrop || ev.Drops[0].Count == 0 {
 					t.Errorf("drops = %+v, other %d; want NETFILTER_DROP (%d)", ev.Drops, ev.OtherDrops, netfilterDrop)
 				}
-				return
+				return ""
 			}
 			if time.Now().After(deadline) {
 				t.Errorf("events = %+v, want a drop", ev)
-				return
+				return ""
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
 	})
+}
+
+// TestTracerDropMaps checks that the collection of the drop program creates
+// only the maps it uses, and that the program of older kernels says what it
+// does not count.
+func TestTracerDropMaps(t *testing.T) {
+	tr := startDropTracer(t)
+	for name := range tr.dropColl.Maps {
+		if name != keventsMapConns && name != ".bss" && name != ".rodata" {
+			t.Errorf("the drop collection created map %s", name)
+		}
+	}
+	if (tr.drop == keventsProgKeventsDrop) != (tr.DropsLimitation() != nil) {
+		t.Errorf("drop program %s, limitation %v", tr.drop, tr.DropsLimitation())
+	}
+	if prog, _, err := dropProgram(kernelSpec(t)); err == nil && prog == keventsProgKeventsDropRx {
+		if old := startDropTracerWith(t, keventsProgKeventsDrop); old.DropsLimitation() == nil {
+			t.Error("the program of older kernels does not say what it does not count")
+		}
+	}
 }

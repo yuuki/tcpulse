@@ -312,7 +312,7 @@ On Linux, `--kernel-events` loads eBPF programs that count kernel events on ever
 - Linux 5.12 or later, with BTF (`/sys/kernel/btf/vmlinux`), on a little-endian architecture.
 - Root, or `CAP_BPF` and `CAP_PERFMON`. The container image runs as `nobody`: give it `--user 0` and the capabilities, which `--privileged` grants.
 - It is refused with `--proto udp` and on other platforms. If the programs cannot be loaded, tcpulse exits with status 1 and the reason, before sending anything.
-- Drops need Linux 5.17 or later, which gives their reason. The drops of TCP's own receive path need Linux 6.11 (see below). When drops are not counted, `DROP_RTS` is `-`, and tcpulse says why at the start.
+- Drops need Linux 5.17 or later, which gives their reason. The drops of TCP's own receive path need Linux 6.11 (see below); before, tcpulse says at the start that they are not counted. When drops are not counted at all, `DROP_RTS` is `-`, and tcpulse says why at the start.
 
 ```shell-session
 $ sudo tcpulse -c --show-only-results --kernel-events --flavor ephemeral --rate 200 --duration 4s 192.0.2.10:9100
@@ -332,7 +332,7 @@ In this run, 5% of the packets to the server were dropped on their way. The 99th
   - `TFO_RTX`: of data sent in a TCP Fast Open SYN that the server did not acknowledge although the SYN arrived: the server no longer accepts Fast Open, or its queue of pending Fast Open requests is full. The client sends the data again right after the handshake, without loss or timeout.
   - `RTO_RTX`: in the kernel's loss state, which a retransmission timeout enters (200ms at least).
   - `OTHER_RTX`: any other: fast retransmit, RACK, tail loss probes. These are not fast for tcpulse's messages either: when a single segment is in flight, the tail loss probe waits for two RTTs plus the minimum RTO (200ms).
-- `DROP_RTS`: The round trips during which the kernel of this host dropped at least one packet of their connection, or `-` when drops are not counted. A packet dropped before it left the host was never sent, so TCP does not retransmit it: it sends it again from its probe timer, after 200ms at least, as new data. These round trips can be slow without counting under any `_RTX` column.
+- `DROP_RTS`: The round trips during which the kernel of this host dropped at least one packet of their connection, or `-` when drops are not counted. A packet dropped before it left the host was never sent, so TCP does not retransmit it: it sends it again from its probe timer, after 200ms at least, as new data. These round trips can be slow without counting under any `_RTX` column. (A packet sent through a veth pair to another network namespace of the host, such as a container's, keeps its socket until IP input there: its drops on the way count, and it is retransmitted.)
 - `EVENT_99p(µs)`, `CLEAN_99p(µs)`: The 99th percentile latency of the round trips with events, and of the others
 - `RST_RECV`: The resets received by the connections
 - `UNMATCHED`: The retransmissions that no completed round trip owns. They come from dials that failed or were cut off by the end of the run (SYNs never answered), from requests that failed or were cut off, and, in persistent mode, from a handshake that the untimed dial waited for.
@@ -360,8 +360,9 @@ In this run, a firewall rule of the client's host dropped 5% of its packets to t
 Which drops are counted:
 - **Sent:** a packet of the connection dropped before it left the host: by a firewall rule (netfilter's OUTPUT hook), a queueing discipline, a neighbour that does not resolve.
 - **Received, by TCP:** a packet that TCP dropped after it found the connection: a full receive buffer, data out of the window, a duplicate. This needs Linux 6.11, which passes the socket to the tracepoint.
-- **Received, before TCP:** a packet dropped before TCP looked the connection up, e.g. by netfilter's INPUT hook, only if early demux had found the connection first (`net.ipv4.tcp_early_demux`, on by default). Over loopback, packets keep their route and skip early demux: these drops are not counted.
-- **Not seen:** drops in the network and on the server's host. They show up as retransmissions.
+- **Received, before TCP:** a packet dropped before TCP looked the connection up, e.g. by netfilter's INPUT hook, only if early demux had found the connection first (`net.ipv4.ip_early_demux` and `net.ipv4.tcp_early_demux`, on by default). Over loopback, packets keep their route and skip early demux: these drops are not counted.
+- **Not seen:** drops in the network and on the server's host (unless it is another network namespace of this one, reached through a veth pair). They show up as retransmissions.
+- **Not drops:** since Linux 6.11, an ACK that a connection receives after the server half-closed it counts as a `NOT_SPECIFIED` drop. The tcpulse server never half-closes.
 - **Too many:** some network drivers free the packets they sent as drops rather than as consumed. Then every packet sent counts, as `NOT_SPECIFIED`, and `DROP_RTS` approaches the count of round trips.
 
 How events are attributed:
