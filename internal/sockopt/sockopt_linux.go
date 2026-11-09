@@ -144,10 +144,13 @@ func control(c syscall.Conn, f func(fd int) error) error {
 	return ferr
 }
 
-// SocketDrops returns what the kernel dropped for a socket since it was
-// created (SO_MEMINFO, Linux 4.12): for a TCP listener, the SYNs and ACKs of
-// handshakes it could not take because its SYN or accept queue was full;
-// for a UDP socket, the datagrams that did not fit in its receive buffer.
+// SocketDrops returns the packets the kernel discarded at a socket since it
+// was created (SO_MEMINFO, Linux 4.12). For a TCP listener: the SYNs it
+// refused and their retransmissions, the ACKs a full accept queue refused
+// (twice each), the SYNs sent again for handshakes in progress (a lost
+// SYN-ACK), resets of those handshakes, and packets a filter dropped. For a
+// UDP socket: mostly the datagrams that did not fit in its receive buffer,
+// and those dropped for memory pressure, a bad checksum, or by a filter.
 func SocketDrops(c syscall.Conn) (uint32, error) {
 	var mem [skMemInfoVars]uint32
 	err := control(c, func(fd int) error {

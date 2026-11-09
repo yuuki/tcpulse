@@ -312,19 +312,30 @@ receives. It listens on each address for TCP, UDP (`udp4`) or both
   stops it.
 - On SIGINT or SIGTERM it closes its listeners and connections and waits for
   its goroutines.
-- TCP listeners are plain TCP. Since Go 1.24, listeners use MPTCP where the
-  kernel supports it; tcpulse measures TCP, its client never uses MPTCP, and
-  an MPTCP listener keeps the drops of its TCP subflow listener from
-  `SO_MEMINFO`. For TCP clients, the connections are the same either way.
+- TCP listeners are plain TCP, with or without `--listener-stats`. Since
+  Go 1.24, listeners use MPTCP where the kernel supports it; tcpulse
+  measures TCP, its client never uses MPTCP, and an MPTCP listener keeps the
+  drops of its TCP subflow listener from `SO_MEMINFO`. For TCP clients, the
+  connections are the same either way, but before Linux 6.2, MPTCP sockets
+  refused `TCP_FASTOPEN`: 0.8.3, built with Go 1.25, served without Fast
+  Open there. MPTCP clients fall back to TCP.
 - With `--listener-stats` (Linux), the server counts the connections it
   accepts and the datagrams it receives, and samples the accept queue of
   each TCP listener every 10ms (`TCP_INFO` of a listening socket: the
   connections waiting and the length of the queue). When it stops, it reads
   the drops the kernel accounted to each socket (`SO_MEMINFO`), before it
-  closes them, and prints a line per socket. The drops of a TCP listener are
-  mostly handshakes it could not take because its SYN or accept queue was
-  full (the host's `ListenDrops`); those of a UDP socket, datagrams over its
-  receive buffer.
+  closes them, and prints a line per socket.
+- The drops of a TCP listener are packets, not handshakes, and not the
+  host's `ListenDrops` (`tcp_v4_rcv`, `discard_and_relse`): the SYNs it
+  refused and their retransmissions, the ACKs a full accept queue refused
+  (`tcp_listendrop` and the discard: twice each), the SYNs sent again for
+  handshakes in progress, whose SYN-ACK was lost (`tcp_check_req` returns
+  nothing), resets of those handshakes, and what a socket filter or a cgroup
+  BPF program dropped. With SYN cookies, the default, a full SYN queue drops
+  nothing. So a lossy path shows in them too: the accept queue overflowed
+  when its sampled maximum reached its length plus one. Those of a UDP
+  socket are mostly datagrams over its receive buffer, and also memory
+  pressure, bad checksums and filters (`udp_drops_inc`).
 
 UDP is IPv4 only on both sides: unlike TCP, a UDP client cannot fall back
 from `::1` to `127.0.0.1`, so `localhost` would fail against the default

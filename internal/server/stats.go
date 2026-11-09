@@ -25,10 +25,10 @@ type ListenerStats struct {
 	// Received counts the TCP connections accepted, or the UDP datagrams
 	// received.
 	Received int64
-	// Drops counts what the kernel dropped for the socket: for TCP, the
-	// SYNs and ACKs of handshakes the listener could not take because its
-	// SYN or accept queue was full; for UDP, the datagrams that did not fit
-	// in the receive buffer.
+	// Drops counts the packets the kernel discarded at the socket
+	// (sockopt.SocketDrops): for TCP, those of refused handshakes, but
+	// also those of handshakes delayed by a lossy path; for UDP, mostly the
+	// datagrams that did not fit in the receive buffer.
 	Drops int64
 	// QueueMax is the most connections seen waiting in the accept queue
 	// (sampled every queueSampleInterval), and QueueLen the length of the

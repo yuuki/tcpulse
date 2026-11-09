@@ -163,7 +163,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	stop := context.AfterFunc(ctx, s.close)
 	defer stop()
 
-	if s.stats {
+	if s.stats && len(s.tcp) > 0 {
 		eg.Go(func() error {
 			s.sampleQueues(ctx)
 			return nil
@@ -228,7 +228,9 @@ func (s *Server) serveTCP(ctx context.Context, ln net.Listener, st *socketStats)
 			continue
 		}
 		delay = 0
-		st.received.Add(1)
+		if s.stats {
+			st.received.Add(1)
+		}
 
 		// TCP_QUICKACK only speeds up acknowledgments: a connection whose
 		// socket refuses it is served all the same.
@@ -322,7 +324,9 @@ func (s *Server) serveUDP(ctx context.Context, pc net.PacketConn, st *socketStat
 			s.logger.Error("UDP read error", "error", err)
 			continue
 		}
-		st.received.Add(1)
+		if s.stats {
+			st.received.Add(1)
+		}
 
 		writers.Go(func() {
 			defer udpBufPool.Put(bufp)

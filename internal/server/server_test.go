@@ -353,7 +353,7 @@ func TestServerStats(t *testing.T) {
 		t.Fatalf("stats = %+v, want a TCP and a UDP socket", stats)
 	}
 	tcp, udpStats := stats[0], stats[1]
-	if tcp.Protocol != ProtocolTCP || tcp.Received != 3 || tcp.Drops != 0 || tcp.QueueLen < 1 || tcp.QueueMax < 0 || tcp.QueueMax > tcp.QueueLen {
+	if tcp.Protocol != ProtocolTCP || tcp.Received != 3 || tcp.Drops != 0 || tcp.QueueLen < 1 || tcp.QueueMax < 0 || tcp.QueueMax > tcp.QueueLen+1 {
 		t.Errorf("TCP stats = %+v, want 3 connections, no drop and a sampled queue", tcp)
 	}
 	if udpStats.Protocol != ProtocolUDP || udpStats.Received != 5 || udpStats.Drops != 0 || udpStats.QueueMax != -1 || udpStats.QueueLen != -1 {
