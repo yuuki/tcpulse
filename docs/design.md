@@ -150,11 +150,11 @@ handshake, unless the message travels in the SYN with Fast Open.
 The client sets `TCP_FASTOPEN_CONNECT`, so it sends its first message in the
 SYN when it holds a cookie for the server. When the server does not accept
 that data (it no longer enables Fast Open, or its queue of pending Fast Open
-requests is full: the tcpulse server keeps a queue of one, see §6), the
-client sends the data again right after the handshake, and it counts as a
-retransmission. So do lost SYNs, which are retransmitted after a timeout of
-at least 1s: the counters alone do not tell the two apart. The latencies do
-(steps of whole seconds for SYN loss: 1s, 2s, 3s with
+requests is full; the tcpulse server keeps one as long as its accept queue,
+see §6), the client sends the data again right after the handshake, and it
+counts as a retransmission. So do lost SYNs, which are retransmitted after a
+timeout of at least 1s: the counters alone do not tell the two apart. The
+latencies do (steps of whole seconds for SYN loss: 1s, 2s, 3s with
 `net.ipv4.tcp_syn_linear_timeouts`, 1s, 3s, 7s where the timeout doubles),
 and so do the host's counters `TCPSynRetrans` and `TCPFastOpenActiveFail`.
 
@@ -439,8 +439,32 @@ receives. It listens on each address for TCP, UDP (`udp4`) or both
   `net/http`. Another accept error closes the listener's connections and
   stops the server with exit status 1. No error of a single connection
   stops it.
-- On SIGINT or SIGTERM it closes its listeners and connections and waits
-  for its goroutines.
+- On SIGINT or SIGTERM it closes its listeners and connections and waits for
+  its goroutines.
+- TCP listeners are plain TCP, with or without `--listener-stats`. Since
+  Go 1.24, listeners use MPTCP where the kernel supports it; tcpulse
+  measures TCP, its client never uses MPTCP, and an MPTCP listener keeps the
+  drops of its TCP subflow listener from `SO_MEMINFO`. For TCP clients, the
+  connections are the same either way, but before Linux 6.2, MPTCP sockets
+  refused `TCP_FASTOPEN`: 0.8.3, built with Go 1.25, served without Fast
+  Open there. MPTCP clients fall back to TCP.
+- With `--listener-stats` (Linux), the server counts the connections it
+  accepts and the datagrams it receives, and samples the accept queue of
+  each TCP listener every 10ms (`TCP_INFO` of a listening socket: the
+  connections waiting and the length of the queue). When it stops, it reads
+  the drops the kernel accounted to each socket (`SO_MEMINFO`), before it
+  closes them, and prints a line per socket.
+- The drops of a TCP listener are packets, not handshakes, and not the
+  host's `ListenDrops` (`tcp_v4_rcv`, `discard_and_relse`): the SYNs it
+  refused and their retransmissions, the ACKs a full accept queue refused
+  (`tcp_listendrop` and the discard: twice each), the SYNs sent again for
+  handshakes in progress, whose SYN-ACK was lost (`tcp_check_req` returns
+  nothing), resets of those handshakes, and what a socket filter or a cgroup
+  BPF program dropped. With SYN cookies, the default, a full SYN queue drops
+  nothing. So a lossy path shows in them too: the accept queue overflowed
+  when its sampled maximum reached its length plus one. Those of a UDP
+  socket are mostly datagrams over its receive buffer, and also memory
+  pressure, bad checksums and filters (`udp_drops_inc`).
 
 UDP is IPv4 only on both sides: unlike TCP, a UDP client cannot fall back
 from `::1` to `127.0.0.1`, so `localhost` would fail against the default
@@ -452,11 +476,25 @@ from `::1` to `127.0.0.1`, so `localhost` would fail against the default
 | --- | --- | --- |
 | `SO_REUSEPORT` | listening and client sockets | several servers can share a port |
 | `TCP_FASTOPEN_CONNECT` | client sockets | the first message travels in the SYN when the server allows it |
-| `TCP_FASTOPEN` (queue of 1) | listening sockets | accept data in the SYN (with `net.ipv4.tcp_fastopen` enabling the server side) |
+| `TCP_FASTOPEN` (a queue of `net.core.somaxconn` pending requests, like the accept backlog) | listening sockets | accept data in the SYN (with `net.ipv4.tcp_fastopen` enabling the server side); a shorter queue makes concurrent Fast Open handshakes fall back |
 | `TCP_QUICKACK` | ephemeral connections, accepted connections | acknowledge at once instead of delaying |
 
 They are optimizations: a kernel that refuses one gets a warning logged once
 per option, and the connection goes on. Other platforms set none.
+
+The Fast Open queue holds the connections that a SYN with data created and
+whose handshake is not over (SYN_RECV until the client's last ACK; a reset
+keeps a place for 60s), not those waiting to be accepted: it needs about the
+rate of new connections times the RTT of a handshake. With a queue of 1, at
+1,000 new connections per second over loopback, 65 of 2,000 fell back. The
+server makes it as long as its accept queue, `net.core.somaxconn`, as the
+kernel does itself with the 0x400 bit of `net.ipv4.tcp_fastopen`, and reads
+the sysctl because only Linux 4.4 and later cap the value at it. With
+cookies, the default, a spoofed SYN creates no connection. Without
+(`net.ipv4.tcp_fastopen` bit 0x200, or a route's `fastopen_no_cookie`), a
+flood of spoofed SYNs with data creates up to that many connections per
+listener, which the server accepts and holds (a socket and a goroutine each)
+until their handshake times out, about 2 minutes.
 
 ## 7. Configuration
 
@@ -475,10 +513,10 @@ rate × duration below one message or beyond an int64, an interval that is
 not positive when interval lines are printed, an empty message, no
 connection in persistent mode, a UDP message above 65507 bytes, an empty
 addresses file, an unknown protocol or flavor, `--tcp-info` or
-`--kernel-events` with UDP or on a platform other than Linux,
-`--runqueue-latency` on a platform other than Linux. `FuzzParse`
-checks the options validation accepts against an independent computation of
-the message count.
+`--kernel-events` with UDP or on a platform other than Linux, and
+`--runqueue-latency` or `--listener-stats` on a platform other than Linux.
+`FuzzParse` checks the options validation accepts against an independent
+computation of the message count.
 
 Exit statuses: 0 on success (also after Ctrl-C, which interrupts the
 requests in flight and prints the report), 1 for invalid options, run
@@ -506,7 +544,9 @@ ends the text report with a section for the process, and each object with a
 `runqueue_latency` object. Without these
 options, the output is
 unchanged. The column layout and the JSON field names and order are a public
-format, pinned by golden tests in `internal/report`.
+format, pinned by golden tests in `internal/report`. The server prints
+`Listening at ...`, and with `--listener-stats`, when it stops, a separator,
+a header and a line per listening socket.
 
 ## 9. Release
 
@@ -519,10 +559,16 @@ the code), then GoReleaser:
 
 - archives `tcpulse_<version>_<os>_<arch>.tar.gz` for Linux and macOS on
   amd64 and arm64, built with `-trimpath` and commit timestamps, and
-  `tcpulse_<version>_checksums.txt`;
+  `tcpulse_<version>_checksums.txt`. Next to the binary, they hold
+  `LICENSE`, `NOTICE`, `LICENSES/` (the eBPF object's licenses) and
+  `THIRD_PARTY_NOTICES`, the license texts of the Go standard library and
+  of the modules linked into the binary on any release platform, which a
+  hook writes with `scripts/third-party-notices` (it fails on a module
+  without a license file);
 - a linux/amd64 and linux/arm64 image `ghcr.io/yuuki/tcpulse` tagged
   `X.Y.Z`, `X.Y`, `X` and `latest`, assembled from the same binaries
-  (Alpine, running as `nobody`);
+  (Alpine, running as `nobody`), with `THIRD_PARTY_NOTICES` in
+  `/usr/share/licenses/tcpulse/`;
 - a signed build provenance attestation of the archives and the checksums
   file.
 

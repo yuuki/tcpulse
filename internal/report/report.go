@@ -461,3 +461,50 @@ func (p *Printer) printf(format string, args ...any) error {
 	}
 	return nil
 }
+
+// Listener is the statistics of a listening socket of the server
+// (--listener-stats). A value the kernel could not report, or that does not
+// apply (the accept queue of a UDP socket), is negative and printed as "-".
+type Listener struct {
+	Addr     string
+	Protocol string
+	// Received counts the TCP connections accepted, or the UDP datagrams
+	// received.
+	Received int64
+	// Drops counts what the kernel dropped for the socket.
+	Drops int64
+	// QueueMax is the most connections seen waiting in the accept queue,
+	// and QueueLen the length of the queue.
+	QueueMax int64
+	QueueLen int64
+}
+
+// ListenerSeparator precedes the statistics of the listening sockets that
+// the server prints when it stops.
+const ListenerSeparator = "--- Statistics of the listening sockets ---"
+
+const listenerFormat = "%-20s %-10s %-15s %-15s %-15s %-10s\n"
+
+// Listeners writes the statistics of the listening sockets: a separator, a
+// header, and a line per socket.
+func (p *Printer) Listeners(rows []Listener) error {
+	if err := p.printf("%s\n"+listenerFormat, ListenerSeparator,
+		"LISTENER", "PROTO", "RECEIVED", "DROPS", "QUEUE_MAX", "QUEUE_LEN"); err != nil {
+		return err
+	}
+	for _, r := range rows {
+		if err := p.printf(listenerFormat, r.Addr, r.Protocol,
+			count(r.Received), count(r.Drops), count(r.QueueMax), count(r.QueueLen)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// count formats a count, or "-" for an unknown one.
+func count(n int64) string {
+	if n < 0 {
+		return "-"
+	}
+	return strconv.FormatInt(n, 10)
+}

@@ -24,7 +24,7 @@ var noEnv = map[string]bool{"help": true, "version": true}
 // serverOptions are the options of server mode only, and commonOptions those
 // of both modes; every other option belongs to client mode only.
 var (
-	serverOptions = map[string]bool{"protocol": true, "listen-addrs-file": true}
+	serverOptions = map[string]bool{"protocol": true, "listen-addrs-file": true, "listener-stats": true}
 	commonOptions = map[string]bool{"client": true, "server": true, "help": true, "version": true}
 )
 
@@ -57,6 +57,7 @@ type options struct {
 	// Server mode.
 	serveProtocol   string
 	listenAddrsFile string
+	listenerStats   bool
 
 	showVersion bool
 	showHelp    bool
@@ -123,6 +124,7 @@ func newFlagSet(o *options) *pflag.FlagSet {
 	// Server mode.
 	fs.StringVar(&o.serveProtocol, "protocol", server.ProtocolAll, "[server mode] listening protocol ('tcp', 'udp' or 'all')")
 	fs.StringVar(&o.listenAddrsFile, "listen-addrs-file", "", "[server mode] enable to pass a file including a pair of addresses and ports")
+	fs.BoolVar(&o.listenerStats, "listener-stats", false, "[server mode] print the statistics of the listening sockets (connections, drops, accept queue) when the server stops (Linux only)")
 
 	fs.BoolVar(&o.showVersion, "version", false, "show version information")
 	fs.BoolVarP(&o.showHelp, "help", "h", false, "show help information")

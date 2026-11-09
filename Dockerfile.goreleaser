@@ -11,6 +11,7 @@ ARG TARGETPLATFORM
 COPY $TARGETPLATFORM/tcpulse /usr/local/bin/tcpulse
 COPY LICENSE NOTICE /usr/share/licenses/tcpulse/
 COPY LICENSES/ /usr/share/licenses/tcpulse/LICENSES/
+COPY build/notices/THIRD_PARTY_NOTICES /usr/share/licenses/tcpulse/
 
 # Alpine's unprivileged user: no RUN step, so that the arm64 image builds
 # without emulation.
