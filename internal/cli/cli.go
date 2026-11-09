@@ -269,6 +269,9 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 		if err := tracer.DropsError(); err != nil {
 			logger.Warn("kernel events do not count dropped packets", "reason", err)
 		}
+		if err := tracer.DropsLimitation(); err != nil {
+			logger.Warn("kernel events do not count every dropped packet", "reason", err)
+		}
 		printer.DropReasons = tracer.DropReasons()
 		events = tracer
 	}

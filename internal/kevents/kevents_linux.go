@@ -46,9 +46,11 @@ type Tracer struct {
 	genErr     error
 	// drop is the program that counts drops, or empty when they are not
 	// counted, and dropErr says why; dropReasons names the reasons. The
-	// program is in a collection of its own, dropColl.
+	// program is in a collection of its own, dropColl. dropLimit says what
+	// the drop program does not count.
 	drop        string
 	dropErr     error
+	dropLimit   error
 	dropReasons map[uint32]string
 	dropColl    *ebpf.Collection
 }
@@ -56,7 +58,12 @@ type Tracer struct {
 // Start loads and attaches the programs of what opts asks for. It needs a
 // kernel with BTF (Linux 5.12 or later: socket storage in tracing programs,
 // fetching atomics), and root or CAP_BPF and CAP_PERFMON.
-func Start(opts Options) (*Tracer, error) {
+func Start(opts Options) (*Tracer, error) { return start(opts, "") }
+
+// start is Start, with the drop program drop instead of the one that matches
+// the kernel's tracepoint, when drop is not empty and drops can be counted:
+// the tests load the variant of older kernels too.
+func start(opts Options, drop string) (*Tracer, error) {
 	if !opts.Events && !opts.RunQueue {
 		return nil, errors.New("nothing to trace")
 	}
@@ -87,6 +94,9 @@ func Start(opts Options) (*Tracer, error) {
 		}
 		progs = append(progs, keventsProgKeventsConnect, retransmit, keventsProgKeventsReset)
 		t.drop, t.dropReasons, t.dropErr = dropProgram(kernel)
+		if drop != "" && t.drop != "" {
+			t.drop = drop
+		}
 	} else {
 		t.dropErr = errors.New("kernel events are not counted")
 	}
@@ -135,6 +145,9 @@ func Start(opts Options) (*Tracer, error) {
 			t.drop, t.dropReasons, t.dropErr = "", nil, err
 		}
 	}
+	if t.drop == keventsProgKeventsDrop {
+		t.dropLimit = errors.New("the kernel's kfree_skb tracepoint has no rx_sk (Linux 6.11 added it): the drops of TCP's receive path, once it found the connection, are not counted")
+	}
 	return t, nil
 }
 
@@ -156,6 +169,12 @@ func (t *Tracer) loadDrops(spec *ebpf.CollectionSpec) error {
 	for name := range spec.Programs {
 		if name != t.drop {
 			delete(spec.Programs, name)
+		}
+	}
+	// The library creates every map of the spec: keep those of the program.
+	for name := range spec.Maps {
+		if name != keventsMapConns && name != ".bss" && name != ".rodata" {
+			delete(spec.Maps, name)
 		}
 	}
 	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
@@ -378,6 +397,10 @@ func (t *Tracer) GenerationError() error { return t.genErr }
 // DropsError says why the drops of packets are not counted (ReadEvents
 // returns none), or is nil.
 func (t *Tracer) DropsError() error { return t.dropErr }
+
+// DropsLimitation says which drops the program does not count although it
+// counts drops (an older kernel), or is nil.
+func (t *Tracer) DropsLimitation() error { return t.dropLimit }
 
 // DropReasons returns the names of the reasons for which the kernel drops
 // packets, without their SKB_DROP_REASON_ prefix, by value. It is nil when

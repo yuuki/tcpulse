@@ -238,7 +238,7 @@ int BPF_PROG(kevents_drop, struct sk_buff *skb, void *location, int reason)
 }
 
 /*
- * rx_sk is NULL for most drops, but some verifiers (Linux 6.11 and 6.12)
+ * rx_sk is NULL for most drops, but some verifiers (Linux 6.11 to 6.13)
  * take the arguments of tracepoints for pointers that are never NULL, and
  * would remove a test of it with its other branch. The helper takes NULL,
  * and its result may be NULL: two lookups cannot be pruned.
