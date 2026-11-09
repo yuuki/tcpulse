@@ -119,6 +119,11 @@ tidy: ## Tidy go.mod and go.sum
 complexity: ## Show the 20 most complex functions (needs cccc)
 	cccc --table --top-cognitive 20 .
 
+# The release writes the same file (.goreleaser.yaml, before hook).
+.PHONY: notices
+notices: ## Write the license texts of the linked Go modules to build/notices/THIRD_PARTY_NOTICES
+	go run ./scripts/third-party-notices -o build/notices/THIRD_PARTY_NOTICES
+
 .PHONY: release-check
 release-check: ## Validate .goreleaser.yaml
 	$(GORELEASER) check
@@ -136,7 +141,7 @@ docker/build: ## Build the container image from the source tree
 .PHONY: clean
 clean: ## Remove build outputs
 	rm -f $(BIN) coverage.out bench.txt
-	rm -rf dist
+	rm -rf dist build
 
 .PHONY: help
 help: ## Show this help

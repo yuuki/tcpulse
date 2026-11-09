@@ -10,11 +10,13 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w" -o /out/tcpulse .
+RUN go run ./scripts/third-party-notices -o /out/THIRD_PARTY_NOTICES
 
 FROM alpine:${ALPINE_VERSION}
 COPY --from=build /out/tcpulse /usr/local/bin/tcpulse
 COPY LICENSE NOTICE /usr/share/licenses/tcpulse/
 COPY LICENSES/ /usr/share/licenses/tcpulse/LICENSES/
+COPY --from=build /out/THIRD_PARTY_NOTICES /usr/share/licenses/tcpulse/
 USER nobody:nobody
 EXPOSE 9100/tcp 9100/udp
 ENTRYPOINT ["/usr/local/bin/tcpulse"]
