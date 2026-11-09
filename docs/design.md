@@ -150,11 +150,11 @@ handshake, unless the message travels in the SYN with Fast Open.
 The client sets `TCP_FASTOPEN_CONNECT`, so it sends its first message in the
 SYN when it holds a cookie for the server. When the server does not accept
 that data (it no longer enables Fast Open, or its queue of pending Fast Open
-requests is full: the tcpulse server keeps a queue of one, see §6), the
-client sends the data again right after the handshake, and it counts as a
-retransmission. So do lost SYNs, which are retransmitted after a timeout of
-at least 1s: the counters alone do not tell the two apart. The latencies do
-(steps of whole seconds for SYN loss: 1s, 2s, 3s with
+requests is full; the tcpulse server keeps one as long as its accept queue,
+see §6), the client sends the data again right after the handshake, and it
+counts as a retransmission. So do lost SYNs, which are retransmitted after a
+timeout of at least 1s: the counters alone do not tell the two apart. The
+latencies do (steps of whole seconds for SYN loss: 1s, 2s, 3s with
 `net.ipv4.tcp_syn_linear_timeouts`, 1s, 3s, 7s where the timeout doubles),
 and so do the host's counters `TCPSynRetrans` and `TCPFastOpenActiveFail`.
 
@@ -323,11 +323,25 @@ from `::1` to `127.0.0.1`, so `localhost` would fail against the default
 | --- | --- | --- |
 | `SO_REUSEPORT` | listening and client sockets | several servers can share a port |
 | `TCP_FASTOPEN_CONNECT` | client sockets | the first message travels in the SYN when the server allows it |
-| `TCP_FASTOPEN` (queue of 1) | listening sockets | accept data in the SYN (with `net.ipv4.tcp_fastopen` enabling the server side) |
+| `TCP_FASTOPEN` (a queue of `net.core.somaxconn` pending requests, like the accept backlog) | listening sockets | accept data in the SYN (with `net.ipv4.tcp_fastopen` enabling the server side); a shorter queue makes concurrent Fast Open handshakes fall back |
 | `TCP_QUICKACK` | ephemeral connections, accepted connections | acknowledge at once instead of delaying |
 
 They are optimizations: a kernel that refuses one gets a warning logged once
 per option, and the connection goes on. Other platforms set none.
+
+The Fast Open queue holds the connections that a SYN with data created and
+whose handshake is not over (SYN_RECV until the client's last ACK; a reset
+keeps a place for 60s), not those waiting to be accepted: it needs about the
+rate of new connections times the RTT of a handshake. With a queue of 1, at
+1,000 new connections per second over loopback, 65 of 2,000 fell back. The
+server makes it as long as its accept queue, `net.core.somaxconn`, as the
+kernel does itself with the 0x400 bit of `net.ipv4.tcp_fastopen`, and reads
+the sysctl because only Linux 4.4 and later cap the value at it. With
+cookies, the default, a spoofed SYN creates no connection. Without
+(`net.ipv4.tcp_fastopen` bit 0x200, or a route's `fastopen_no_cookie`), a
+flood of spoofed SYNs with data creates up to that many connections per
+listener, which the server accepts and holds (a socket and a goroutine each)
+until their handshake times out, about 2 minutes.
 
 ## 7. Configuration
 
