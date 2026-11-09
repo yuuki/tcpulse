@@ -3,6 +3,8 @@
 
 /tcpulse
 /dist/
+# make notices, the release's before hook
+/build/
 /coverage.out
 # make bench
 /bench.txt

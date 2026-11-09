@@ -277,6 +277,26 @@ func TestJSONLinesDrops(t *testing.T) {
 	}
 }
 
+func TestListeners(t *testing.T) {
+	var buf bytes.Buffer
+	err := NewPrinter(&buf).Listeners([]Listener{
+		{Addr: "0.0.0.0:9100", Protocol: "tcp", Received: 14982, Drops: 3, QueueMax: 17, QueueLen: 4096},
+		{Addr: "0.0.0.0:9100", Protocol: "udp", Received: 25000, Drops: 120, QueueMax: -1, QueueLen: -1},
+		{Addr: "0.0.0.0:9200", Protocol: "tcp", Received: 0, Drops: -1, QueueMax: -1, QueueLen: -1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ListenerSeparator + "\n" +
+		"LISTENER             PROTO      RECEIVED        DROPS           QUEUE_MAX       QUEUE_LEN \n" +
+		"0.0.0.0:9100         tcp        14982           3               17              4096      \n" +
+		"0.0.0.0:9100         udp        25000           120             -               -         \n" +
+		"0.0.0.0:9200         tcp        0               -               -               -         \n"
+	if buf.String() != want {
+		t.Fatalf("listeners:\n got %q\nwant %q", buf.String(), want)
+	}
+}
+
 type failingWriter struct{}
 
 func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
@@ -293,6 +313,7 @@ func TestWriteErrors(t *testing.T) {
 			{Peer: "a:1", Events: &stats.EventSummary{Drops: map[uint32]int64{2: 1}}},
 		}),
 		"JSONLines": p.JSONLines([]Result{{Peer: "a:1"}}),
+		"Listeners": p.Listeners(nil),
 	} {
 		if err == nil {
 			t.Errorf("%s returned no error on a failing writer", name)
