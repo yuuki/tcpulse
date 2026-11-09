@@ -277,6 +277,47 @@ func TestJSONLinesDrops(t *testing.T) {
 	}
 }
 
+var sampleBreakdown = stats.BreakdownSummary{
+	RoundTrips: 14787, Missing: 7, OutOfOrder: 3, Negative: 2,
+	Send:    stats.PartSummary{P50: 21 * time.Microsecond, P99: 81 * time.Microsecond},
+	Network: stats.PartSummary{P50: 455 * time.Microsecond, P99: 5480 * time.Microsecond},
+	Receive: stats.PartSummary{P50: 18 * time.Microsecond, P99: 4520 * time.Microsecond},
+}
+
+func TestReportBreakdown(t *testing.T) {
+	var buf bytes.Buffer
+	err := NewPrinter(&buf).Report([]Result{
+		{Peer: "10.0.150.2:9200", Summary: sample, Events: &sampleEvents, Breakdown: &sampleBreakdown},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The breakdown follows the kernel events, with its own header.
+	_, breakdown, ok := strings.Cut(buf.String(), BreakdownSeparator+"\n")
+	if !ok || !strings.Contains(buf.String(), EventSeparator) {
+		t.Fatalf("report:\n%s", buf.String())
+	}
+	want := "PEER                 SPLIT_RTS  MISSING    OUT_OF_ORDER NEGATIVE   SEND_50p(µs)    SEND_99p(µs)    NET_50p(µs)     NET_99p(µs)     RECV_50p(µs)    RECV_99p(µs)   \n" +
+		"10.0.150.2:9200      14787      7          3            2          21              81              455             5480            18              4520           \n"
+	if breakdown != want {
+		t.Fatalf("breakdown:\n got %q\nwant %q", breakdown, want)
+	}
+}
+
+func TestJSONLinesBreakdown(t *testing.T) {
+	var buf bytes.Buffer
+	p := NewPrinter(&buf)
+	if err := p.JSONLines([]Result{{Peer: "10.0.150.2:9200", Summary: sample, Events: &sampleEvents, Breakdown: &sampleBreakdown}}); err != nil {
+		t.Fatal(err)
+	}
+	// latency_breakdown ends the object, after kernel_events.
+	want := `"untracked_round_trips":5},"latency_breakdown":{"round_trips":14787,"missing_timestamps":7,"out_of_order":3,"negative_parts":2,` +
+		`"send_50p_us":21,"send_99p_us":81,"network_50p_us":455,"network_99p_us":5480,"receive_50p_us":18,"receive_99p_us":4520}}` + "\n"
+	if !strings.HasSuffix(buf.String(), want) {
+		t.Fatalf("JSON Lines: %s\nwant it to end with %s", buf.String(), want)
+	}
+}
+
 var sampleRunQueue = stats.RunQueueSummary{
 	Waits: 51234, Preempted: 812, Total: 2345678 * time.Microsecond,
 	P50: 4100 * time.Nanosecond, P99: 1835 * time.Microsecond, Max: 31012 * time.Microsecond,
@@ -348,9 +389,10 @@ func TestWriteErrors(t *testing.T) {
 		"dropReport": (&Printer{w: failingWriter{}, DropReasons: map[uint32]string{}}).dropReport([]Result{
 			{Peer: "a:1", Events: &stats.EventSummary{Drops: map[uint32]int64{2: 1}}},
 		}),
-		"runQueueReport": NewPrinter(failingWriter{}).runQueueReport([]Result{{Peer: "a:1", RunQueue: &stats.RunQueueSummary{}}}),
-		"JSONLines":      p.JSONLines([]Result{{Peer: "a:1"}}),
-		"Listeners":      p.Listeners(nil),
+		"breakdownReport": NewPrinter(failingWriter{}).breakdownReport([]Result{{Peer: "a:1", Breakdown: &stats.BreakdownSummary{}}}),
+		"runQueueReport":  NewPrinter(failingWriter{}).runQueueReport([]Result{{Peer: "a:1", RunQueue: &stats.RunQueueSummary{}}}),
+		"JSONLines":       p.JSONLines([]Result{{Peer: "a:1"}}),
+		"Listeners":       p.Listeners(nil),
 	} {
 		if err == nil {
 			t.Errorf("%s returned no error on a failing writer", name)

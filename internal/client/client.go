@@ -66,6 +66,13 @@ type Config struct {
 	// after each of its round trips, once the clock has stopped, and
 	// records them in the Recorder with the round trip. UDP ignores it.
 	Events EventReader
+	// Breakdown splits every round trip of FlavorPersistent TCP into send,
+	// network and receive time, by the kernel's timestamps of the last byte
+	// of the message (SO_TIMESTAMPING), and records the parts in the
+	// Recorder. It needs BreakdownSupported, and the receive timestamps of
+	// the host turned on (PrepareBreakdown); FlavorEphemeral and UDP ignore
+	// it.
+	Breakdown bool
 	// Logger receives the errors the run tolerates; nil means
 	// slog.Default().
 	Logger *slog.Logger
@@ -136,6 +143,9 @@ type run struct {
 	tcpInfoWarning sync.Once
 	// eventWarning logs once a connection whose events could not be read.
 	eventWarning sync.Once
+	// breakdownWarnings log once each kind of failure of the timestamps of
+	// a connection (splitter.warn).
+	breakdownWarnings [warnings]sync.Once
 }
 
 // Messages returns how many messages a sender at rate per second sends
@@ -434,14 +444,16 @@ func exchange(conn net.Conn, msg, echo []byte) error {
 	}()
 	_, readErr := io.ReadFull(conn, echo)
 	if readErr != nil {
-		// Unblock the write: the connection is done.
+		// Unblock the write: the connection is done. The write then fails
+		// because of the deadline: the read's error is the one to report.
 		_ = conn.SetDeadline(time.Now())
+		if err := <-written; err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+			return fmt.Errorf("reading from connection: %w (and writing: %w)", readErr, err)
+		}
+		return fmt.Errorf("reading from connection: %w", readErr)
 	}
 	if err := <-written; err != nil {
 		return fmt.Errorf("writing to connection: %w", err)
-	}
-	if readErr != nil {
-		return fmt.Errorf("reading from connection: %w", readErr)
 	}
 	return nil
 }
@@ -477,6 +489,12 @@ func (r *run) persistent(ctx context.Context) error {
 			// round trip.
 			r.recordUnmatched(events)
 
+			var split *splitter
+			if r.cfg.Breakdown {
+				split = r.newSplitter(conn)
+				defer split.close()
+			}
+
 			msg := make([]byte, r.cfg.MessageBytes)
 			echo := echoBuffer(msg)
 			limiter := ratelimit.New(r.cfg.Rate)
@@ -485,11 +503,22 @@ func (r *run) persistent(ctx context.Context) error {
 					return nil
 				}
 				fill(msg)
+				var (
+					received time.Time
+					err      error
+				)
+				timed := split.timed()
 				start := time.Now()
-				err := exchange(conn, msg, echo)
+				if timed {
+					received, err = exchangeTimestamped(ctx, conn, split.ts, msg, echo)
+				} else {
+					err = exchange(conn, msg, echo)
+				}
 				elapsed := time.Since(start)
+				end := split.now()
 				if err == nil {
 					r.recordEvents(events, elapsed)
+					split.roundTrip(start, end, received, len(msg))
 				}
 				if err := r.finish(ctx, elapsed, err); err != nil {
 					return err

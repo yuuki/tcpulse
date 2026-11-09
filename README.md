@@ -78,6 +78,7 @@ Creates new connections for each request, immediately closing them afterward. Th
 - **Platform optimizations**: Leverages Linux-specific optimizations (TCP_FASTOPEN, SO_REUSEPORT) when available
 - **JSON Lines output**: Machine-readable output format for integration with monitoring and analysis tools
 - **Kernel TCP statistics**: Retransmissions, the kernel's smoothed RTT and TCP Fast Open use of the connections, with `--tcp-info` on Linux
+- **Latency breakdown**: Which part of the round trips moved, the client's sending, the network and the server, or the client's receiving, by the kernel's timestamps of the last byte of each message, with `--latency-breakdown` (Linux, no privileges needed)
 - **Load generator self-check**: How long tcpulse's own threads waited for a CPU, to tell whether the latencies are those of the network or of a busy client host, with `--runqueue-latency` (eBPF, Linux)
 - **Kernel events per round trip**: Which round trips met a SYN retransmission, a retransmission timeout, another retransmission, a reset or a packet dropped by the host (and why), and how slow they were compared with the others, with `--kernel-events` (eBPF, Linux)
 
@@ -151,6 +152,7 @@ Options:
       --interval duration          [client mode] interval for printing stats (default 5s)
       --jsonlines                  [client mode] output results in JSON Lines format
       --kernel-events              [client mode] attribute kernel TCP events (retransmissions, resets, drops) to the round trips with eBPF (Linux only, needs root or CAP_BPF and CAP_PERFMON)
+      --latency-breakdown          [client mode] split every round trip into send, network and receive time with the kernel's timestamps (SO_TIMESTAMPING; persistent TCP, Linux only)
       --listen-addrs-file string   [server mode] enable to pass a file including a pair of addresses and ports
       --listener-stats             [server mode] print the statistics of the listening sockets (connections, drops, accept queue) when the server stops (Linux only)
       --merge-results-each-host    [client mode] merge results of each host (with --show-only-results)
@@ -386,6 +388,41 @@ With `--jsonlines`, each object ends with a `kernel_events` object (after `tcp_i
 
 The round trips with and without events, plus the untracked ones, add up to `count`.
 
+#### Latency Breakdown (`--latency-breakdown`)
+
+On Linux, `--latency-breakdown` splits every round trip of persistent TCP connections into three parts, by the kernel's software timestamps of the last byte of the message (`SO_TIMESTAMPING`, which needs no privileges). When a percentile moves, the part that moved tells where: in the client, or in the network and the server.
+
+```shell-session
+$ tcpulse -c --show-only-results --latency-breakdown --connections 10 --rate 1000 --duration 4s 192.0.2.10:9100
+PEER                 CNT        LAT_MAX(µs)     LAT_MIN(µs)     LAT_MEAN(µs)    LAT_90p(µs)     LAT_95p(µs)     LAT_99p(µs)     RATE(/s)
+--- A result during total execution time ---
+192.0.2.10:9100      38808      23553           8               423             278             3948            5767            9692.27
+--- Breakdown of the round trips (SO_TIMESTAMPING) ---
+PEER                 SPLIT_RTS  MISSING    OUT_OF_ORDER NEGATIVE   SEND_50p(µs)    SEND_99p(µs)    NET_50p(µs)     NET_99p(µs)     RECV_50p(µs)    RECV_99p(µs)
+192.0.2.10:9100      38808      0          0            0          1               11              35              250             39              5537
+```
+
+In this run, two busy loops per CPU shared the CPUs of the client. The 99th percentile, 5.77ms, is in the receive part (5.54ms): the echoes had arrived, and the client was late to read them. The network part kept the 99th percentile it had on an idle host (250µs against 253µs), where the round trips had one of 378µs.
+
+- `SPLIT_RTS`: The completed round trips with a breakdown
+- `MISSING`: The completed round trips without one, for lack of a timestamp: the first round trip of a connection that TCP Fast Open opened with it (the offsets of the stream are not known before), a network driver that does not timestamp what it sends, a timestamp lost
+- `OUT_OF_ORDER`: The completed round trips whose echo had packets out of order: an earlier packet of the echo was lost or reordered on the way back, so the last byte arrived before the echo could be read, and the wait for the others would go to `RECV` (Linux 5.4, `tcpi_rcv_ooopack`; not told apart before)
+- `NEGATIVE`: The completed round trips with a negative part, whose breakdown is not used: a step of the system clock, or packets reordered
+- `SEND_50p(µs)`, `SEND_99p(µs)`: From the start of the round trip to the last byte of the message leaving the host (the driver's timestamp, or the loopback device's). For a message larger than the socket buffers or the congestion window, this includes the wait for them.
+- `NET_50p(µs)`, `NET_99p(µs)`: From there to the reception of the last byte of the echo by the client's host: the network both ways and the server, retransmissions included
+- `RECV_50p(µs)`, `RECV_99p(µs)`: From there to the end of the round trip: the client reading the echo, its waits for a CPU included
+
+`SPLIT_RTS`, `MISSING`, `OUT_OF_ORDER` and `NEGATIVE` add up to `CNT`; the percentiles of the parts are over the round trips with a breakdown. Loss on the way back makes echoes out of order, so it leaves the `NET` percentiles (while `LAT_*` keeps it), whereas loss on the way to the server stays in `NET`: a high `OUT_OF_ORDER` points to the return path.
+
+How the parts are taken:
+- **The last byte only:** the transmit timestamp is that of the send request that ends with the message's last byte, found by its offset in the stream (`SOF_TIMESTAMPING_OPT_ID`); the receive timestamp is that of the `recvmsg(2)` that returns the last byte of the echo. The partial writes of a large message, and the first bytes of its echo, which can arrive before its last byte has left, are not used.
+- **No substitute:** a round trip that lacks a timestamp has no breakdown. Nothing stands in for it, and a negative part is counted, not set to 0. One exception remains: when the kernel dropped the transmit timestamp of the last byte (its queue is charged to the socket's receive buffer, which a large echo can fill) and the byte was then retransmitted, the retransmission's timestamp is taken, and the send part includes the wait for it.
+- **Clock:** the parts are in the system's time (`CLOCK_REALTIME`), the clock of the kernel's timestamps. The start is read with the clock of the round trip, the end right after it stops, so the parts add up to `LAT_*` within a few microseconds, not exactly.
+- **Requirements:** persistent TCP on Linux 5.1 or later (`SO_TIMESTAMPING_NEW`; on 64-bit architectures, older kernels work with `SO_TIMESTAMPING`); the option is refused with `--flavor ephemeral`, with `--proto udp` and on other platforms, and the run fails on a kernel that cannot timestamp. While the run lasts, the kernel timestamps every packet the host receives (it does so as long as one socket asks).
+- **Cost:** inside the clock, the echo is read with `recvmsg(2)` rather than `read(2)`, and the transmit timestamp of each message wakes the reading thread once, as an error event. When the socket was neither readable nor writable then, Go's poller stops waiting on it until it is: tcpulse then reads the timestamps queued and waits with an epoll instance of its own, inside the clock, where one thread waits for all such connections. After the clock stops, the transmit timestamps are read from the socket's error queue, with one `recvmsg(2)` each, plus one. Against the same server, 50 persistent connections at 1,000 messages per second each had a 99th percentile of 782 to 1,003µs, against about 600µs without the option, on 4 CPUs.
+
+With `--jsonlines`, each object ends with a `latency_breakdown` object (after `kernel_events`, if present): `round_trips`, `missing_timestamps`, `out_of_order`, `negative_parts`, `send_50p_us`, `send_99p_us`, `network_50p_us`, `network_99p_us`, `receive_50p_us`, `receive_99p_us`.
+
 #### Run Queue Latency (`--runqueue-latency`)
 
 A load generator that waits for a CPU delays its own round trips. On Linux, `--runqueue-latency` loads eBPF programs that measure how long the threads of tcpulse wait for one: from when a thread becomes runnable (woken up, or preempted while it could still run) to when it runs. Compare these waits with the latencies of the run before blaming the network or the server.
@@ -414,7 +451,7 @@ The waits are those of the process, not of the round trips: a thread runs the go
 
 **Cost:** the programs run at every context switch and wakeup of the host, whatever the process: once they know the process's ID, at the first switch of one of its threads, those of the others cost a few loads and comparisons. They run inside the clock for tcpulse's own threads: the wakeup that ends most round trips updates a hash map, and the switch to the woken thread looks it up and updates the histogram. Against the same server, 50 persistent connections at 1,000 messages per second each had a mean latency 5 to 24µs higher than without the option (about 190µs), which is the size of the differences between runs; 2,000 ephemeral connections per second, 1 to 3µs higher.
 
-With `--jsonlines`, each object ends with a `runqueue_latency` object (after `kernel_events`, if present), the same in every object of a run: `waits`, `preempted`, `wait_total_us`, `wait_50p_us`, `wait_99p_us`, `wait_max_us`. It is absent when the waits could not be read (tcpulse logs why).
+With `--jsonlines`, each object ends with a `runqueue_latency` object (after `kernel_events` and `latency_breakdown`, if present), the same in every object of a run: `waits`, `preempted`, `wait_total_us`, `wait_50p_us`, `wait_99p_us`, `wait_max_us`. It is absent when the waits could not be read (tcpulse logs why).
 
 #### Listener Statistics (`--listener-stats`)
 

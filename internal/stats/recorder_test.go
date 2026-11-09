@@ -221,3 +221,28 @@ func TestEventsSubDrops(t *testing.T) {
 		t.Fatal("a slot without drops is an event")
 	}
 }
+
+func TestRecorderBreakdown(t *testing.T) {
+	r := NewRecorder()
+	if s := r.Breakdown(); s != (BreakdownSummary{}) {
+		t.Fatalf("no breakdown = %+v, want zero", s)
+	}
+	for i := range 100 {
+		r.RecordBreakdown(time.Duration(i+1)*time.Microsecond, time.Duration(i+1)*time.Millisecond, 3*time.Microsecond)
+	}
+	r.RecordMissingBreakdown()
+	r.RecordMissingBreakdown()
+	r.RecordOutOfOrderBreakdown()
+	r.RecordNegativeBreakdown()
+	s := r.Breakdown()
+	if s.RoundTrips != 100 || s.Missing != 2 || s.OutOfOrder != 1 || s.Negative != 1 {
+		t.Fatalf("counts = %+v", s)
+	}
+	// Nearest rank, within the 1/128 of the histogram.
+	near := func(got, want time.Duration) bool { return got >= want && got <= want+want/128 }
+	if !near(s.Send.P50, 50*time.Microsecond) || !near(s.Send.P99, 99*time.Microsecond) ||
+		!near(s.Network.P50, 50*time.Millisecond) || !near(s.Network.P99, 99*time.Millisecond) ||
+		!near(s.Receive.P50, 3*time.Microsecond) || !near(s.Receive.P99, 3*time.Microsecond) {
+		t.Fatalf("parts = %+v", s)
+	}
+}

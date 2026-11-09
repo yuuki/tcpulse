@@ -219,6 +219,7 @@ func validateKernelOptions(o *options) error {
 	}{
 		{"--tcp-info", o.tcpInfo, true, client.TCPInfoSupported, "Linux"},
 		{"--kernel-events", o.kernelEvents, true, kevents.Supported, "Linux on little-endian architectures"},
+		{"--latency-breakdown", o.latencyBreakdown, true, client.BreakdownSupported, "Linux"},
 		{"--runqueue-latency", o.runqueueLatency, false, kevents.Supported, "Linux on little-endian architectures"},
 	} {
 		switch {
@@ -228,6 +229,11 @@ func validateKernelOptions(o *options) error {
 		case !opt.supported:
 			return fmt.Errorf("%s is only supported on %s", opt.name, opt.platforms)
 		}
+	}
+	// The stream offsets of the timestamps are known on a connection that
+	// carries one message after another.
+	if o.latencyBreakdown && o.flavor != client.FlavorPersistent {
+		return errors.New("--latency-breakdown requires --flavor persistent")
 	}
 	return nil
 }
@@ -303,6 +309,20 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 		events = tracer
 	}
 
+	// Before printing, and before the clock of the run: the first round
+	// trips would have no receive timestamp otherwise.
+	if o.latencyBreakdown {
+		release, err := client.PrepareBreakdown()
+		switch {
+		case errors.Is(err, client.ErrNoTimestamping):
+			return fmt.Errorf("--latency-breakdown: %w", err)
+		case err != nil:
+			logger.Warn("the first round trips may have no receive timestamp", "error", err)
+		default:
+			defer release()
+		}
+	}
+
 	if !o.jsonlines {
 		if err := printer.Header(); err != nil {
 			return err
@@ -317,6 +337,7 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 		Duration:     o.duration,
 		MessageBytes: int(o.messageBytes),
 		TCPInfo:      o.tcpInfo,
+		Breakdown:    o.latencyBreakdown,
 		Events:       events,
 		Logger:       logger,
 	}
@@ -373,6 +394,10 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 		if o.kernelEvents {
 			ev := rec.Events()
 			r.Events = &ev
+		}
+		if o.latencyBreakdown {
+			b := rec.Breakdown()
+			r.Breakdown = &b
 		}
 		r.RunQueue = runq
 		return r

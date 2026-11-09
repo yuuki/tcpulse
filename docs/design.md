@@ -32,6 +32,7 @@ internal/stats   latency histogram, per-peer recorders
 internal/report  text and JSON Lines output
 internal/sockopt Linux socket options and TCP_INFO (no-ops or unsupported elsewhere)
 internal/kevents eBPF counters of kernel TCP events per connection, run queue latency (Linux)
+internal/tstamp  kernel timestamps of a TCP connection (SO_TIMESTAMPING, Linux)
 ```
 
 `main.go` stays at the root of the module so that
@@ -395,6 +396,96 @@ many connections, so a wait cannot be given to one round trip. The report
 compares percentiles, which is what tells the client's delays from the
 network's.
 
+### 3.7 Latency breakdown
+
+With `--latency-breakdown` (persistent TCP, Linux), the client splits every
+round trip into send, network and receive time, by the kernel's software
+timestamps (`SO_TIMESTAMPING`, `Documentation/networking/timestamping.rst`),
+through `internal/tstamp`. Issue #50 records the analysis.
+
+- **Transmit:** TCP timestamps a send request (one `write(2)`), not a
+  segment: the timestamp is that of its last byte, once it has left
+  (`TX_SOFTWARE`: the driver, or the loopback device). With `OPT_ID`, its
+  key is the byte's offset in the stream; `OPT_TSONLY` leaves the payload
+  out. The timestamps are queued on the socket's error queue, which the
+  client reads after the clock stops, without blocking.
+- **Receive:** the echo is read with `recvmsg(2)`, whose control message is
+  the receive timestamp of the last packet the call read. The timestamp of
+  the call that returns the last byte of the echo is kept.
+- **Matching:** only the last byte of the message is matched on both sides.
+  In persistent mode, the next message is written once the whole echo is
+  read, so the key of its last byte is the bytes written before it plus its
+  length, less one. The partial writes of a large message (`Write` loops)
+  and the first bytes of its echo, which can arrive before its last byte
+  has left, are not used. The instants are ordered by causality: start,
+  transmission, reception, end; a negative part means a step of the clock,
+  or packets reordered, and is counted, not set to 0.
+- **Offsets:** the timestamps are turned on when the stream's offsets are
+  known: on an established connection, with nothing written (with
+  `OPT_ID_TCP`, Linux 6.2, the keys count from the next byte written;
+  without it, from the first byte not acknowledged, so nothing may be
+  unacknowledged either). TCP Fast Open defers the handshake of a dial that
+  has a cookie to the first write (the socket is in SYN_SENT), where
+  `OPT_ID_TCP` would count from the SYN: the timestamps of such a connection
+  are turned on after its first round trip, which has no breakdown.
+- **Late timestamps:** a transmit timestamp that is not there when the round
+  trip ends waits for the end of the next round trip, or the close, and only
+  then counts as missing. Of several timestamps of one byte, the first counts.
+  The error queue is charged to the receive buffer: when a large echo fills
+  it, the kernel drops the timestamp, and a retransmission of the last byte
+  would bring a later one.
+- **Out of order:** the receive timestamp is the arrival of the packet that
+  holds the last byte, not the moment the echo became readable: when an
+  earlier packet of the echo was lost or reordered, the last arrived first,
+  and the wait for the others would go to the receive part, blaming the
+  client for the network. After each round trip, the client compares the
+  packets received out of order (`tcpi_rcv_ooopack`, Linux 5.4) with their
+  count after the previous one, and counts such a round trip apart.
+- **Error events:** a transmit timestamp on the error queue makes the socket
+  signal `EPOLLERR`. When the socket is neither readable nor writable then
+  (the echo not back, the send buffer full, as with messages larger than
+  it), epoll reports the error alone, and Go's poller refuses to wait on the
+  socket ("not pollable") until it sees it readable or writable. `ReadFull`
+  then reads the timestamps queued, which clears the error, waits for the
+  socket with an epoll instance of its own, level-triggered, where one
+  goroutine, and so one thread, waits for all such readers (`poll(2)` would
+  block a thread each: 200 slow connections took 131 threads, and enough of
+  them exhaust Go's), and reads. A wait ends when the socket is readable, at
+  the end of the run (the context of the read), or after 100ms, when the
+  poller checks the deadline of the socket; data read after the deadline is
+  not a round trip. Without this, messages of 50 KB on a path of 1500 bytes
+  failed the run.
+- **Allocations:** the reads keep their `recvmsg(2)` header and functions in
+  the connection, and call the system call directly (`unix.Recvmsg`
+  allocates the peer's address): a read allocates nothing.
+- **Clock:** the kernel's timestamps are in the system's time
+  (`CLOCK_REALTIME`). `time.Now` reads it just before the monotonic time
+  that times the round trip; the end is read right after the clock stops.
+  Both readings bracket the round trip, so a thread preempted between two
+  readings lengthens a part, but never makes one negative. The end cannot be
+  the start plus the round trip's time: a preemption between the two
+  readings of the start made it early by up to 19µs on a busy client, and
+  the receive part negative.
+- **Receive timestamps of the host:** the kernel stamps received packets only
+  while a socket asks for it, and turns that on a moment after the first one
+  does (`net_enable_timestamp`, through a work queue). Before the clock of
+  the run starts, the command calls `tstamp.Prepare` once, which asks with a
+  UDP socket on the loopback device, sends to it until a datagram is stamped
+  (in about a millisecond), and keeps it open until the end. If that fails,
+  the first round trips may miss their receive timestamps; if the kernel
+  cannot timestamp at all, the run fails.
+- **Kernels:** `SO_TIMESTAMPING_NEW` (Linux 5.1) has 64-bit timestamps on
+  every architecture; on 64-bit ones, older kernels fall back to
+  `SO_TIMESTAMPING`, whose layout is then the same.
+- **Default path:** without the option, the echo is still read with
+  `io.ReadFull`, and nothing else changes inside the clock.
+- **Cost:** inside the clock, the `recvmsg(2)` of the echo, and the wakeup
+  of the reading goroutine by the error event of each transmit timestamp.
+
+The `Recorder` keeps the parts in three `Histogram`s, and counts the round
+trips with a breakdown, missing a timestamp, with their echo out of order,
+and with a negative part, which add up to the count of the run.
+
 ## 4. Statistics
 
 `internal/stats.Histogram` counts durations in log-linear buckets: every
@@ -512,8 +603,9 @@ Validation rejects any option set the run cannot work with: a rate below 1
 rate × duration below one message or beyond an int64, an interval that is
 not positive when interval lines are printed, an empty message, no
 connection in persistent mode, a UDP message above 65507 bytes, an empty
-addresses file, an unknown protocol or flavor, `--tcp-info` or
-`--kernel-events` with UDP or on a platform other than Linux, and
+addresses file, an unknown protocol or flavor, `--tcp-info`,
+`--kernel-events` or `--latency-breakdown` with UDP or on a platform other
+than Linux, `--latency-breakdown` with ephemeral connections, and
 `--runqueue-latency` or `--listener-stats` on a platform other than Linux.
 `FuzzParse` checks the options validation accepts against an independent
 computation of the message count.
@@ -539,12 +631,12 @@ with a section of its own: a separator, a header, and a line per peer (or a
 single merged line) of TCP statistics. Each JSON object ends with a
 `tcp_info` object. `--kernel-events` adds a section of the same form after
 it, and a `kernel_events` object; when the host dropped packets of the
-connections, a section lists them by peer and reason. `--runqueue-latency`
-ends the text report with a section for the process, and each object with a
-`runqueue_latency` object. Without these
-options, the output is
-unchanged. The column layout and the JSON field names and order are a public
-format, pinned by golden tests in `internal/report`. The server prints
+connections, a section lists them by peer and reason. `--latency-breakdown`
+adds a section after these, and a `latency_breakdown` object.
+`--runqueue-latency` ends the text report with a section for the process,
+and each object with a `runqueue_latency` object. Without these options,
+the output is unchanged. The column layout and the JSON field names and
+order are a public format, pinned by golden tests in `internal/report`. The server prints
 `Listening at ...`, and with `--listener-stats`, when it stops, a separator,
 a header and a line per listening socket.
 

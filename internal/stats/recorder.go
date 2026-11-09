@@ -91,6 +91,10 @@ type Recorder struct {
 	// eventMu guards events, for the same reason.
 	eventMu sync.Mutex
 	events  eventStats
+
+	// breakdownMu guards breakdown, for the same reason.
+	breakdownMu sync.Mutex
+	breakdown   breakdownStats
 }
 
 // NewRecorder returns a Recorder whose first interval starts now.
