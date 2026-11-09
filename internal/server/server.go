@@ -60,6 +60,9 @@ type Config struct {
 	// Logger receives the errors of individual connections; nil means
 	// slog.Default().
 	Logger *slog.Logger
+	// Stats keeps the statistics of the listening sockets (Server.Stats).
+	// It needs StatsSupported.
+	Stats bool
 }
 
 // Server is an echo server bound to its addresses.
@@ -67,12 +70,18 @@ type Server struct {
 	logger *slog.Logger
 	tcp    []net.Listener
 	udp    []net.PacketConn
+
+	// stats is Config.Stats; tcpStats and udpStats parallel tcp and udp.
+	stats     bool
+	tcpStats  []*socketStats
+	udpStats  []*socketStats
+	closeOnce sync.Once
 }
 
 // Listen binds every address of cfg, for TCP, UDP or both. The listeners are
 // open when it returns; Serve closes them.
 func Listen(ctx context.Context, cfg Config) (*Server, error) {
-	s := &Server{logger: cfg.Logger}
+	s := &Server{logger: cfg.Logger, stats: cfg.Stats}
 	if s.logger == nil {
 		s.logger = slog.Default()
 	}
@@ -81,6 +90,11 @@ func Listen(ctx context.Context, cfg Config) (*Server, error) {
 
 	if tcp {
 		lc := net.ListenConfig{Control: sockopt.ListenControl}
+		// Plain TCP: since Go 1.24, listeners use MPTCP where the kernel
+		// supports it. tcpulse measures TCP, its client never uses MPTCP,
+		// and an MPTCP listener keeps the drops of its TCP subflow
+		// listener from SO_MEMINFO (--listener-stats).
+		lc.SetMultipathTCP(false)
 		for _, addr := range cfg.Addrs {
 			ln, err := lc.Listen(ctx, "tcp", addr)
 			if err != nil {
@@ -88,6 +102,7 @@ func Listen(ctx context.Context, cfg Config) (*Server, error) {
 				return nil, fmt.Errorf("listen %q error: %w", addr, err)
 			}
 			s.tcp = append(s.tcp, ln)
+			s.tcpStats = append(s.tcpStats, newSocketStats())
 		}
 	}
 	if udp {
@@ -99,6 +114,7 @@ func Listen(ctx context.Context, cfg Config) (*Server, error) {
 				return nil, fmt.Errorf("listen %q error: %w", addr, err)
 			}
 			s.udp = append(s.udp, pc)
+			s.udpStats = append(s.udpStats, newSocketStats())
 		}
 	}
 	return s, nil
@@ -122,13 +138,20 @@ func (s *Server) UDPAddrs() []net.Addr {
 	return addrs
 }
 
+// close closes the listeners, once, after reading the statistics the
+// kernel keeps for them.
 func (s *Server) close() {
-	for _, ln := range s.tcp {
-		_ = ln.Close()
-	}
-	for _, pc := range s.udp {
-		_ = pc.Close()
-	}
+	s.closeOnce.Do(func() {
+		if s.stats {
+			s.snapshot()
+		}
+		for _, ln := range s.tcp {
+			_ = ln.Close()
+		}
+		for _, pc := range s.udp {
+			_ = pc.Close()
+		}
+	})
 }
 
 // Serve echoes until ctx is done or a listener fails, then closes the
@@ -140,18 +163,24 @@ func (s *Server) Serve(ctx context.Context) error {
 	stop := context.AfterFunc(ctx, s.close)
 	defer stop()
 
-	for _, ln := range s.tcp {
+	if s.stats && len(s.tcp) > 0 {
 		eg.Go(func() error {
-			if err := s.serveTCP(ctx, ln); err != nil {
+			s.sampleQueues(ctx)
+			return nil
+		})
+	}
+	for i, ln := range s.tcp {
+		eg.Go(func() error {
+			if err := s.serveTCP(ctx, ln, s.tcpStats[i]); err != nil {
 				s.logger.Error("TCP server error", "error", err)
 				return err
 			}
 			return nil
 		})
 	}
-	for _, pc := range s.udp {
+	for i, pc := range s.udp {
 		eg.Go(func() error {
-			if err := s.serveUDP(ctx, pc); err != nil {
+			if err := s.serveUDP(ctx, pc, s.udpStats[i]); err != nil {
 				s.logger.Error("UDP server error", "error", err)
 				return err
 			}
@@ -166,7 +195,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) serveTCP(ctx context.Context, ln net.Listener) error {
+func (s *Server) serveTCP(ctx context.Context, ln net.Listener, st *socketStats) error {
 	// The connections end with the listener, whatever ends it: the server
 	// stopping, or an accept error. They are closed before they are waited
 	// for (deferred calls run last in, first out): waiting first would wait
@@ -199,6 +228,9 @@ func (s *Server) serveTCP(ctx context.Context, ln net.Listener) error {
 			continue
 		}
 		delay = 0
+		if s.stats {
+			st.received.Add(1)
+		}
 
 		// TCP_QUICKACK only speeds up acknowledgments: a connection whose
 		// socket refuses it is served all the same.
@@ -278,7 +310,7 @@ func closedByPeer(err error) bool {
 		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
 }
 
-func (s *Server) serveUDP(ctx context.Context, pc net.PacketConn) error {
+func (s *Server) serveUDP(ctx context.Context, pc net.PacketConn, st *socketStats) error {
 	var writers sync.WaitGroup
 	defer writers.Wait()
 	for {
@@ -291,6 +323,9 @@ func (s *Server) serveUDP(ctx context.Context, pc net.PacketConn) error {
 			}
 			s.logger.Error("UDP read error", "error", err)
 			continue
+		}
+		if s.stats {
+			st.received.Add(1)
 		}
 
 		writers.Go(func() {

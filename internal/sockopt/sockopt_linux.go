@@ -13,6 +13,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -151,4 +152,74 @@ func ReadTCPInfo(conn net.Conn) (TCPInfo, error) {
 		RTT:         time.Duration(info.Rtt) * time.Microsecond,
 		FastOpen:    info.Options&tcpiOptSYNData != 0,
 	}, nil
+}
+
+// SocketStatsSupported reports whether SocketDrops and AcceptQueue work on
+// this platform.
+const SocketStatsSupported = true
+
+// skMemInfoDrops and skMemInfoVars are SK_MEMINFO_DROPS and SK_MEMINFO_VARS
+// (linux/sock_diag.h): the index of the drop count in SO_MEMINFO, and the
+// number of its values.
+const (
+	skMemInfoDrops = 8
+	skMemInfoVars  = 9
+)
+
+// tcpListen is TCP_LISTEN (include/net/tcp_states.h).
+const tcpListen = 10
+
+// control runs f with the descriptor of c.
+func control(c syscall.Conn, f func(fd int) error) error {
+	raw, err := c.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var ferr error
+	if err := raw.Control(func(fd uintptr) { ferr = f(int(fd)) }); err != nil {
+		return err
+	}
+	return ferr
+}
+
+// SocketDrops returns the packets the kernel discarded at a socket since it
+// was created (SO_MEMINFO, Linux 4.12). For a TCP listener: the SYNs it
+// refused and their retransmissions, the ACKs a full accept queue refused
+// (twice each), the SYNs sent again for handshakes in progress (a lost
+// SYN-ACK), resets of those handshakes, and packets a filter dropped. For a
+// UDP socket: mostly the datagrams that did not fit in its receive buffer,
+// and those dropped for memory pressure, a bad checksum, or by a filter.
+func SocketDrops(c syscall.Conn) (uint32, error) {
+	var mem [skMemInfoVars]uint32
+	err := control(c, func(fd int) error {
+		size := uint32(unsafe.Sizeof(mem))
+		_, _, errno := unix.Syscall6(unix.SYS_GETSOCKOPT, uintptr(fd), unix.SOL_SOCKET, unix.SO_MEMINFO,
+			uintptr(unsafe.Pointer(&mem)), uintptr(unsafe.Pointer(&size)), 0)
+		if errno != 0 {
+			return fmt.Errorf("getsockopt SO_MEMINFO: %w", errno)
+		}
+		if size < (skMemInfoDrops+1)*4 {
+			return fmt.Errorf("SO_MEMINFO of %d bytes lacks the drops", size)
+		}
+		return nil
+	})
+	return mem[skMemInfoDrops], err
+}
+
+// AcceptQueue returns the connections waiting in the accept queue of a TCP
+// listener, and the length of the queue (TCP_INFO of a listening socket:
+// tcpi_unacked and tcpi_sacked).
+func AcceptQueue(c syscall.Conn) (waiting, length uint32, err error) {
+	err = control(c, func(fd int) error {
+		info, err := unix.GetsockoptTCPInfo(fd, unix.IPPROTO_TCP, unix.TCP_INFO)
+		if err != nil {
+			return fmt.Errorf("getsockopt TCP_INFO: %w", err)
+		}
+		if info.State != tcpListen {
+			return fmt.Errorf("not a listening socket (TCP state %d)", info.State)
+		}
+		waiting, length = info.Unacked, info.Sacked
+		return nil
+	})
+	return waiting, length, err
 }

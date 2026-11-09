@@ -74,6 +74,7 @@ Creates new connections for each request, immediately closing them afterward. Th
 - **Rate limiting**: Control connection establishment rate to simulate realistic load patterns
 - **Multi-target support**: Test multiple endpoints simultaneously and aggregate results
 - **Protocol support**: Both TCP and UDP with optimized implementations
+- **Listener statistics**: The connections the server accepted, the packets the kernel discarded at its sockets, and how full its accept queue got, with `--listener-stats` (Linux)
 - **Platform optimizations**: Leverages Linux-specific optimizations (TCP_FASTOPEN, SO_REUSEPORT) when available
 - **JSON Lines output**: Machine-readable output format for integration with monitoring and analysis tools
 - **Kernel TCP statistics**: Retransmissions, the kernel's smoothed RTT and TCP Fast Open use of the connections, with `--tcp-info` on Linux
@@ -150,6 +151,7 @@ Options:
       --jsonlines                  [client mode] output results in JSON Lines format
       --kernel-events              [client mode] attribute kernel TCP events (retransmissions, resets) to the round trips with eBPF (Linux only, needs root or CAP_BPF and CAP_PERFMON)
       --listen-addrs-file string   [server mode] enable to pass a file including a pair of addresses and ports
+      --listener-stats             [server mode] print the statistics of the listening sockets (connections, drops, accept queue) when the server stops (Linux only)
       --merge-results-each-host    [client mode] merge results of each host (with --show-only-results)
       --message-bytes int32        [client mode] TCP/UDP message size (bytes) (default 64)
       --pprof-addr string          [client mode] pprof listening address:port (default "localhost:6060")
@@ -352,6 +354,31 @@ With `--jsonlines`, each object ends with a `kernel_events` object (after `tcp_i
 
 The round trips with and without events, plus the untracked ones, add up to `count`.
 
+#### Listener Statistics (`--listener-stats`)
+
+On Linux, a server started with `--listener-stats` prints the statistics of its listening sockets when it stops (Ctrl-C, SIGTERM). They are read from what the kernel already counts for each socket, so no privileges are needed.
+
+```shell-session
+$ tcpulse -s --listener-stats 0.0.0.0:9100
+Listening at ["0.0.0.0:9100"] ...
+^C
+--- Statistics of the listening sockets ---
+LISTENER             PROTO      RECEIVED        DROPS           QUEUE_MAX       QUEUE_LEN
+0.0.0.0:9100         tcp        37944           7506            9               8
+0.0.0.0:9100         udp        145590          0               -               -
+```
+
+That run had an accept queue of 8 (`net.core.somaxconn=8`) and 20,000 new connections per second: the queue was full (`QUEUE_MAX` is one more than its length), and the listener refused handshakes.
+
+- `RECEIVED`: The TCP connections accepted, or the UDP datagrams received
+- `DROPS`: The packets the kernel discarded at the socket (`SO_MEMINFO`). They are packets, not handshakes, and not the host's `ListenDrops`.
+  - For TCP: the SYNs the listener refused and their retransmissions, the ACKs that a full accept queue refused (each counted twice), the SYNs that clients sent again because a SYN-ACK was lost, the resets of handshakes in progress, and the packets that a socket filter or a cgroup's BPF program dropped. With SYN cookies (`net.ipv4.tcp_syncookies=1`, the default), a full SYN queue drops nothing. A lossy path between the client and the server shows here too: the accept queue overflowed only if `QUEUE_MAX` reached `QUEUE_LEN` + 1, or if the host's `ListenOverflows` (`nstat`) grew.
+  - For UDP: mostly the datagrams that did not fit in the receive buffer (the host's `RcvbufErrors`), and also those dropped for memory pressure, for a bad checksum, or by a filter.
+- `QUEUE_MAX`: The most connections seen waiting in the accept queue (`TCP_INFO` of the listener, sampled every 10ms). The kernel lets the queue hold one more connection than its length.
+- `QUEUE_LEN`: The length of the accept queue: the backlog, capped at `net.core.somaxconn`
+
+A value that does not apply, or that the kernel could not report, is `-`.
+
 ## Use Cases
 
 tcpulse is particularly well-suited for performance validation of network devices and middlewares that relay end-to-end communications. Below are typical experimental scenarios that can be completed with tcpulse alone, which would be difficult to reproduce with iperf/netperf.
@@ -463,6 +490,7 @@ tcpulse 0.9 keeps the options, the environment variables and the output formats 
 - **Exit status**: a request still in flight when the duration elapses no longer fails the run (0.8 exited 1 with an I/O timeout and printed no report, after a single lost UDP datagram for instance); a target with which no round trip completed exits 1 after the report is printed. Options that cannot generate load (`--rate 0`, which panicked, a run of less than one message, `--protocol` other than `tcp`, `udp` or `all`, which exited 0 at once) exit 1. A command line that cannot be parsed exits 2 and prints a hint instead of the list of options.
 - **Environment variables**: values are parsed like the flags, more strictly than 0.8: `TCPULSE_RATE=10.0` and a duration without a unit (`TCPULSE_DURATION=10`, which 0.8 read as 10ns) are errors (exit 2), and so is an unparsable value, which 0.8 read as zero. A variable of the other mode (`TCPULSE_INTERVAL` for a server) is ignored.
 - **Help**: `--help` prints to stdout.
+- **Plain TCP server**: the server listens with plain TCP. Built with Go 1.24 or later, as 0.8.3 was, it listened with MPTCP where the kernel has it. An MPTCP client now falls back to TCP (tcpulse's own client is plain TCP), and on kernels before 6.2, whose MPTCP sockets refused `TCP_FASTOPEN`, the server accepts TCP Fast Open again, which can change ephemeral-mode latencies when `net.ipv4.tcp_fastopen` includes 2.
 
 ## Development
 

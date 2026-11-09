@@ -97,10 +97,13 @@ func Main(ctx context.Context, env Env) int {
 func validateServer(o *options) error {
 	switch o.serveProtocol {
 	case server.ProtocolTCP, server.ProtocolUDP, server.ProtocolAll:
-		return nil
 	default:
 		return fmt.Errorf("unexpected protocol %q", o.serveProtocol)
 	}
+	if o.listenerStats && !server.StatsSupported {
+		return errors.New("--listener-stats is only supported on Linux")
+	}
+	return nil
 }
 
 func runServer(ctx context.Context, o *options, stdout io.Writer, logger *slog.Logger) error {
@@ -122,12 +125,36 @@ func runServer(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 		Addrs:    addrs,
 		Protocol: o.serveProtocol,
 		Logger:   logger,
+		Stats:    o.listenerStats,
 	})
 	if err != nil {
 		return fmt.Errorf("server error: %w", err)
 	}
 	fmt.Fprintf(stdout, "Listening at %q ...\n", addrs)
-	return srv.Serve(ctx)
+	err = srv.Serve(ctx)
+	if o.listenerStats {
+		// Also after a failure: the statistics may tell why.
+		if perr := report.NewPrinter(stdout).Listeners(listenerRows(srv.Stats())); perr != nil {
+			return errors.Join(err, perr)
+		}
+	}
+	return err
+}
+
+// listenerRows turns the statistics of the server into report rows.
+func listenerRows(stats []server.ListenerStats) []report.Listener {
+	rows := make([]report.Listener, 0, len(stats))
+	for _, st := range stats {
+		rows = append(rows, report.Listener{
+			Addr:     st.Addr.String(),
+			Protocol: st.Protocol,
+			Received: st.Received,
+			Drops:    st.Drops,
+			QueueMax: st.QueueMax,
+			QueueLen: st.QueueLen,
+		})
+	}
+	return rows
 }
 
 func validateClient(o *options) error {
