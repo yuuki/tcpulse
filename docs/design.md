@@ -31,7 +31,7 @@ internal/server  echo server
 internal/stats   latency histogram, per-peer recorders
 internal/report  text and JSON Lines output
 internal/sockopt Linux socket options and TCP_INFO (no-ops or unsupported elsewhere)
-internal/kevents eBPF counters of kernel TCP events per connection (Linux)
+internal/kevents eBPF counters of kernel TCP events per connection, run queue latency (Linux)
 internal/tstamp  kernel timestamps of a TCP connection (SO_TIMESTAMPING, Linux)
 ```
 
@@ -151,11 +151,11 @@ handshake, unless the message travels in the SYN with Fast Open.
 The client sets `TCP_FASTOPEN_CONNECT`, so it sends its first message in the
 SYN when it holds a cookie for the server. When the server does not accept
 that data (it no longer enables Fast Open, or its queue of pending Fast Open
-requests is full: the tcpulse server keeps a queue of one, see §6), the
-client sends the data again right after the handshake, and it counts as a
-retransmission. So do lost SYNs, which are retransmitted after a timeout of
-at least 1s: the counters alone do not tell the two apart. The latencies do
-(steps of whole seconds for SYN loss: 1s, 2s, 3s with
+requests is full; the tcpulse server keeps one as long as its accept queue,
+see §6), the client sends the data again right after the handshake, and it
+counts as a retransmission. So do lost SYNs, which are retransmitted after a
+timeout of at least 1s: the counters alone do not tell the two apart. The
+latencies do (steps of whole seconds for SYN loss: 1s, 2s, 3s with
 `net.ipv4.tcp_syn_linear_timeouts`, 1s, 3s, 7s where the timeout doubles),
 and so do the host's counters `TCPSynRetrans` and `TCPFastOpenActiveFail`.
 
@@ -173,13 +173,15 @@ events of its TCP connections to their round trips. A failure to load them
 is an error (exit 1) with its reason, not a report without events.
 
 The programs are tracepoints through BTF (`tp_btf`), at state changes,
-retransmissions and resets; none runs for every packet or message.
+retransmissions, resets and drops; none runs for every packet or message
+(`kfree_skb` runs for every packet the host drops, whatever its socket).
 
 | Tracepoint | What it does |
 | --- | --- |
 | `inet_sock_set_state` | CLOSE → SYN_SENT of a socket of the tcpulse process: gives the socket its storage (`BPF_MAP_TYPE_SK_STORAGE`). It runs inside `connect(2)`, even when TCP Fast Open defers the SYN to the first write (tcp_v4_connect and tcp_v6_connect set SYN_SENT first). The process is matched in its PID namespace (`bpf_get_ns_current_pid_tgid`), so that it works in a container. |
 | `tcp_retransmit_skb` | Counts a retransmission of a socket with storage, by kind (below). Before Linux 6.17 the tracepoint fires for retransmissions that were sent; since then it also fires for failed attempts, with their error, and only `err == 0` counts. The loader reads the tracepoint's prototype in the kernel's BTF and loads the matching program. |
 | `tcp_receive_reset` | Counts a reset the connection accepted. |
+| `kfree_skb` | Counts a dropped packet of a socket with storage, by reason (below). Linux 5.17 added the reason, and Linux 6.11 the socket a received packet was for (`rx_sk`). The loader reads the prototype and loads the matching program, or none before Linux 5.17. |
 
 The kind of a retransmission, decided in this order:
 
@@ -198,6 +200,70 @@ The kind of a retransmission, decided in this order:
   single segment in flight, as for most of tcpulse's messages, a tail loss
   probe waits for two RTTs plus the minimum RTO (`tcp_schedule_loss_probe`),
   so these are not fast.
+
+A dropped packet belongs to the socket that sent it (`skb->sk`, which the
+packet keeps until it leaves the host, or loops back: `loopback_xmit`
+orphans it), or to the socket it was received for: `rx_sk`, which the
+receive path of TCP passes once it found the socket (`sk_skb_reason_drop`),
+or `skb->sk`, which early demux sets for an established connection before
+routing (with `net.ipv4.ip_early_demux` and `tcp_early_demux`). Over
+loopback, a packet keeps the route of its sender and skips early demux
+(`ip_rcv_finish_core`), so drops before TCP, such as in netfilter's INPUT
+hook, are not attributed there; across a veth pair they are. A veth pair
+does not orphan the packet either (`__dev_forward_skb`): a packet sent to
+another network namespace of the host keeps the sender's socket until IP
+input there (`ip_rcv_core`), so its drops on the way (tc, a bridge, the
+backlog of the receiving CPU, an ingress hook) count too, although the
+packet was sent, and is retransmitted.
+
+`kfree_skb` does not fire for the packets the kernel consumes
+(`consume_skb`, `SKB_CONSUMED`): a clean run counts no drop, unless the
+network driver frees the packets it sent as drops (`dev_kfree_skb_any`
+rather than `dev_consume_skb_any`), which then all count, as
+`NOT_SPECIFIED`. Since Linux 6.11, a connection that receives an ACK in
+CLOSE_WAIT, CLOSING or LAST_ACK (after the server half-closed it) also
+counts a `NOT_SPECIFIED` drop (`tcp_rcv_state_process` frees the segment
+without queueing it); the tcpulse server never half-closes. Before Linux
+6.11, the drops of TCP's own receive path are not counted, and tcpulse says
+so at the start.
+
+Two guards keep the programs from reading what is not a socket:
+
+- Before Linux 6.9, `skb->sk` shares a union with `ip_defrag_offset`, which a
+  fragment queued for reassembly sets, and such fragments are dropped when
+  their queue expires. Every packet that belongs to a socket has a
+  destructor (`tcp_wfree`, `sock_edemux`, `sock_rfree`), and a queued
+  fragment has none: `skb->sk` is only used when `skb->destructor` is set.
+- `rx_sk` is NULL for most drops, but the verifiers of Linux 6.11 to 6.13
+  take the arguments of tracepoints for pointers that are never NULL, and
+  would remove a test of it along with its other branch. The program looks
+  `rx_sk` up first, then `skb->sk` when that found nothing: the helper takes
+  NULL, and its result may be NULL, so neither lookup can be pruned.
+
+The storage of a socket keeps four slots of a reason and its count, and the
+drops of further reasons in `other_drops`. A drop goes to the slot of its
+reason, or takes the first free slot with a compare-and-exchange
+(`BPF_CMPXCHG`, also `-mcpu=v3`), since two CPUs can drop packets of a
+connection at once. A slot keeps its reason, so the client subtracts two
+readings slot by slot. A slot holds the reason plus one, so that 0 marks it
+free: on Linux 5.17, reason 0 is `NOT_SPECIFIED`. The copy of a lookup can
+race with the program taking a slot, and see its count without its reason:
+the client ignores that count, which the next reading sees whole (the
+program changes the generation after the count). The loader names the
+reasons from the values of `enum skb_drop_reason` in the kernel's BTF, so
+that tcpulse need not know them; a reason that is not there (a subsystem's,
+in the high 16 bits) is printed as its number.
+
+A packet that the host drops before it leaves was never sent: TCP sends it
+again from its probe timer, as new data, not as a retransmission. Round
+trips with drops can thus be slow without any retransmission of their own.
+
+Drops are an addition to the other events. The drop program loads in a
+collection of its own, which shares the maps of the others
+(`MapReplacements`), so that its failure is told apart from theirs. When the
+kernel's tracepoint has no reason, or the drop program does not load or
+attach, tcpulse counts the other events, logs why, and reports drops as
+unknown (`-`, and no `drops` object), not as none.
 
 The programs only count; the client attributes. After each completed round
 trip, once the clock has stopped, it reads the counters of the connection's
@@ -264,10 +330,73 @@ instead of a generated `vmlinux.h`. The programs declare the license "Dual
 BSD/GPL", which the kernel requires of tracing programs (see `NOTICE`).
 
 The tests that load the programs skip without the privileges, as in CI;
-`make test-bpf` runs them as root. The attribution itself is tested with a
+`make test-bpf` runs them as root. The test of a drop on the send path adds
+an nftables rule in a network namespace of its own, so that the host's
+firewall is left alone. The attribution itself is tested with a
 fake reader.
 
-### 3.6 Latency breakdown
+### 3.6 Run queue latency
+
+A load generator that waits for a CPU delays its own round trips, and its
+report then blames the network. With `--runqueue-latency` (the requirements
+of §3.5, TCP or UDP), the programs of `internal/kevents` measure how long the
+threads of the process wait for a CPU: from when a thread becomes runnable
+to when it runs, as `runqlat` does. It is a separate option because its
+tracepoints run at every context switch and wakeup of the host, more often
+than those of §3.5; it loads only its own programs.
+
+| Tracepoint | What it does |
+| --- | --- |
+| `sched_wakeup`, `sched_wakeup_new` | A thread of the process becomes runnable: remembers when, by thread ID, in a hash map. |
+| `sched_switch` | prev stays runnable when it was preempted in the kernel, or when its state is `TASK_RUNNING`: its time slice ended (preemption in user mode goes through `schedule()`, with `preempt` false), it yielded, or a pending signal kept it from sleeping. The switch is then involuntary, and prev waits again, from now; otherwise prev blocks, and its start is cleared. next stops waiting: its wait is recorded. |
+
+The tasks of these tracepoints carry the IDs of the initial PID namespace,
+while tcpulse may run in a container. The process's ID there is learnt at
+the first context switch of one of its threads, when it is the current task,
+by the namespace check of §3.5 (a helper call at every switch of the host
+until then); then a switch or wakeup of another process costs a few loads
+and comparisons.
+
+The state of prev is read in the tracepoint, not taken from its `prev_state`
+argument (Linux 5.18): until Linux 6.16, that is the state of a sleep that a
+pending signal cut short, while the task stays runnable, and a Go thread
+with a pending SIGURG (asynchronous preemption) would lose its wait. Read in
+the tracepoint, the state is `TASK_RUNNING` exactly when prev stays
+runnable: a wakeup racing with the switch sets `TASK_WAKING`, and its own
+tracepoint comes after. The kernel counts the switches the same way
+(`nivcsw`), but for those cut-short sleeps, which it counts as voluntary on
+every version (`!preempt && prev_state`).
+
+`sched_wakeup` also fires for a thread that is still running (a wakeup
+before it slept, `ttwu_runnable`), and sets a start then. A switch that
+blocks the thread clears it, so that a later switch to it cannot count the
+time it ran as a wait. A wakeup of a thread that already waits (preempted
+in the kernel before it slept, then woken) keeps its start, as the kernel's
+`sched_info` does, rather than lose the wait before the wakeup. A start
+later than the end (`bpf_ktime_get_ns` is monotonic, so this should not
+happen), which would be a wait of 2^64 nanoseconds, is not counted.
+
+The waits go to a per-CPU array (the CPU where they end, with preemption
+disabled, so plain increments): their count, total, longest, and a
+histogram whose buckets are at most 1/8 of their values wide (each power of
+two of nanoseconds in eight). After the run, the client adds the CPUs up;
+the percentiles are nearest-rank, as the largest value of their bucket, and
+the longest wait is exact. The report prints one section for the process,
+and every JSON object carries the same `runqueue_latency`. Until a thread of
+the process was switched out, the programs did not know it, and measured
+nothing: reading the waits is then an error, logged, and the report leaves
+the section out rather than show a process that never waited.
+
+A Tracer creates the maps of what it is asked for only: the library would
+otherwise create those of the run queue (a hash map of 4096 threads, and a
+histogram per CPU) for `--kernel-events` alone.
+
+The waits are those of the process: a Go thread runs the goroutines of
+many connections, so a wait cannot be given to one round trip. The report
+compares percentiles, which is what tells the client's delays from the
+network's.
+
+### 3.7 Latency breakdown
 
 With `--latency-breakdown` (persistent TCP, Linux), the client splits every
 round trip into send, network and receive time, by the kernel's software
@@ -401,8 +530,32 @@ receives. It listens on each address for TCP, UDP (`udp4`) or both
   `net/http`. Another accept error closes the listener's connections and
   stops the server with exit status 1. No error of a single connection
   stops it.
-- On SIGINT or SIGTERM it closes its listeners and connections and waits
-  for its goroutines.
+- On SIGINT or SIGTERM it closes its listeners and connections and waits for
+  its goroutines.
+- TCP listeners are plain TCP, with or without `--listener-stats`. Since
+  Go 1.24, listeners use MPTCP where the kernel supports it; tcpulse
+  measures TCP, its client never uses MPTCP, and an MPTCP listener keeps the
+  drops of its TCP subflow listener from `SO_MEMINFO`. For TCP clients, the
+  connections are the same either way, but before Linux 6.2, MPTCP sockets
+  refused `TCP_FASTOPEN`: 0.8.3, built with Go 1.25, served without Fast
+  Open there. MPTCP clients fall back to TCP.
+- With `--listener-stats` (Linux), the server counts the connections it
+  accepts and the datagrams it receives, and samples the accept queue of
+  each TCP listener every 10ms (`TCP_INFO` of a listening socket: the
+  connections waiting and the length of the queue). When it stops, it reads
+  the drops the kernel accounted to each socket (`SO_MEMINFO`), before it
+  closes them, and prints a line per socket.
+- The drops of a TCP listener are packets, not handshakes, and not the
+  host's `ListenDrops` (`tcp_v4_rcv`, `discard_and_relse`): the SYNs it
+  refused and their retransmissions, the ACKs a full accept queue refused
+  (`tcp_listendrop` and the discard: twice each), the SYNs sent again for
+  handshakes in progress, whose SYN-ACK was lost (`tcp_check_req` returns
+  nothing), resets of those handshakes, and what a socket filter or a cgroup
+  BPF program dropped. With SYN cookies, the default, a full SYN queue drops
+  nothing. So a lossy path shows in them too: the accept queue overflowed
+  when its sampled maximum reached its length plus one. Those of a UDP
+  socket are mostly datagrams over its receive buffer, and also memory
+  pressure, bad checksums and filters (`udp_drops_inc`).
 
 UDP is IPv4 only on both sides: unlike TCP, a UDP client cannot fall back
 from `::1` to `127.0.0.1`, so `localhost` would fail against the default
@@ -414,11 +567,25 @@ from `::1` to `127.0.0.1`, so `localhost` would fail against the default
 | --- | --- | --- |
 | `SO_REUSEPORT` | listening and client sockets | several servers can share a port |
 | `TCP_FASTOPEN_CONNECT` | client sockets | the first message travels in the SYN when the server allows it |
-| `TCP_FASTOPEN` (queue of 1) | listening sockets | accept data in the SYN (with `net.ipv4.tcp_fastopen` enabling the server side) |
+| `TCP_FASTOPEN` (a queue of `net.core.somaxconn` pending requests, like the accept backlog) | listening sockets | accept data in the SYN (with `net.ipv4.tcp_fastopen` enabling the server side); a shorter queue makes concurrent Fast Open handshakes fall back |
 | `TCP_QUICKACK` | ephemeral connections, accepted connections | acknowledge at once instead of delaying |
 
 They are optimizations: a kernel that refuses one gets a warning logged once
 per option, and the connection goes on. Other platforms set none.
+
+The Fast Open queue holds the connections that a SYN with data created and
+whose handshake is not over (SYN_RECV until the client's last ACK; a reset
+keeps a place for 60s), not those waiting to be accepted: it needs about the
+rate of new connections times the RTT of a handshake. With a queue of 1, at
+1,000 new connections per second over loopback, 65 of 2,000 fell back. The
+server makes it as long as its accept queue, `net.core.somaxconn`, as the
+kernel does itself with the 0x400 bit of `net.ipv4.tcp_fastopen`, and reads
+the sysctl because only Linux 4.4 and later cap the value at it. With
+cookies, the default, a spoofed SYN creates no connection. Without
+(`net.ipv4.tcp_fastopen` bit 0x200, or a route's `fastopen_no_cookie`), a
+flood of spoofed SYNs with data creates up to that many connections per
+listener, which the server accepts and holds (a socket and a goroutine each)
+until their handshake times out, about 2 minutes.
 
 ## 7. Configuration
 
@@ -436,10 +603,12 @@ Validation rejects any option set the run cannot work with: a rate below 1
 rate × duration below one message or beyond an int64, an interval that is
 not positive when interval lines are printed, an empty message, no
 connection in persistent mode, a UDP message above 65507 bytes, an empty
-addresses file, an unknown protocol or flavor, `--tcp-info` or
-`--kernel-events` with UDP or on a platform other than Linux. `FuzzParse`
-checks the options validation accepts against an independent computation of
-the message count.
+addresses file, an unknown protocol or flavor, `--tcp-info`,
+`--kernel-events` or `--latency-breakdown` with UDP or on a platform other
+than Linux, `--latency-breakdown` with ephemeral connections, and
+`--runqueue-latency` or `--listener-stats` on a platform other than Linux.
+`FuzzParse` checks the options validation accepts against an independent
+computation of the message count.
 
 Exit statuses: 0 on success (also after Ctrl-C, which interrupts the
 requests in flight and prints the report), 1 for invalid options, run
@@ -461,10 +630,15 @@ are whole microseconds, truncated. With `--tcp-info`, the text report ends
 with a section of its own: a separator, a header, and a line per peer (or a
 single merged line) of TCP statistics. Each JSON object ends with a
 `tcp_info` object. `--kernel-events` adds a section of the same form after
-it, and a `kernel_events` object; `--latency-breakdown`, a section after
-that, and a `latency_breakdown` object. Without these options, the output is
-unchanged. The column layout and the JSON field names and order are a public
-format, pinned by golden tests in `internal/report`.
+it, and a `kernel_events` object; when the host dropped packets of the
+connections, a section lists them by peer and reason. `--latency-breakdown`
+adds a section after these, and a `latency_breakdown` object.
+`--runqueue-latency` ends the text report with a section for the process,
+and each object with a `runqueue_latency` object. Without these options,
+the output is unchanged. The column layout and the JSON field names and
+order are a public format, pinned by golden tests in `internal/report`. The server prints
+`Listening at ...`, and with `--listener-stats`, when it stops, a separator,
+a header and a line per listening socket.
 
 ## 9. Release
 
@@ -477,10 +651,16 @@ the code), then GoReleaser:
 
 - archives `tcpulse_<version>_<os>_<arch>.tar.gz` for Linux and macOS on
   amd64 and arm64, built with `-trimpath` and commit timestamps, and
-  `tcpulse_<version>_checksums.txt`;
+  `tcpulse_<version>_checksums.txt`. Next to the binary, they hold
+  `LICENSE`, `NOTICE`, `LICENSES/` (the eBPF object's licenses) and
+  `THIRD_PARTY_NOTICES`, the license texts of the Go standard library and
+  of the modules linked into the binary on any release platform, which a
+  hook writes with `scripts/third-party-notices` (it fails on a module
+  without a license file);
 - a linux/amd64 and linux/arm64 image `ghcr.io/yuuki/tcpulse` tagged
   `X.Y.Z`, `X.Y`, `X` and `latest`, assembled from the same binaries
-  (Alpine, running as `nobody`);
+  (Alpine, running as `nobody`), with `THIRD_PARTY_NOTICES` in
+  `/usr/share/licenses/tcpulse/`;
 - a signed build provenance attestation of the archives and the checksums
   file.
 

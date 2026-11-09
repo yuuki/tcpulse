@@ -5,7 +5,13 @@ package sockopt
 import (
 	"io"
 	"net"
+	"os"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // echoListener echoes every TCP connection on a free loopback port until the
@@ -79,5 +85,146 @@ func TestReadTCPInfoErrors(t *testing.T) {
 	_ = closed.Close()
 	if _, err := ReadTCPInfo(closed); err == nil {
 		t.Error("ReadTCPInfo of a closed connection returned no error")
+	}
+}
+
+// rawListener listens on a free loopback port with backlog and returns a
+// net.Listener of it, which accepts nothing until asked.
+func rawListener(t *testing.T, backlog int) net.Listener {
+	t.Helper()
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Bind(fd, &unix.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Listen(fd, backlog); err != nil {
+		t.Fatal(err)
+	}
+	f := os.NewFile(uintptr(fd), "listener")
+	defer f.Close()
+	ln, err := net.FileListener(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	return ln
+}
+
+func TestAcceptQueue(t *testing.T) {
+	ln := rawListener(t, 5)
+	for range 3 {
+		conn, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+	}
+	waiting, length, err := AcceptQueue(ln.(*net.TCPListener))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if waiting != 3 || length != 5 {
+		t.Fatalf("accept queue = %d of %d, want 3 of 5", waiting, length)
+	}
+	if drops, err := SocketDrops(ln.(*net.TCPListener)); err != nil || drops != 0 {
+		t.Fatalf("drops = %d, %v; want none", drops, err)
+	}
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, _, err := AcceptQueue(conn.(*net.TCPConn)); err == nil {
+		t.Error("AcceptQueue of a connected socket returned no error")
+	}
+}
+
+func TestSocketDropsListener(t *testing.T) {
+	// A backlog of 0 holds one connection: the SYNs of the next ones are
+	// dropped while it waits.
+	ln := rawListener(t, 0)
+	first, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	d := net.Dialer{Timeout: 200 * time.Millisecond}
+	if conn, err := d.Dial("tcp", ln.Addr().String()); err == nil {
+		_ = conn.Close()
+		t.Fatal("the dial succeeded, want its SYN dropped")
+	}
+	drops, err := SocketDrops(ln.(*net.TCPListener))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drops < 1 {
+		t.Fatalf("drops of the full listener = %d, want at least 1", drops)
+	}
+}
+
+func TestSocketDropsUDP(t *testing.T) {
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	// The smallest receive buffer the kernel allows, flooded and never read.
+	if err := pc.(*net.UDPConn).SetReadBuffer(1); err != nil {
+		t.Fatal(err)
+	}
+	sender, err := net.Dial("udp4", pc.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+	msg := make([]byte, 1024)
+	for range 200 {
+		if _, err := sender.Write(msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	drops, err := SocketDrops(pc.(*net.UDPConn))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drops < 1 {
+		t.Fatalf("drops of the flooded UDP socket = %d, want some", drops)
+	}
+}
+
+func TestListenControlFastOpenQueue(t *testing.T) {
+	lc := net.ListenConfig{Control: ListenControl}
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	raw, err := ln.(*net.TCPListener).SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var (
+		qlen   int
+		optErr error
+	)
+	if err := raw.Control(func(fd uintptr) {
+		qlen, optErr = unix.GetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_FASTOPEN)
+	}); err != nil || optErr != nil {
+		t.Fatal(err, optErr)
+	}
+	// The queue is as long as net.core.somaxconn.
+	data, err := os.ReadFile("/proc/sys/net/core/somaxconn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	somaxconn, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := FastOpenQueue(); qlen != want || want != somaxconn {
+		t.Fatalf("Fast Open queue of the listener = %d, want %d (somaxconn %d)", qlen, want, somaxconn)
 	}
 }

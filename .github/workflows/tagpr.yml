@@ -27,13 +27,13 @@ jobs:
     outputs:
       tag: ${{ steps.tagpr.outputs.tag }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           # tagpr pushes the release branch and the tag with git.
           persist-credentials: true # zizmor: ignore[artipacked]
       - id: tagpr
-        uses: Songmu/tagpr@49c02dc423566b55a123beb12dc63f371032eaa3 # v1.9.2
+        uses: Songmu/tagpr@v1.9.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

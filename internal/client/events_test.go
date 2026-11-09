@@ -8,6 +8,7 @@ package client
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -97,6 +98,41 @@ func TestRunEventsPersistent(t *testing.T) {
 	}
 	if total := rec.Total(time.Second); total.Count != 10 {
 		t.Errorf("%d round trips, want 10", total.Count)
+	}
+}
+
+func TestRunEventsDrops(t *testing.T) {
+	// One connection, 10 round trips, as above.
+	fake := newFakeEvents(func(_, call int) (stats.Events, error) {
+		var ev stats.Events
+		ev.Drops[0] = stats.DropCount{Reason: 15, Count: 1} // during the dial
+		if call >= 4 {
+			ev.Drops[0].Count = 2 // during the 4th round trip
+		}
+		if call >= 6 {
+			// During the 6th, a drop of another reason; a third slot is
+			// taken, but its drop not yet counted.
+			ev.Drops[1] = stats.DropCount{Reason: 6, Count: 1}
+			ev.Drops[2] = stats.DropCount{Reason: 77}
+		}
+		if call >= 11 {
+			ev.OtherDrops = 1 // after the last round trip
+		}
+		return ev, nil
+	})
+	cfg := config(ProtocolTCP, FlavorPersistent)
+	cfg.Connections = 1
+	cfg.Events = fake
+	rec := stats.NewRecorder()
+	if err := Run(t.Context(), cfg, echoServer(t, server.ProtocolTCP), rec); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	ev := rec.Events()
+	if ev.RoundTrips != 2 || ev.DropRoundTrips != 2 || ev.WithoutEvents.Count != 8 {
+		t.Errorf("round trips with events %d, with drops %d, without events %d; want the 4th and the 6th", ev.RoundTrips, ev.DropRoundTrips, ev.WithoutEvents.Count)
+	}
+	if !maps.Equal(ev.Drops, map[uint32]int64{15: 2, 6: 1}) || ev.OtherDrops != 1 {
+		t.Errorf("drops %v, other %d; want those of the dial and the round trips by reason, and one other", ev.Drops, ev.OtherDrops)
 	}
 }
 

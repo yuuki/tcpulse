@@ -97,10 +97,13 @@ func Main(ctx context.Context, env Env) int {
 func validateServer(o *options) error {
 	switch o.serveProtocol {
 	case server.ProtocolTCP, server.ProtocolUDP, server.ProtocolAll:
-		return nil
 	default:
 		return fmt.Errorf("unexpected protocol %q", o.serveProtocol)
 	}
+	if o.listenerStats && !server.StatsSupported {
+		return errors.New("--listener-stats is only supported on Linux")
+	}
+	return nil
 }
 
 func runServer(ctx context.Context, o *options, stdout io.Writer, logger *slog.Logger) error {
@@ -122,12 +125,36 @@ func runServer(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 		Addrs:    addrs,
 		Protocol: o.serveProtocol,
 		Logger:   logger,
+		Stats:    o.listenerStats,
 	})
 	if err != nil {
 		return fmt.Errorf("server error: %w", err)
 	}
 	fmt.Fprintf(stdout, "Listening at %q ...\n", addrs)
-	return srv.Serve(ctx)
+	err = srv.Serve(ctx)
+	if o.listenerStats {
+		// Also after a failure: the statistics may tell why.
+		if perr := report.NewPrinter(stdout).Listeners(listenerRows(srv.Stats())); perr != nil {
+			return errors.Join(err, perr)
+		}
+	}
+	return err
+}
+
+// listenerRows turns the statistics of the server into report rows.
+func listenerRows(stats []server.ListenerStats) []report.Listener {
+	rows := make([]report.Listener, 0, len(stats))
+	for _, st := range stats {
+		rows = append(rows, report.Listener{
+			Addr:     st.Addr.String(),
+			Protocol: st.Protocol,
+			Received: st.Received,
+			Drops:    st.Drops,
+			QueueMax: st.QueueMax,
+			QueueLen: st.QueueLen,
+		})
+	}
+	return rows
 }
 
 func validateClient(o *options) error {
@@ -179,23 +206,25 @@ func validateClient(o *options) error {
 	return validateKernelOptions(o)
 }
 
-// validateKernelOptions rejects the options that read the kernel's view of
-// TCP connections (TCP_INFO, eBPF) where there is none: with UDP, or on a
-// platform other than Linux.
+// validateKernelOptions rejects the options that read the kernel (TCP_INFO,
+// eBPF) where they cannot: on a platform other than Linux, and with UDP for
+// those that read TCP connections.
 func validateKernelOptions(o *options) error {
 	for _, opt := range []struct {
 		name      string
 		set       bool
+		tcp       bool
 		supported bool
 		platforms string
 	}{
-		{"--tcp-info", o.tcpInfo, client.TCPInfoSupported, "Linux"},
-		{"--kernel-events", o.kernelEvents, kevents.Supported, "Linux on little-endian architectures"},
-		{"--latency-breakdown", o.latencyBreakdown, client.BreakdownSupported, "Linux"},
+		{"--tcp-info", o.tcpInfo, true, client.TCPInfoSupported, "Linux"},
+		{"--kernel-events", o.kernelEvents, true, kevents.Supported, "Linux on little-endian architectures"},
+		{"--latency-breakdown", o.latencyBreakdown, true, client.BreakdownSupported, "Linux"},
+		{"--runqueue-latency", o.runqueueLatency, false, kevents.Supported, "Linux on little-endian architectures"},
 	} {
 		switch {
 		case !opt.set:
-		case o.proto != client.ProtocolTCP:
+		case opt.tcp && o.proto != client.ProtocolTCP:
 			return fmt.Errorf("%s requires --proto tcp", opt.name)
 		case !opt.supported:
 			return fmt.Errorf("%s is only supported on %s", opt.name, opt.platforms)
@@ -207,6 +236,18 @@ func validateKernelOptions(o *options) error {
 		return errors.New("--latency-breakdown requires --flavor persistent")
 	}
 	return nil
+}
+
+// tracedOptions names the options that load eBPF programs, for an error.
+func tracedOptions(o *options) string {
+	switch {
+	case o.kernelEvents && o.runqueueLatency:
+		return "--kernel-events and --runqueue-latency"
+	case o.kernelEvents:
+		return "--kernel-events"
+	default:
+		return "--runqueue-latency"
+	}
 }
 
 // printsIntervals reports whether a client run prints interval lines.
@@ -240,17 +281,31 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 	}
 
 	// The programs count the connections the process opens from now on,
-	// for every target.
-	var events client.EventReader
-	if o.kernelEvents {
-		tracer, err := kevents.Start()
+	// for every target, and the waits of its threads.
+	var (
+		events client.EventReader
+		tracer *kevents.Tracer
+	)
+	printer := report.NewPrinter(stdout)
+	if o.kernelEvents || o.runqueueLatency {
+		var err error
+		tracer, err = kevents.Start(kevents.Options{Events: o.kernelEvents, RunQueue: o.runqueueLatency})
 		if err != nil {
-			return fmt.Errorf("--kernel-events: %w", err)
+			return fmt.Errorf("%s: %w", tracedOptions(o), err)
 		}
 		defer func() { _ = tracer.Close() }()
+	}
+	if o.kernelEvents {
 		if err := tracer.GenerationError(); err != nil {
 			logger.Warn("kernel events are read with a system call after every round trip", "reason", err)
 		}
+		if err := tracer.DropsError(); err != nil {
+			logger.Warn("kernel events do not count dropped packets", "reason", err)
+		}
+		if err := tracer.DropsLimitation(); err != nil {
+			logger.Warn("kernel events do not count every dropped packet", "reason", err)
+		}
+		printer.DropReasons = tracer.DropReasons()
 		events = tracer
 	}
 
@@ -268,7 +323,6 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 		}
 	}
 
-	printer := report.NewPrinter(stdout)
 	if !o.jsonlines {
 		if err := printer.Header(); err != nil {
 			return err
@@ -321,6 +375,15 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 	if ctx.Err() == nil {
 		run = max(run, o.duration)
 	}
+	var runq *stats.RunQueueSummary
+	if o.runqueueLatency {
+		// The round trips are reported without it.
+		if q, err := tracer.RunQueue(); err != nil {
+			logger.Warn("could not read the run queue latency", "error", err)
+		} else {
+			runq = &q
+		}
+	}
 
 	result := func(peer string, rec *stats.Recorder) report.Result {
 		r := report.Result{Peer: peer, Summary: rec.Total(run)}
@@ -336,6 +399,7 @@ func runClient(ctx context.Context, o *options, stdout io.Writer, logger *slog.L
 			b := rec.Breakdown()
 			r.Breakdown = &b
 		}
+		r.RunQueue = runq
 		return r
 	}
 	var results []report.Result

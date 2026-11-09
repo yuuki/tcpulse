@@ -3,11 +3,12 @@ PKG := ./...
 
 # Tool versions. The workflows (.github/workflows) pin the same versions:
 # bump them together.
-GOLANGCI_LINT_VERSION ?= v2.15.0
-GORELEASER_VERSION    ?= v2.20.0
-GOVULNCHECK_VERSION   ?= v1.9.0
-ACTIONLINT_VERSION    ?= v1.7.12
-ZIZMOR_VERSION        ?= 1.32.0
+GOLANGCI_LINT_VERSION   ?= v2.15.0
+GORELEASER_VERSION      ?= v2.20.0
+GOVULNCHECK_VERSION     ?= v1.9.0
+ACTIONLINT_VERSION      ?= v1.7.12
+ZIZMOR_VERSION          ?= 1.32.0
+GH_ACTIONS_LOCK_VERSION ?= v0.4.1
 
 FUZZTIME    ?= 30s
 BENCH_COUNT ?= 6
@@ -23,6 +24,8 @@ GOLANGCI_LINT = GOTOOLCHAIN=$(GO_TOOLCHAIN)+auto go run github.com/golangci/gola
 GORELEASER    = GOTOOLCHAIN=$(GO_TOOLCHAIN)+auto go run github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION)
 # uvx, or pipx (preinstalled on GitHub-hosted runners), runs the pinned zizmor.
 ZIZMOR        = $(if $(shell command -v uvx 2>/dev/null),uvx zizmor@$(ZIZMOR_VERSION),pipx run zizmor==$(ZIZMOR_VERSION))
+# gh-actions-lock (the `gh actions-lock` extension) runs through `go run` too.
+GH_ACTIONS_LOCK = GOTOOLCHAIN=$(GO_TOOLCHAIN)+auto go run github.com/github/gh-actions-lock/cmd/gh-actions-lock@$(GH_ACTIONS_LOCK_VERSION)
 # Extra zizmor options, e.g. --format=github for annotations in CI.
 ZIZMOR_FLAGS ?=
 
@@ -49,8 +52,8 @@ test-race: ## Run the tests with the race detector
 # Loading eBPF programs needs root, or CAP_BPF and CAP_PERFMON: without them,
 # these tests skip (as they do in `make test`).
 .PHONY: test-bpf
-test-bpf: ## Run the tests that load the eBPF programs of --kernel-events (as root)
-	go test -race -count=1 -run 'Tracer|KernelEvents' ./internal/kevents/ ./internal/cli/
+test-bpf: ## Run the tests that load the eBPF programs of --kernel-events and --runqueue-latency (as root)
+	go test -race -count=1 -run 'Tracer|KernelEvents|RunQueueLatency' ./internal/kevents/ ./internal/cli/
 
 # bpf2go compiles internal/kevents/bpf with clang; its output
 # (internal/kevents/kevents_bpfel.go and .o) is committed, so that building
@@ -96,10 +99,19 @@ lint: ## Run golangci-lint and check that go.mod and go.sum are tidy
 # Without a GitHub token (GH_TOKEN), zizmor runs offline; CI gives it one for
 # the audits that ask the GitHub API (impostor commits, known vulnerable
 # actions, ...).
+# gh-actions-lock checks that .github/workflows/actions.lock pins every
+# action the workflows use; with GH_TOKEN it also verifies each pin upstream.
 .PHONY: lint-actions
-lint-actions: ## Lint (actionlint) and audit (zizmor) the GitHub Actions workflows
+lint-actions: ## Lint (actionlint) and audit (zizmor) the GitHub Actions workflows, and check their lockfile
 	GOTOOLCHAIN=$(GO_TOOLCHAIN)+auto go run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
 	$(ZIZMOR) $(ZIZMOR_FLAGS) $(if $(GH_TOKEN),,--offline) .
+	$(GH_ACTIONS_LOCK) $(if $(GH_TOKEN),--verify,--verify-local)
+
+# Pin the actions in .github/workflows/actions.lock after a `uses:` changed,
+# then review the diff. Needs a GitHub token (GH_TOKEN or `gh auth login`).
+.PHONY: lock-actions
+lock-actions: ## Update .github/workflows/actions.lock after changing a uses: line
+	$(GH_ACTIONS_LOCK)
 
 .PHONY: vuln
 vuln: ## Report known vulnerabilities reachable from tcpulse (govulncheck)
@@ -119,6 +131,11 @@ tidy: ## Tidy go.mod and go.sum
 complexity: ## Show the 20 most complex functions (needs cccc)
 	cccc --table --top-cognitive 20 .
 
+# The release writes the same file (.goreleaser.yaml, before hook).
+.PHONY: notices
+notices: ## Write the license texts of the linked Go modules to build/notices/THIRD_PARTY_NOTICES
+	go run ./scripts/third-party-notices -o build/notices/THIRD_PARTY_NOTICES
+
 .PHONY: release-check
 release-check: ## Validate .goreleaser.yaml
 	$(GORELEASER) check
@@ -136,7 +153,7 @@ docker/build: ## Build the container image from the source tree
 .PHONY: clean
 clean: ## Remove build outputs
 	rm -f $(BIN) coverage.out bench.txt
-	rm -rf dist
+	rm -rf dist build
 
 .PHONY: help
 help: ## Show this help

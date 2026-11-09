@@ -2,10 +2,17 @@
 # (which tagpr creates when its release pull request is merged).
 #
 # The release workflow runs CI first, so this file has no test or
-# `go mod tidy` hooks: a release builds exactly the tagged tree.
+# `go mod tidy` hooks: a release builds exactly the tagged tree. Its only
+# hook writes a release asset outside the tree's sources.
 version: 2
 
 project_name: tcpulse
+
+before:
+  hooks:
+    # The license texts of the Go modules linked into the binary, which the
+    # archives and the image ship with it.
+    - go run ./scripts/third-party-notices -o build/notices/THIRD_PARTY_NOTICES
 
 builds:
   - id: tcpulse
@@ -48,6 +55,9 @@ archives:
         info: *doc
       - src: LICENSES/*
         info: *doc
+      - src: build/notices/THIRD_PARTY_NOTICES
+        strip_parent: true
+        info: *doc
       - src: README.md
         info: *doc
       - src: CHANGELOG.md
@@ -83,6 +93,7 @@ dockers_v2:
       - NOTICE
       - LICENSES/BSD-2-Clause.txt
       - LICENSES/GPL-2.0-only.txt
+      - build/notices/THIRD_PARTY_NOTICES
     # Labels and annotations carry the same data on purpose: ghcr.io links a
     # package to its repository from the image config label, while the
     # manifest annotations are what a multi-platform aware client reads.

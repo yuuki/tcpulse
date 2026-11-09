@@ -74,11 +74,13 @@ Creates new connections for each request, immediately closing them afterward. Th
 - **Rate limiting**: Control connection establishment rate to simulate realistic load patterns
 - **Multi-target support**: Test multiple endpoints simultaneously and aggregate results
 - **Protocol support**: Both TCP and UDP with optimized implementations
+- **Listener statistics**: The connections the server accepted, the packets the kernel discarded at its sockets, and how full its accept queue got, with `--listener-stats` (Linux)
 - **Platform optimizations**: Leverages Linux-specific optimizations (TCP_FASTOPEN, SO_REUSEPORT) when available
 - **JSON Lines output**: Machine-readable output format for integration with monitoring and analysis tools
 - **Kernel TCP statistics**: Retransmissions, the kernel's smoothed RTT and TCP Fast Open use of the connections, with `--tcp-info` on Linux
 - **Latency breakdown**: Which part of the round trips moved, the client's sending, the network and the server, or the client's receiving, by the kernel's timestamps of the last byte of each message, with `--latency-breakdown` (Linux, no privileges needed)
-- **Kernel events per round trip**: Which round trips met a SYN retransmission, a retransmission timeout, another retransmission or a reset, and how slow they were compared with the others, with `--kernel-events` (eBPF, Linux)
+- **Load generator self-check**: How long tcpulse's own threads waited for a CPU, to tell whether the latencies are those of the network or of a busy client host, with `--runqueue-latency` (eBPF, Linux)
+- **Kernel events per round trip**: Which round trips met a SYN retransmission, a retransmission timeout, another retransmission, a reset or a packet dropped by the host (and why), and how slow they were compared with the others, with `--kernel-events` (eBPF, Linux)
 
 ## Installation
 
@@ -149,15 +151,17 @@ Options:
   -h, --help                       show help information
       --interval duration          [client mode] interval for printing stats (default 5s)
       --jsonlines                  [client mode] output results in JSON Lines format
-      --kernel-events              [client mode] attribute kernel TCP events (retransmissions, resets) to the round trips with eBPF (Linux only, needs root or CAP_BPF and CAP_PERFMON)
+      --kernel-events              [client mode] attribute kernel TCP events (retransmissions, resets, drops) to the round trips with eBPF (Linux only, needs root or CAP_BPF and CAP_PERFMON)
       --latency-breakdown          [client mode] split every round trip into send, network and receive time with the kernel's timestamps (SO_TIMESTAMPING; persistent TCP, Linux only)
       --listen-addrs-file string   [server mode] enable to pass a file including a pair of addresses and ports
+      --listener-stats             [server mode] print the statistics of the listening sockets (connections, drops, accept queue) when the server stops (Linux only)
       --merge-results-each-host    [client mode] merge results of each host (with --show-only-results)
       --message-bytes int32        [client mode] TCP/UDP message size (bytes) (default 64)
       --pprof-addr string          [client mode] pprof listening address:port (default "localhost:6060")
       --proto string               [client mode] protocol (tcp or udp) (default "tcp")
       --protocol string            [server mode] listening protocol ('tcp', 'udp' or 'all') (default "all")
       --rate int32                 [client mode] Message throughput per connection (/s) (for 'persistent' and UDP) or new connections throughput (/s) (for 'ephemeral'). Total messages (CNT) = rate * duration * connections (for 'persistent') or rate * duration (for 'ephemeral') (default 100)
+      --runqueue-latency           [client mode] measure how long the threads of tcpulse wait for a CPU with eBPF, to tell its own delays from those of the network (Linux only, needs root or CAP_BPF and CAP_PERFMON)
   -s, --server                     run in server mode
       --show-only-results          [client mode] print only results of measurement stats
       --tcp-info                   [client mode] report TCP statistics of the connections read from the kernel (TCP_INFO, Linux only)
@@ -289,7 +293,7 @@ PEER                 CONNS      RETRANS_CONNS   RETRANS_SEGS    SEGS_OUT        
 - `RETRANS_SEGS`: The segments retransmitted, SYNs included (`tcpi_total_retrans`)
 - `SEGS_OUT`: The segments sent, retransmissions included (`tcpi_segs_out`, Linux 4.2+; it reads 0 on older kernels). SYNs and pure ACKs count too, as in the kernel's `OutSegs`, so `RETRANS_SEGS / SEGS_OUT` is lower than a rate over data segments.
 - `SRTT_*`: The kernel's smoothed round-trip time (`tcpi_rtt`), in microseconds: the mean, the 99th percentile (within 0.8%) and the maximum over the connections that have an RTT sample. A connection may have none, for instance when its SYN, sent with Fast Open, was never answered. They are 0 when no connection has one.
-- `TFO_CONNS`: The connections whose data in the SYN was acknowledged by TCP Fast Open (`TCPI_OPT_SYN_DATA`). The client side is on by default (`net.ipv4.tcp_fastopen=1`); the server side also needs the server bit (`3`). The tcpulse server accepts one pending Fast Open request per listener at a time, so concurrent handshakes beyond it fall back to a plain handshake.
+- `TFO_CONNS`: The connections whose data in the SYN was acknowledged by TCP Fast Open (`TCPI_OPT_SYN_DATA`). The client side is on by default (`net.ipv4.tcp_fastopen=1`); the server side also needs the server bit (`3`). The tcpulse server's queue of pending Fast Open requests, the handshakes of Fast Open connections in progress, is as long as its accept queue (`net.core.somaxconn`). Without cookies (`net.ipv4.tcp_fastopen` bit 0x200), spoofed SYNs with data can hold that many connections per listener for about 2 minutes.
 
 The kernel's RTT leaves out the time spent in the client's process (system calls, the Go runtime), which `LAT_*` includes. In ephemeral mode, a round trip also includes the handshake, about one more RTT, unless the message travels in the SYN with Fast Open.
 
@@ -308,12 +312,13 @@ Interval lines do not include these statistics: a persistent connection is read 
 
 #### Kernel Events (`--kernel-events`)
 
-On Linux, `--kernel-events` loads eBPF programs that count kernel events on every TCP connection tcpulse opens: retransmissions, by kind, and resets received. tcpulse attributes each event to the round trip during which it happened, and the report tells whether the slow round trips are those that met these events.
+On Linux, `--kernel-events` loads eBPF programs that count kernel events on every TCP connection tcpulse opens: retransmissions, by kind, resets received, and packets that the kernel of the host dropped, by reason. tcpulse attributes each event to the round trip during which it happened, and the report tells whether the slow round trips are those that met these events.
 
 **Requirements**
 - Linux 5.12 or later, with BTF (`/sys/kernel/btf/vmlinux`), on a little-endian architecture.
 - Root, or `CAP_BPF` and `CAP_PERFMON`. The container image runs as `nobody`: give it `--user 0` and the capabilities, which `--privileged` grants.
 - It is refused with `--proto udp` and on other platforms. If the programs cannot be loaded, tcpulse exits with status 1 and the reason, before sending anything.
+- Drops need Linux 5.17 or later, which gives their reason. The drops of TCP's own receive path need Linux 6.11 (see below); before, tcpulse says at the start that they are not counted. When drops are not counted at all, `DROP_RTS` is `-`, and tcpulse says why at the start.
 
 ```shell-session
 $ sudo tcpulse -c --show-only-results --kernel-events --flavor ephemeral --rate 200 --duration 4s 192.0.2.10:9100
@@ -321,11 +326,11 @@ PEER                 CNT        LAT_MAX(µs)     LAT_MIN(µs)     LAT_MEAN(µs) 
 --- A result during total execution time ---
 192.0.2.10:9100      795        2047918         164             50962           647             206569          1023410         198.60
 --- Kernel events of the round trips (eBPF) ---
-PEER                 EVENT_RTS  SYN_RTX         TFO_RTX         RTO_RTX         OTHER_RTX       EVENT_99p(µs)   CLEAN_99p(µs)   RST_RECV        UNMATCHED       UNTRACKED
-192.0.2.10:9100      65         30              0               2               36              2047918         827             0               0               0
+PEER                 EVENT_RTS  SYN_RTX         TFO_RTX         RTO_RTX         OTHER_RTX       DROP_RTS        EVENT_99p(µs)   CLEAN_99p(µs)   RST_RECV        UNMATCHED       UNTRACKED
+192.0.2.10:9100      65         30              0               2               36              0               2047918         827             0               0               0
 ```
 
-In this run, 5% of the packets to the server were dropped. The 99th percentile of the run, 1.02s, comes from the 65 round trips that met kernel events: their own 99th percentile is 2.05s, while that of the other round trips is 827µs.
+In this run, 5% of the packets to the server were dropped on their way. The 99th percentile of the run, 1.02s, comes from the 65 round trips that met kernel events: their own 99th percentile is 2.05s, while that of the other round trips is 827µs.
 
 - `EVENT_RTS`: The completed round trips during which at least one event was counted on their connection
 - `SYN_RTX`, `TFO_RTX`, `RTO_RTX`, `OTHER_RTX`: The round trips during which at least one retransmission of that kind happened. A round trip can count under several kinds.
@@ -333,16 +338,44 @@ In this run, 5% of the packets to the server were dropped. The 99th percentile o
   - `TFO_RTX`: of data sent in a TCP Fast Open SYN that the server did not acknowledge although the SYN arrived: the server no longer accepts Fast Open, or its queue of pending Fast Open requests is full. The client sends the data again right after the handshake, without loss or timeout.
   - `RTO_RTX`: in the kernel's loss state, which a retransmission timeout enters (200ms at least).
   - `OTHER_RTX`: any other: fast retransmit, RACK, tail loss probes. These are not fast for tcpulse's messages either: when a single segment is in flight, the tail loss probe waits for two RTTs plus the minimum RTO (200ms).
+- `DROP_RTS`: The round trips during which the kernel of this host dropped at least one packet of their connection, or `-` when drops are not counted. A packet dropped before it left the host was never sent, so TCP does not retransmit it: it sends it again from its probe timer, after 200ms at least, as new data. These round trips can be slow without counting under any `_RTX` column. (A packet sent through a veth pair to another network namespace of the host, such as a container's, keeps its socket until IP input there: its drops on the way count, and it is retransmitted.)
 - `EVENT_99p(µs)`, `CLEAN_99p(µs)`: The 99th percentile latency of the round trips with events, and of the others
 - `RST_RECV`: The resets received by the connections
 - `UNMATCHED`: The retransmissions that no completed round trip owns. They come from dials that failed or were cut off by the end of the run (SYNs never answered), from requests that failed or were cut off, and, in persistent mode, from a handshake that the untimed dial waited for.
 - `UNTRACKED`: The completed round trips whose events could not be read. They count neither as round trips with events nor as round trips without.
 
+When the host dropped packets of the connections, a last section lists them, by peer and reason, the most frequent first:
+- `REASON`: The kernel's reason for the drop (`enum skb_drop_reason`, without its `SKB_DROP_REASON_` prefix: `NETFILTER_DROP` for a firewall rule, `QDISC_DROP` for a full queue, `TCP_OLD_DATA` for a duplicate of data already received...), or a number for a reason the kernel does not name in its BTF. `other` counts the drops of a connection after it met four reasons.
+- `DROPS`: The dropped packets, during round trips or not.
+
+```shell-session
+$ sudo tcpulse -c --show-only-results --kernel-events --flavor ephemeral --rate 200 --duration 4s 192.0.2.10:9100
+PEER                 CNT        LAT_MAX(µs)     LAT_MIN(µs)     LAT_MEAN(µs)    LAT_90p(µs)     LAT_95p(µs)     LAT_99p(µs)     RATE(/s)
+--- A result during total execution time ---
+192.0.2.10:9100      788        2039601         151             46885           770             206569          1027604         196.95
+--- Kernel events of the round trips (eBPF) ---
+PEER                 EVENT_RTS  SYN_RTX         TFO_RTX         RTO_RTX         OTHER_RTX       DROP_RTS        EVENT_99p(µs)   CLEAN_99p(µs)   RST_RECV        UNMATCHED       UNTRACKED
+192.0.2.10:9100      133        28              0               0               0               133             1224736         1990            0               0               0
+--- Packets of the connections dropped by the kernel (eBPF) ---
+PEER                 REASON                         DROPS
+192.0.2.10:9100      NETFILTER_DROP                 157
+```
+
+In this run, a firewall rule of the client's host dropped 5% of its packets to the server. The 133 round trips that met a drop have a 99th percentile of 1.22s, but only 28 of them met a retransmission, of their SYN: the other dropped packets were sent again as new data.
+
+Which drops are counted:
+- **Sent:** a packet of the connection dropped before it left the host: by a firewall rule (netfilter's OUTPUT hook), a queueing discipline, a neighbour that does not resolve.
+- **Received, by TCP:** a packet that TCP dropped after it found the connection: a full receive buffer, data out of the window, a duplicate. This needs Linux 6.11, which passes the socket to the tracepoint.
+- **Received, before TCP:** a packet dropped before TCP looked the connection up, e.g. by netfilter's INPUT hook, only if early demux had found the connection first (`net.ipv4.ip_early_demux` and `net.ipv4.tcp_early_demux`, on by default). Over loopback, packets keep their route and skip early demux: these drops are not counted.
+- **Not seen:** drops in the network and on the server's host (unless it is another network namespace of this one, reached through a veth pair). They show up as retransmissions.
+- **Not drops:** since Linux 6.11, an ACK that a connection receives after the server half-closed it counts as a `NOT_SPECIFIED` drop. The tcpulse server never half-closes.
+- **Too many:** some network drivers free the packets they sent as drops rather than as consumed. Then every packet sent counts, as `NOT_SPECIFIED`, and `DROP_RTS` approaches the count of round trips.
+
 How events are attributed:
 - **Persistent mode:** the events of a round trip are those counted on its connection since the end of the previous round trip.
 - **Ephemeral mode:** a round trip includes the dial, so its events are all those counted since the connection was opened.
 - **Failed dials:** tcpulse keeps a duplicate of the descriptor of each socket it dials, so that it can read the events of a socket after the dial failed and closed it.
-- **Cost:** tcpulse checks the counters after each round trip, once the clock has stopped. On amd64 and arm64, it does so with a load from memory it shares with the programs; a `bpf()` system call reads a connection's counters only the first time, and after an event was counted on any connection. On other architectures, every check is a system call. Inside the clock, the only addition is the `dup(2)` of the socket in the dial (in ephemeral mode, the dial is timed). No program runs for every packet.
+- **Cost:** tcpulse checks the counters after each round trip, once the clock has stopped. On amd64 and arm64, it does so with a load from memory it shares with the programs; a `bpf()` system call reads a connection's counters only the first time, and after an event was counted on any connection. On other architectures, every check is a system call. Inside the clock, the only addition is the `dup(2)` of the socket in the dial (in ephemeral mode, the dial is timed). No program runs for every packet: the one of drops runs for each packet the host drops, whatever its socket.
 
 With `--jsonlines`, each object ends with a `kernel_events` object (after `tcp_info`, if present). It has these fields:
 - `round_trips_with_events`, `round_trips_without_events`;
@@ -350,7 +383,8 @@ With `--jsonlines`, each object ends with a `kernel_events` object (after `tcp_i
 - `latency_99p_with_events_us`, `latency_max_with_events_us`, `latency_99p_without_events_us`, `latency_max_without_events_us`;
 - `resets_received`;
 - `unmatched_syn_retrans`, `unmatched_fastopen_retrans`, `unmatched_rto_retrans`, `unmatched_other_retrans`;
-- `untracked_round_trips`.
+- `untracked_round_trips`;
+- `drops`, only when drops are counted: `round_trips`, as `DROP_RTS`, and `by_reason`, the dropped packets by `REASON` (an empty object when there were none).
 
 The round trips with and without events, plus the untracked ones, add up to `count`.
 
@@ -388,6 +422,61 @@ How the parts are taken:
 - **Cost:** inside the clock, the echo is read with `recvmsg(2)` rather than `read(2)`, and the transmit timestamp of each message wakes the reading thread once, as an error event. When the socket was neither readable nor writable then, Go's poller stops waiting on it until it is: tcpulse then reads the timestamps queued and waits with an epoll instance of its own, inside the clock, where one thread waits for all such connections. After the clock stops, the transmit timestamps are read from the socket's error queue, with one `recvmsg(2)` each, plus one. Against the same server, 50 persistent connections at 1,000 messages per second each had a 99th percentile of 782 to 1,003µs, against about 600µs without the option, on 4 CPUs.
 
 With `--jsonlines`, each object ends with a `latency_breakdown` object (after `kernel_events`, if present): `round_trips`, `missing_timestamps`, `out_of_order`, `negative_parts`, `send_50p_us`, `send_99p_us`, `network_50p_us`, `network_99p_us`, `receive_50p_us`, `receive_99p_us`.
+
+#### Run Queue Latency (`--runqueue-latency`)
+
+A load generator that waits for a CPU delays its own round trips. On Linux, `--runqueue-latency` loads eBPF programs that measure how long the threads of tcpulse wait for one: from when a thread becomes runnable (woken up, or preempted while it could still run) to when it runs. Compare these waits with the latencies of the run before blaming the network or the server.
+
+**Requirements:** those of `--kernel-events` (Linux 5.12 or later with BTF, a little-endian architecture, root or `CAP_BPF` and `CAP_PERFMON`), with TCP or UDP. If the programs cannot be loaded, tcpulse exits with status 1 and the reason, before sending anything.
+
+```shell-session
+$ sudo tcpulse -c --show-only-results --runqueue-latency --connections 10 --rate 1000 --duration 4s 192.0.2.10:9100
+PEER                 CNT        LAT_MAX(µs)     LAT_MIN(µs)     LAT_MEAN(µs)    LAT_90p(µs)     LAT_95p(µs)     LAT_99p(µs)     RATE(/s)
+--- A result during total execution time ---
+192.0.2.10:9100      32934      11092           7               700             3997            4014            4882            8226.77
+--- Run queue latency of the tcpulse threads (eBPF) ---
+WAITS      PREEMPTED  WAIT_TOTAL(µs)  WAIT_50p(µs)    WAIT_99p(µs)    WAIT_MAX(µs)
+16147      786        4434186         6               4194            11293
+```
+
+In this run, two busy loops per CPU shared the CPUs of the client. Its 99th percentile, 4.88ms, is that of its waits for a CPU, 4.19ms, and its slowest round trip, 11.09ms, its longest wait, 11.29ms: the latency was the client's own. On an idle host, the same run had a 99th percentile of 348µs, and its waits one of 73µs.
+
+- `WAITS`: The waits for a CPU that ended, of all the threads of tcpulse, from the start of the programs (before the first connection) to the end of the run
+- `PREEMPTED`: The involuntary context switches of the threads: the CPU was taken from a thread that could still run, because its time slice ended, a more urgent task woke up, or it yielded. The kernel counts them for the process too (`ru_nivcsw` of `getrusage(2)`), but counts as voluntary a sleep that a pending signal cut short, which this counts as involuntary, since the thread stays runnable.
+- `WAIT_TOTAL(µs)`: The sum of the waits. With several threads, it can exceed the duration of the run.
+- `WAIT_50p(µs)`, `WAIT_99p(µs)`: Percentiles of the waits, rounded up by at most 1/8 (the programs keep the waits in buckets of their own, coarser than those of the round trips)
+- `WAIT_MAX(µs)`: The longest wait
+
+The waits are those of the process, not of the round trips: a thread runs the goroutines of many connections, and its wait delays every round trip it was about to resume. Waits close to the slow round trips point to the client; waits far shorter rule it out.
+
+**Cost:** the programs run at every context switch and wakeup of the host, whatever the process: once they know the process's ID, at the first switch of one of its threads, those of the others cost a few loads and comparisons. They run inside the clock for tcpulse's own threads: the wakeup that ends most round trips updates a hash map, and the switch to the woken thread looks it up and updates the histogram. Against the same server, 50 persistent connections at 1,000 messages per second each had a mean latency 5 to 24µs higher than without the option (about 190µs), which is the size of the differences between runs; 2,000 ephemeral connections per second, 1 to 3µs higher.
+
+With `--jsonlines`, each object ends with a `runqueue_latency` object (after `kernel_events` and `latency_breakdown`, if present), the same in every object of a run: `waits`, `preempted`, `wait_total_us`, `wait_50p_us`, `wait_99p_us`, `wait_max_us`. It is absent when the waits could not be read (tcpulse logs why).
+
+#### Listener Statistics (`--listener-stats`)
+
+On Linux, a server started with `--listener-stats` prints the statistics of its listening sockets when it stops (Ctrl-C, SIGTERM). They are read from what the kernel already counts for each socket, so no privileges are needed.
+
+```shell-session
+$ tcpulse -s --listener-stats 0.0.0.0:9100
+Listening at ["0.0.0.0:9100"] ...
+^C
+--- Statistics of the listening sockets ---
+LISTENER             PROTO      RECEIVED        DROPS           QUEUE_MAX       QUEUE_LEN
+0.0.0.0:9100         tcp        37944           7506            9               8
+0.0.0.0:9100         udp        145590          0               -               -
+```
+
+That run had an accept queue of 8 (`net.core.somaxconn=8`) and 20,000 new connections per second: the queue was full (`QUEUE_MAX` is one more than its length), and the listener refused handshakes.
+
+- `RECEIVED`: The TCP connections accepted, or the UDP datagrams received
+- `DROPS`: The packets the kernel discarded at the socket (`SO_MEMINFO`). They are packets, not handshakes, and not the host's `ListenDrops`.
+  - For TCP: the SYNs the listener refused and their retransmissions, the ACKs that a full accept queue refused (each counted twice), the SYNs that clients sent again because a SYN-ACK was lost, the resets of handshakes in progress, and the packets that a socket filter or a cgroup's BPF program dropped. With SYN cookies (`net.ipv4.tcp_syncookies=1`, the default), a full SYN queue drops nothing. A lossy path between the client and the server shows here too: the accept queue overflowed only if `QUEUE_MAX` reached `QUEUE_LEN` + 1, or if the host's `ListenOverflows` (`nstat`) grew.
+  - For UDP: mostly the datagrams that did not fit in the receive buffer (the host's `RcvbufErrors`), and also those dropped for memory pressure, for a bad checksum, or by a filter.
+- `QUEUE_MAX`: The most connections seen waiting in the accept queue (`TCP_INFO` of the listener, sampled every 10ms). The kernel lets the queue hold one more connection than its length.
+- `QUEUE_LEN`: The length of the accept queue: the backlog, capped at `net.core.somaxconn`
+
+A value that does not apply, or that the kernel could not report, is `-`.
 
 ## Use Cases
 
@@ -500,10 +589,11 @@ tcpulse 0.9 keeps the options, the environment variables and the output formats 
 - **Exit status**: a request still in flight when the duration elapses no longer fails the run (0.8 exited 1 with an I/O timeout and printed no report, after a single lost UDP datagram for instance); a target with which no round trip completed exits 1 after the report is printed. Options that cannot generate load (`--rate 0`, which panicked, a run of less than one message, `--protocol` other than `tcp`, `udp` or `all`, which exited 0 at once) exit 1. A command line that cannot be parsed exits 2 and prints a hint instead of the list of options.
 - **Environment variables**: values are parsed like the flags, more strictly than 0.8: `TCPULSE_RATE=10.0` and a duration without a unit (`TCPULSE_DURATION=10`, which 0.8 read as 10ns) are errors (exit 2), and so is an unparsable value, which 0.8 read as zero. A variable of the other mode (`TCPULSE_INTERVAL` for a server) is ignored.
 - **Help**: `--help` prints to stdout.
+- **Plain TCP server**: the server listens with plain TCP. Built with Go 1.24 or later, as 0.8.3 was, it listened with MPTCP where the kernel has it. An MPTCP client now falls back to TCP (tcpulse's own client is plain TCP), and on kernels before 6.2, whose MPTCP sockets refused `TCP_FASTOPEN`, the server accepts TCP Fast Open again, which can change ephemeral-mode latencies when `net.ipv4.tcp_fastopen` includes 2.
 
 ## Development
 
-`make check` runs the linters, the workflow audit, `go vet`, the race-enabled tests and the build; `make help` lists the other targets. The eBPF programs of `--kernel-events` are in `internal/kevents/bpf`; `make generate` rebuilds their committed object (it needs clang), and `make test-bpf`, run as root, runs the tests that load them (they skip otherwise). See [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md) for the conventions and compatibility contracts, and [SECURITY.md](SECURITY.md) to report a vulnerability.
+`make check` runs the linters, the workflow audit, `go vet`, the race-enabled tests and the build; `make help` lists the other targets. The eBPF programs of `--kernel-events` and `--runqueue-latency` are in `internal/kevents/bpf`; `make generate` rebuilds their committed object (it needs clang), and `make test-bpf`, run as root, runs the tests that load them (they skip otherwise). See [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md) for the conventions and compatibility contracts, and [SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## License
 
