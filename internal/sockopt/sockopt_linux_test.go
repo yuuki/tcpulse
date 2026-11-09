@@ -107,7 +107,7 @@ func TestListenControlFastOpenQueue(t *testing.T) {
 	}); err != nil || optErr != nil {
 		t.Fatal(err, optErr)
 	}
-	// The kernel caps the queue at net.core.somaxconn.
+	// The queue is as long as net.core.somaxconn.
 	data, err := os.ReadFile("/proc/sys/net/core/somaxconn")
 	if err != nil {
 		t.Fatal(err)
@@ -116,7 +116,7 @@ func TestListenControlFastOpenQueue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := min(FastOpenQueue, somaxconn); qlen != want {
+	if want := FastOpenQueue(); qlen != want || want != somaxconn {
 		t.Fatalf("Fast Open queue of the listener = %d, want %d (somaxconn %d)", qlen, want, somaxconn)
 	}
 }

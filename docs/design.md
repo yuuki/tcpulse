@@ -329,6 +329,20 @@ from `::1` to `127.0.0.1`, so `localhost` would fail against the default
 They are optimizations: a kernel that refuses one gets a warning logged once
 per option, and the connection goes on. Other platforms set none.
 
+The Fast Open queue holds the connections that a SYN with data created and
+whose handshake is not over (SYN_RECV until the client's last ACK; a reset
+keeps a place for 60s), not those waiting to be accepted: it needs about the
+rate of new connections times the RTT of a handshake. With a queue of 1, at
+1,000 new connections per second over loopback, 65 of 2,000 fell back. The
+server makes it as long as its accept queue, `net.core.somaxconn`, as the
+kernel does itself with the 0x400 bit of `net.ipv4.tcp_fastopen`, and reads
+the sysctl because only Linux 4.4 and later cap the value at it. With
+cookies, the default, a spoofed SYN creates no connection. Without
+(`net.ipv4.tcp_fastopen` bit 0x200, or a route's `fastopen_no_cookie`), a
+flood of spoofed SYNs with data creates up to that many connections per
+listener, which the server accepts and holds (a socket and a goroutine each)
+until their handshake times out, about 2 minutes.
+
 ## 7. Configuration
 
 Options are POSIX-style flags (`spf13/pflag`, kept on 1.0, whose help text
