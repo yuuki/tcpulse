@@ -29,12 +29,12 @@ jobs:
       pull-requests: write # octocov comments on the pull request
       actions: read # octocov reads the workflow run
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
       - name: Measure complexity (cccc)
-        uses: moznion/cccc-action@1d5313811f8451953e46a268c61791a01e40b7df # v1.1.2
+        uses: moznion/cccc-action@v1.1.2
         with:
           version: v1.8.6
           path: .
@@ -97,7 +97,7 @@ jobs:
 
       - name: Track the metrics (octocov)
         if: steps.octocov-branch.outputs.exists == 'true'
-        uses: k1LoW/octocov-action@a167dc0dee441b7ffc45e1b862ab55ec0d87f278 # v1.5.2
+        uses: k1LoW/octocov-action@v1.5.2
         with:
           version: v0.83.3
           config: .octocov.complexity.yml

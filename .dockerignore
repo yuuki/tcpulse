@@ -2,6 +2,7 @@
 .github
 .devcontainer
 dist
+build
 tcpulse
 coverage.out
 bench.txt

@@ -6,6 +6,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -190,5 +192,39 @@ func TestSocketDropsUDP(t *testing.T) {
 	}
 	if drops < 1 {
 		t.Fatalf("drops of the flooded UDP socket = %d, want some", drops)
+	}
+}
+
+func TestListenControlFastOpenQueue(t *testing.T) {
+	lc := net.ListenConfig{Control: ListenControl}
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	raw, err := ln.(*net.TCPListener).SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var (
+		qlen   int
+		optErr error
+	)
+	if err := raw.Control(func(fd uintptr) {
+		qlen, optErr = unix.GetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_FASTOPEN)
+	}); err != nil || optErr != nil {
+		t.Fatal(err, optErr)
+	}
+	// The queue is as long as net.core.somaxconn.
+	data, err := os.ReadFile("/proc/sys/net/core/somaxconn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	somaxconn, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := FastOpenQueue(); qlen != want || want != somaxconn {
+		t.Fatalf("Fast Open queue of the listener = %d, want %d (somaxconn %d)", qlen, want, somaxconn)
 	}
 }
