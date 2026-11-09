@@ -514,15 +514,17 @@ func TestTracerRunQueue(t *testing.T) {
 	if err := tr.runq.Lookup(uint32(0), &perCPU); err != nil {
 		t.Fatal(err)
 	}
+	// From this one reading: a longer wait may have ended since RunQueue.
 	last := -1
+	var maxNs uint64
 	for _, c := range perCPU {
+		maxNs = max(maxNs, c.MaxNs)
 		for b, n := range c.Buckets {
 			if n > 0 {
 				last = max(last, b)
 			}
 		}
 	}
-	maxNs := uint64(s.Max.Nanoseconds())
 	if last < 1 || maxNs <= runqBucketMax(last-1) || maxNs > runqBucketMax(last) {
 		t.Fatalf("longest wait %dns, last bucket with waits %d", maxNs, last)
 	}

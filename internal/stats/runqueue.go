@@ -9,9 +9,10 @@ type RunQueueSummary struct {
 	// Waits is the number of waits that ended.
 	Waits int64
 	// Preempted is the number of involuntary context switches of the
-	// threads, as the kernel counts them: the scheduler took the CPU from a
-	// thread that was still runnable (its time slice ended, it was
-	// preempted, or it yielded).
+	// threads: the scheduler took the CPU from a thread that was still
+	// runnable (its time slice ended, it was preempted, or it yielded). The
+	// kernel counts them too (ru_nivcsw), but for sleeps that a pending
+	// signal cut short, which it counts as voluntary.
 	Preempted int64
 	// Total is the sum of the waits.
 	Total time.Duration

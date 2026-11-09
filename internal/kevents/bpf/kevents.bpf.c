@@ -351,7 +351,8 @@ static __always_inline void runq_dequeue(const struct task_struct *t)
 		return;
 	ns = bpf_ktime_get_ns() - *start;
 	*start = 0;
-	/* A start from another CPU whose clock is behind: no wait to count. */
+	/* A start later than the end (the clock is monotonic: it should not
+	 * happen) would be a wait of 2^64 ns: not counted. */
 	if ((__s64)ns < 0)
 		return;
 	s = bpf_map_lookup_elem(&runq, &zero);
@@ -388,7 +389,7 @@ static __always_inline long task_state(const struct task_struct *t)
  * Linux 6.16 is the state of a sleep that a signal cut short. A wakeup racing
  * with the switch sets TASK_WAKING, not TASK_RUNNING, and its own tracepoint
  * comes after. The switch is then involuntary, as the kernel counts it
- * (nivcsw) but for those sleeps, which Linux 6.16 counts as voluntary.
+ * (nivcsw) but for those sleeps, which it counts as voluntary.
  * Otherwise prev blocks, and its start is cleared. next stops waiting.
  */
 static __always_inline void runq_switch(bool preempt, const struct task_struct *prev,
@@ -418,11 +419,31 @@ static __always_inline void runq_switch(bool preempt, const struct task_struct *
 		runq_dequeue(next);
 }
 
+/*
+ * runq_wakeup starts the wait of a thread that is woken up, unless it waits
+ * already: preempted in the kernel before it slept, it stayed runnable, and
+ * its wait began then, as the kernel's sched_info counts it. Every switch
+ * that takes the CPU from the thread sets or clears its start, so a start
+ * kept here is never one from before the thread last ran.
+ */
+static __always_inline void runq_wakeup(const struct task_struct *t)
+{
+	__u32 tid = t->pid;
+	__u64 *start = bpf_map_lookup_elem(&runq_start, &tid);
+
+	if (!start) {
+		runq_enqueue(t);
+		return;
+	}
+	if (!*start)
+		*start = bpf_ktime_get_ns();
+}
+
 SEC("tp_btf/sched_wakeup")
 int BPF_PROG(kevents_wakeup, struct task_struct *p)
 {
 	if (runq_target(p, runq_tgid))
-		runq_enqueue(p);
+		runq_wakeup(p);
 	return 0;
 }
 
@@ -430,7 +451,7 @@ SEC("tp_btf/sched_wakeup_new")
 int BPF_PROG(kevents_wakeup_new, struct task_struct *p)
 {
 	if (runq_target(p, runq_tgid))
-		runq_enqueue(p);
+		runq_wakeup(p);
 	return 0;
 }
 

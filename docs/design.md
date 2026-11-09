@@ -363,14 +363,17 @@ with a pending SIGURG (asynchronous preemption) would lose its wait. Read in
 the tracepoint, the state is `TASK_RUNNING` exactly when prev stays
 runnable: a wakeup racing with the switch sets `TASK_WAKING`, and its own
 tracepoint comes after. The kernel counts the switches the same way
-(`nivcsw`), but since Linux 6.16 it counts such cut-short sleeps as
-voluntary.
+(`nivcsw`), but for those cut-short sleeps, which it counts as voluntary on
+every version (`!preempt && prev_state`).
 
 `sched_wakeup` also fires for a thread that is still running (a wakeup
 before it slept, `ttwu_runnable`), and sets a start then. A switch that
 blocks the thread clears it, so that a later switch to it cannot count the
-time it ran as a wait. A start older on its CPU's clock than the one that
-ends it, which would be a wait of 2^64 nanoseconds, is not counted.
+time it ran as a wait. A wakeup of a thread that already waits (preempted
+in the kernel before it slept, then woken) keeps its start, as the kernel's
+`sched_info` does, rather than lose the wait before the wakeup. A start
+later than the end (`bpf_ktime_get_ns` is monotonic, so this should not
+happen), which would be a wait of 2^64 nanoseconds, is not counted.
 
 The waits go to a per-CPU array (the CPU where they end, with preemption
 disabled, so plain increments): their count, total, longest, and a
@@ -472,7 +475,8 @@ rate × duration below one message or beyond an int64, an interval that is
 not positive when interval lines are printed, an empty message, no
 connection in persistent mode, a UDP message above 65507 bytes, an empty
 addresses file, an unknown protocol or flavor, `--tcp-info` or
-`--kernel-events` with UDP or on a platform other than Linux. `FuzzParse`
+`--kernel-events` with UDP or on a platform other than Linux,
+`--runqueue-latency` on a platform other than Linux. `FuzzParse`
 checks the options validation accepts against an independent computation of
 the message count.
 
