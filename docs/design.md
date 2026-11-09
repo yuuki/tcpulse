@@ -393,7 +393,8 @@ the code), then GoReleaser:
   without a license file);
 - a linux/amd64 and linux/arm64 image `ghcr.io/yuuki/tcpulse` tagged
   `X.Y.Z`, `X.Y`, `X` and `latest`, assembled from the same binaries
-  (Alpine, running as `nobody`);
+  (Alpine, running as `nobody`), with `THIRD_PARTY_NOTICES` in
+  `/usr/share/licenses/tcpulse/`;
 - a signed build provenance attestation of the archives and the checksums
   file.
 

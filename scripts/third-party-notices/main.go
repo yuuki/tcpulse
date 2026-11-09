@@ -1,6 +1,7 @@
 // Command third-party-notices writes the license texts of the Go modules and
 // of the Go standard library linked into the tcpulse binary, which the
-// release archives and images ship next to it.
+// release archives ship at their root and the container images in
+// /usr/share/licenses/tcpulse.
 //
 //	go run ./scripts/third-party-notices -o FILE [PACKAGE...]
 //
@@ -9,7 +10,9 @@
 // file covers the union, since the modules differ between Linux and macOS
 // (github.com/cilium/ebpf is Linux only). It fails when a module has no
 // license file at its root, so that a new dependency cannot be shipped
-// without its license.
+// without its license. Only module roots are read: a module whose license
+// asks for a NOTICE file that the module zip leaves out, or that bundles code
+// under another license in a subdirectory, needs a look by hand.
 //
 // Adapted from scripts/third-party-notices of github.com/yuuki/shawk.
 package main
@@ -32,7 +35,8 @@ import (
 // ownModule is covered by the repository's own LICENSE and NOTICE.
 const ownModule = "github.com/yuuki/tcpulse"
 
-// platforms are those of the release archives (.goreleaser.yaml).
+// platforms are those of the release archives (.goreleaser.yaml, which
+// TestPlatforms compares).
 var platforms = []string{"linux/amd64", "linux/arm64", "darwin/amd64", "darwin/arm64"}
 
 var licenseFile = regexp.MustCompile(`(?i)^(licen[cs]e|copying|notice|patents|unlicense)([.\-_].*)?$`)
@@ -94,7 +98,9 @@ func notices(ctx context.Context, patterns []string) ([]byte, error) {
 		return nil, err
 	}
 	if err := writeLicenses(&b, "Go standard library and runtime "+goversion, goroot); err != nil {
-		return nil, fmt.Errorf("the Go standard library (%s): %w", goversion, err)
+		// A distribution's Go package may keep them elsewhere: the release
+		// is built with Go's own distribution.
+		return nil, fmt.Errorf("the Go standard library (%s, %s): %w", goversion, goroot, err)
 	}
 	keys := make([]string, 0, len(mods))
 	for k := range mods {
@@ -138,7 +144,7 @@ func list(ctx context.Context, patterns []string, goos, goarch string, mods map[
 		if m.Replace != nil {
 			m = m.Replace
 		}
-		if strings.HasPrefix(m.Path, ownModule) || strings.HasPrefix(p.Module.Path, ownModule) {
+		if isOwn(m.Path) || isOwn(p.Module.Path) {
 			continue
 		}
 		if m.Dir == "" {
@@ -149,7 +155,14 @@ func list(ctx context.Context, patterns []string, goos, goarch string, mods map[
 	return nil
 }
 
-// writeLicenses appends the license files at the root of dir.
+// isOwn reports whether path is tcpulse's module, or one of its own nested
+// modules.
+func isOwn(path string) bool {
+	return path == ownModule || strings.HasPrefix(path, ownModule+"/")
+}
+
+// writeLicenses appends the license files at the root of dir: those whose
+// name is a license's (not Go files such as license.go).
 func writeLicenses(b *bytes.Buffer, title, dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -157,7 +170,7 @@ func writeLicenses(b *bytes.Buffer, title, dir string) error {
 	}
 	var found bool
 	for _, e := range entries {
-		if e.IsDir() || !licenseFile.MatchString(e.Name()) {
+		if e.IsDir() || !licenseFile.MatchString(e.Name()) || strings.HasSuffix(e.Name(), ".go") {
 			continue
 		}
 		text, err := os.ReadFile(filepath.Join(dir, e.Name()))
