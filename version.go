@@ -5,7 +5,7 @@ import "runtime/debug"
 // version is the version of tcpulse. tagpr rewrites it when it prepares a
 // release (versionFile in .tagpr), and release builds set it with
 // -ldflags "-X main.version=...".
-var version = "0.8.3"
+var version = "0.9.0"
 
 // revision is the commit tcpulse was built from. Release builds set it with
 // -ldflags "-X main.revision=...".
