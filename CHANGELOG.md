@@ -1,5 +1,18 @@
 # Changelog
 
+## [v0.9.0](https://github.com/yuuki/tcpulse/compare/v0.8.3...v0.9.0) - 2026-11-11
+- refactor!: modernize tcpulse's layout, tooling, CI and release by @yuuki in https://github.com/yuuki/tcpulse/pull/47
+- feat(cli): report the kernel's TCP statistics of the connections with --tcp-info by @yuuki in https://github.com/yuuki/tcpulse/pull/51
+- feat(kevents): attribute kernel TCP events to the round trips with --kernel-events by @yuuki in https://github.com/yuuki/tcpulse/pull/54
+- build(release): ship the license texts of the Go modules linked into tcpulse by @yuuki in https://github.com/yuuki/tcpulse/pull/58
+- ci: lock the workflows' actions in .github/workflows/actions.lock by @yuuki in https://github.com/yuuki/tcpulse/pull/66
+- fix(sockopt): give the server a Fast Open queue as long as its accept queue by @yuuki in https://github.com/yuuki/tcpulse/pull/56
+- feat(server): report the drops and accept queue of the listening sockets by @yuuki in https://github.com/yuuki/tcpulse/pull/60
+- feat(kevents): count the packets of the connections that the host drops, by reason by @yuuki in https://github.com/yuuki/tcpulse/pull/62
+- feat(kevents): measure how long tcpulse's threads wait for a CPU with --runqueue-latency by @yuuki in https://github.com/yuuki/tcpulse/pull/64
+- feat(client): split round trips into send, network and receive time with --latency-breakdown by @yuuki in https://github.com/yuuki/tcpulse/pull/65
+- chore: build with Go 1.27.4 and update Go module dependencies by @yuuki in https://github.com/yuuki/tcpulse/pull/67
+
 ## [v0.8.3](https://github.com/yuuki/tcpulse/compare/v0.8.2...v0.8.3) - 2026-01-12
 - docs: clarify CNT field meaning in help output by @yuuki in https://github.com/yuuki/tcpulse/pull/44
 - Upgrade Go version to 1.25 by @yuuki in https://github.com/yuuki/tcpulse/pull/45
