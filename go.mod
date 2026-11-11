@@ -1,6 +1,6 @@
 module github.com/yuuki/tcpulse
 
-go 1.27.3
+go 1.27.4
 
 require (
 	github.com/cilium/ebpf v0.22.0
