@@ -2,6 +2,9 @@
 
 [![CI](https://github.com/yuuki/tcpulse/actions/workflows/ci.yml/badge.svg)](https://github.com/yuuki/tcpulse/actions/workflows/ci.yml)
 [![Security](https://github.com/yuuki/tcpulse/actions/workflows/security.yml/badge.svg)](https://github.com/yuuki/tcpulse/actions/workflows/security.yml)
+[![Release](https://img.shields.io/github/v/release/yuuki/tcpulse)](https://github.com/yuuki/tcpulse/releases)
+[![License](https://img.shields.io/github/license/yuuki/tcpulse)](LICENSE)
+[![Go version](https://img.shields.io/github/go-mod/go-version/yuuki/tcpulse)](go.mod)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/yuuki/tcpulse)
 
 tcpulse is a concurrent TCP/UDP load generator written in Go that provides fine-grained, flow-level control over connection establishment and data transfer.
