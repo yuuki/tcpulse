@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.9.1](https://github.com/yuuki/tcpulse/compare/v0.9.0...v0.9.1) - 2026-11-15
+- docs: add status badges to the README by @yuuki in https://github.com/yuuki/tcpulse/pull/68
+
 ## [v0.9.0](https://github.com/yuuki/tcpulse/compare/v0.8.3...v0.9.0) - 2026-11-11
 - refactor!: modernize tcpulse's layout, tooling, CI and release by @yuuki in https://github.com/yuuki/tcpulse/pull/47
 - feat(cli): report the kernel's TCP statistics of the connections with --tcp-info by @yuuki in https://github.com/yuuki/tcpulse/pull/51
