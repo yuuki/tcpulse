@@ -27,7 +27,7 @@ workflows:
         - 'github/codeql-action@v4.39.3'
     '.github/workflows/tagpr.yml':
         - 'actions/checkout@v7.0.1'
-        - 'songmu/tagpr@v1.9.2'
+        - 'songmu/tagpr@v1.21.4'
 dependencies:
     'actions/attest@v4.2.2':
         ref: 'v4.2.2'
@@ -104,8 +104,8 @@ dependencies:
         repo_id: 1285669875
         uses:
             - 'actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830'
-    'songmu/tagpr@v1.9.2':
-        ref: 'v1.9.2'
-        commit: 'sha1-49c02dc423566b55a123beb12dc63f371032eaa3'
+    'songmu/tagpr@v1.21.4':
+        ref: 'v1.21.4'
+        commit: 'sha1-e1250d6c84e4425db82b5e90549d62dfe23e9ebe'
         owner_id: 177122
         repo_id: 524603982

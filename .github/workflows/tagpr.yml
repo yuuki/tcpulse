@@ -33,7 +33,7 @@ jobs:
           # tagpr pushes the release branch and the tag with git.
           persist-credentials: true # zizmor: ignore[artipacked]
       - id: tagpr
-        uses: Songmu/tagpr@v1.9.2
+        uses: Songmu/tagpr@v1.21.4
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
